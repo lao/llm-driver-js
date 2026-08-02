@@ -14,7 +14,12 @@ const CLI_ONLY = ["cliPath", "cliArgs"] as const;
  * rather than silently ignored.
  */
 export function validateConfig(config: Config): void {
-  if (!PROVIDERS.includes(config?.provider)) {
+  if (typeof config !== "object" || config === null) {
+    throw new LLMWrapperError("invalid_config", "config is required", {
+      operation: "createClient",
+    });
+  }
+  if (!PROVIDERS.includes(config.provider)) {
     throw invalid(config, `provider must be one of ${quoted(PROVIDERS)}`);
   }
   if (!FLAVORS.includes(config.flavor)) {
@@ -55,8 +60,8 @@ function quoted(values: readonly string[]): string {
 
 function invalid(config: Config, message: string): LLMWrapperError {
   return new LLMWrapperError("invalid_config", message, {
-    provider: config?.provider,
-    flavor: config?.flavor,
+    provider: config.provider,
+    flavor: config.flavor,
     operation: "createClient",
   });
 }

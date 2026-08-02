@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { type ErrorCode, LLMWrapperError } from "../errors.js";
 import type { Message, Provider } from "../types.js";
 
@@ -123,10 +123,10 @@ export function readString(source: Record<string, unknown>, key: string): string
   return typeof value === "string" ? value : "";
 }
 
-/** Reads a token count field, defaulting to `0`. */
+/** Reads a token count field; anything but a non-negative integer counts as `0`. */
 export function readCount(source: Record<string, unknown>, key: string): number {
   const value = source[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0;
 }
 
 /** Collects output up to `limit` bytes, then flags the overflow. */
@@ -156,10 +156,30 @@ export function createBoundedCapture(limit = MAX_OUTPUT_BYTES) {
   };
 }
 
+const POSIX = process.platform !== "win32";
+
+/**
+ * Signals the child's whole process group, so the helper processes `claude` and
+ * `codex` spawn die with it. Falls back to the direct child when the group is
+ * already gone (`ESRCH`) or on Windows, which has no process groups.
+ */
+function killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (POSIX && child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+      // Group already reaped, or we lost the right to signal it.
+    }
+  }
+  child.kill(signal);
+}
+
 /**
  * Default runner: spawns the executable directly — never through a shell — and
- * inherits cwd and env so the CLI's own login is used. An abort sends SIGTERM
- * and escalates to SIGKILL after a short grace period.
+ * inherits cwd and env so the CLI's own login is used. The child leads its own
+ * process group; an abort sends SIGTERM to the group and escalates to SIGKILL
+ * after a short grace period.
  */
 export const spawnRunner: CommandRunner = (command, signal) =>
   new Promise<CommandResult>((resolve, reject) => {
@@ -168,15 +188,18 @@ export const spawnRunner: CommandRunner = (command, signal) =>
       return;
     }
 
-    const child = spawn(command.executable, command.args, { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(command.executable, command.args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: POSIX,
+    });
     const stdout = createBoundedCapture();
     const stderr = createBoundedCapture();
     let killTimer: NodeJS.Timeout | undefined;
     let settled = false;
 
     const onAbort = () => {
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
+      killGroup(child, "SIGTERM");
+      killTimer = setTimeout(() => killGroup(child, "SIGKILL"), KILL_GRACE_MS);
       killTimer.unref();
     };
     const settle = (finish: () => void) => {
@@ -189,10 +212,10 @@ export const spawnRunner: CommandRunner = (command, signal) =>
 
     signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", (chunk: Buffer) => {
-      if (!stdout.push(chunk)) child.kill("SIGKILL");
+      if (!stdout.push(chunk)) killGroup(child, "SIGKILL");
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      if (!stderr.push(chunk)) child.kill("SIGKILL");
+      if (!stderr.push(chunk)) killGroup(child, "SIGKILL");
     });
     child.on("error", (error) => settle(() => reject(error)));
     child.on("close", (code) =>

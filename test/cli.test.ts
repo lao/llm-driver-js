@@ -1,9 +1,13 @@
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   type Command,
   type CommandRunner,
   createBoundedCapture,
   executeCli,
+  readCount,
   renderTranscript,
   spawnRunner,
 } from "../src/backends/cli.js";
@@ -24,6 +28,24 @@ function resultRunner(result: Partial<Awaited<ReturnType<CommandRunner>>>): Comm
 
 function enoent(): NodeJS.ErrnoException {
   return Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" });
+}
+
+/** `0` until the spawned process has recorded its grandchild's pid. */
+function readPid(file: string): number {
+  try {
+    return Number(readFileSync(file, "utf8")) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 describe("renderTranscript", () => {
@@ -49,6 +71,20 @@ describe("createBoundedCapture", () => {
     expect(capture.push(Buffer.from("3456"))).toBe(false);
     expect(capture.overflowed()).toBe(true);
     expect(capture.text()).toBe("1234");
+  });
+});
+
+describe("readCount", () => {
+  it("reads a non-negative integer", () => {
+    expect(readCount({ tokens: 0 }, "tokens")).toBe(0);
+    expect(readCount({ tokens: 42 }, "tokens")).toBe(42);
+  });
+
+  it("treats anything else as zero", () => {
+    for (const tokens of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "7", null, undefined]) {
+      expect(readCount({ tokens }, "tokens")).toBe(0);
+    }
+    expect(readCount({}, "tokens")).toBe(0);
   });
 });
 
@@ -146,6 +182,37 @@ describe("spawnRunner", () => {
       spawnRunner({ executable: node, args: [], stdin: "" }, controller.signal),
     ).rejects.toBe(reason);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "kills grandchildren by signalling the whole process group",
+    async () => {
+      const pidFile = join(mkdtempSync(join(tmpdir(), "llmwrapper-")), "grandchild.pid");
+      const grandchild = "setInterval(()=>{},1000)";
+      // Spawns a grandchild — like `claude`/`codex` do — records its pid, stays alive.
+      const script =
+        "const {spawn}=require('node:child_process');" +
+        `const g=spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],{stdio:'ignore'});` +
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(g.pid));` +
+        "setInterval(()=>{},1000)";
+      const controller = new AbortController();
+      const running = spawnRunner(
+        { executable: node, args: ["-e", script], stdin: "" },
+        controller.signal,
+      );
+
+      await expect.poll(() => readPid(pidFile), { timeout: 2000 }).toBeGreaterThan(0);
+      const pid = readPid(pidFile);
+      try {
+        controller.abort(new Error("cancelled"));
+        await expect(running).rejects.toThrow("cancelled");
+        await expect.poll(() => isRunning(pid), { timeout: 2000 }).toBe(false);
+      } finally {
+        // A surviving grandchild is the bug under test; never leak it.
+        if (isRunning(pid)) process.kill(pid, "SIGKILL");
+      }
+    },
+    10_000,
+  );
 
   it("escalates to SIGKILL when an aborted child ignores SIGTERM", async () => {
     const controller = new AbortController();

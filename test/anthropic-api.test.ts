@@ -1,3 +1,4 @@
+import { APIUserAbortError } from "@anthropic-ai/sdk";
 import { describe, expect, it } from "vitest";
 import { createClient } from "../src/client.js";
 import { LLMWrapperError } from "../src/errors.js";
@@ -184,7 +185,7 @@ describe("anthropic api backend", () => {
     expect(error.operation).toBe("generate");
   });
 
-  it("aborts an in-flight request", async () => {
+  it("aborts an in-flight request and surfaces the abort reason untouched", async () => {
     const controller = new AbortController();
     const client = clientWith(
       (_input, init) =>
@@ -195,8 +196,14 @@ describe("anthropic api backend", () => {
 
     const pending = client.generate(PROMPT, { signal: controller.signal });
     controller.abort();
-    const error = await rejection(pending);
 
-    expect(error.code).toBe("transport_failed");
+    const error = await pending.then(
+      () => {
+        throw new Error("expected generate() to reject");
+      },
+      (reason: unknown) => reason,
+    );
+    expect(error).not.toBeInstanceOf(LLMWrapperError);
+    expect(error).toBeInstanceOf(APIUserAbortError);
   });
 });

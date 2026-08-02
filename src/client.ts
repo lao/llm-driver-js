@@ -10,17 +10,29 @@ import type { Client, Config, Request } from "./types.js";
 /** Constructs a client for one provider, flavor, and model. */
 export function createClient(config: Config): Client {
   validateConfig(config);
-  const backend = selectBackend(config);
+  // The caller's object is snapshotted, so mutating it later cannot change how
+  // an already-built client behaves.
+  const snapshot: Config = Object.freeze({
+    provider: config.provider,
+    flavor: config.flavor,
+    model: config.model,
+    apiKey: config.apiKey,
+    baseUrl: config.baseUrl,
+    fetch: config.fetch,
+    cliPath: config.cliPath,
+    cliArgs: config.cliArgs === undefined ? undefined : [...config.cliArgs],
+  });
+  const backend = selectBackend(snapshot);
 
   return {
     async generate(request, options) {
-      validateRequest(request, config);
+      validateRequest(request, snapshot);
       const response = await backend.generate(request, options?.signal);
       return {
         ...response,
-        model: response.model || config.model,
-        provider: config.provider,
-        flavor: config.flavor,
+        model: response.model || snapshot.model,
+        provider: snapshot.provider,
+        flavor: snapshot.flavor,
       };
     },
   };
@@ -41,6 +53,9 @@ function selectBackend(config: Config): Backend {
 
 /** Validates a request, throwing `invalid_request` on any violation. */
 export function validateRequest(request: Request, config: Config): void {
+  if (typeof request !== "object" || request === null) {
+    throw invalid(config, "request is required");
+  }
   const { maxTokens, messages } = request;
   if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
     throw invalid(config, "maxTokens must be a positive integer");

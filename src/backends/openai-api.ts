@@ -24,6 +24,8 @@ export function createOpenAiApiBackend(config: Config): Backend {
           await client.responses.create(toParams(config.model, request), { signal }),
         );
       } catch (error) {
+        // An abort surfaces its own reason untouched, like the CLI flavors.
+        if (signal?.aborted) throw error;
         throw normalizeError(error);
       }
     },

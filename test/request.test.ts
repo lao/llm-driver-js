@@ -39,6 +39,13 @@ describe("validateRequest", () => {
     ).not.toThrow();
   });
 
+  it("rejects a missing or non-object request", () => {
+    for (const request of [undefined, null, 42]) {
+      const error = expectInvalidRequest(request as unknown as Request);
+      expect(error.message).toBe("request is required");
+    }
+  });
+
   it("rejects an empty transcript", () => {
     expectInvalidRequest({ messages: [], maxTokens: 1 });
     expectInvalidRequest({ messages: undefined as unknown as Request["messages"], maxTokens: 1 });

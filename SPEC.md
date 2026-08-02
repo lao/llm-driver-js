@@ -125,17 +125,21 @@ Validation rules (ported from Go):
 
 ### CLI transport contract (ported from Go)
 
-- Claude: `claude -p --output-format json --model <model> [--append-system-prompt <system>] [cliArgs...]`,
-  transcript rendered to stdin, single JSON object parsed from stdout.
-- Codex: `codex exec --json --model <model> [-c dev instructions for system] [cliArgs...]`,
-  transcript on stdin, JSONL events parsed from stdout (agent message + token usage events).
+- Claude: `claude -p --output-format json --permission-mode default --model <model>
+  [--append-system-prompt <system>] [cliArgs...]`, transcript rendered to stdin,
+  single JSON object parsed from stdout.
+- Codex: `codex exec --json --sandbox read-only --skip-git-repo-check --model <model>
+  [--config developer_instructions=<JSON-encoded system>] [cliArgs...] -`, transcript on
+  stdin, JSONL events parsed from stdout (agent message + token usage events).
 - Argv built directly, prompts passed via stdin, **no shell ever invoked**.
 - Subprocess inherits cwd/env so local authentication works.
 - Missing executable → `executable_not_found`; non-zero exit → `process_failed`
   (status = exit code); malformed output → `parse_failed`; provider-reported
   failure in output → `api_error` with `providerCode`.
-- `AbortSignal` kills the subprocess (SIGTERM, then SIGKILL after grace) and
-  aborts API requests.
+- `AbortSignal` kills the subprocess group (SIGTERM, then SIGKILL after grace, so
+  CLI-spawned helper processes die too) and aborts API requests.
+- On abort, `generate` rejects with the abort reason itself — never a wrapped
+  `LLMWrapperError` — identically across all four targets.
 - Mirror exact flags from Go reference: `backend_claude_cli.go`, `backend_codex_cli.go`.
 
 ### Scope

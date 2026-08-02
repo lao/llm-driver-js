@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createClient } from "../src/client.js";
 import { validateConfig } from "../src/config.js";
 import { LLMWrapperError } from "../src/errors.js";
-import type { Config, Flavor, Provider } from "../src/types.js";
+import { type Config, type Flavor, type Provider, user } from "../src/types.js";
 
 function expectInvalidConfig(config: Config): LLMWrapperError {
   let caught: unknown;
@@ -50,6 +50,13 @@ describe("validateConfig", () => {
         cliArgs: ["--verbose"],
       }),
     ).not.toThrow();
+  });
+
+  it("rejects a missing or non-object config", () => {
+    for (const config of [undefined, null, 42]) {
+      const error = expectInvalidConfig(config as unknown as Config);
+      expect(error.message).toBe("config is required");
+    }
   });
 
   it("rejects an unknown provider", () => {
@@ -112,5 +119,48 @@ describe("validateConfig", () => {
     expect(() => createClient({ provider: "claude", flavor: "api", model: "" })).toThrow(
       LLMWrapperError,
     );
+  });
+});
+
+describe("createClient config snapshot", () => {
+  it("ignores mutations made to the caller's config after construction", async () => {
+    const sent: Record<string, unknown>[] = [];
+    const config: Config = {
+      provider: "claude",
+      flavor: "api",
+      model: "claude-test",
+      apiKey: "test-key",
+      baseUrl: "https://anthropic.test",
+      fetch: async (input, init) => {
+        sent.push((await new Request(input, init).json()) as Record<string, unknown>);
+        return new Response(
+          // An empty model makes the response fall back to the configured one.
+          JSON.stringify({
+            id: "msg_1",
+            type: "message",
+            role: "assistant",
+            model: "",
+            content: [],
+            stop_reason: "end_turn",
+            usage: {},
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    };
+    const client = createClient(config);
+
+    config.provider = "openai";
+    config.flavor = "cli";
+    config.model = "mutated-model";
+    config.fetch = () => Promise.reject(new Error("mutated fetch must not be used"));
+
+    const response = await client.generate({ messages: [user("hello")], maxTokens: 8 });
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ model: "claude-test" });
+    expect(response.model).toBe("claude-test");
+    expect(response.provider).toBe("claude");
+    expect(response.flavor).toBe("api");
   });
 });

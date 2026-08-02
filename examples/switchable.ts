@@ -4,6 +4,7 @@
  *   npm run example -- --provider openai --flavor cli --model gpt-5.6-sol --prompt "hi"
  */
 import { parseArgs } from "node:util";
+// In your own project this import is `from "llmwrapper"`.
 import { createClient, LLMWrapperError, user } from "../src/index.js";
 
 const USAGE = `Usage: npm run example -- --provider <claude|openai> --flavor <api|cli> \\
