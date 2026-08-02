@@ -26,7 +26,7 @@ export function createClaudeCliBackend(
   runner: CommandRunner = spawnRunner,
 ): Backend {
   const executable = config.cliPath ?? "claude";
-  const extraArgs = [...(config.cliArgs ?? [])];
+  const extraArgs = config.cliArgs ?? [];
 
   return {
     async generate(request, signal) {

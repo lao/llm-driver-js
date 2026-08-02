@@ -20,7 +20,7 @@ export function createClient(config: Config): Client {
     baseUrl: config.baseUrl,
     fetch: config.fetch,
     cliPath: config.cliPath,
-    cliArgs: config.cliArgs === undefined ? undefined : [...config.cliArgs],
+    cliArgs: config.cliArgs?.slice(),
   });
   const backend = selectBackend(snapshot);
 
@@ -63,14 +63,14 @@ export function validateRequest(request: Request, config: Config): void {
   if (!Array.isArray(messages) || messages.length === 0) {
     throw invalid(config, "at least one message is required");
   }
-  messages.forEach((message, index) => {
+  for (const [index, message] of messages.entries()) {
     if (message?.role !== "user" && message?.role !== "assistant") {
       throw invalid(config, `message ${index} has invalid role "${message?.role}"`);
     }
     if (typeof message.text !== "string" || message.text.trim() === "") {
       throw invalid(config, `message ${index} text is required`);
     }
-  });
+  }
 }
 
 function invalid(config: Config, message: string): LLMWrapperError {

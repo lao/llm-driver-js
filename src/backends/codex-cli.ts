@@ -1,5 +1,5 @@
 import { LLMWrapperError } from "../errors.js";
-import type { Config, Response } from "../types.js";
+import type { Config, Response, Usage } from "../types.js";
 import type { Backend } from "./backend.js";
 import {
   asRecord,
@@ -27,7 +27,7 @@ export function createCodexCliBackend(
   runner: CommandRunner = spawnRunner,
 ): Backend {
   const executable = config.cliPath ?? "codex";
-  const extraArgs = [...(config.cliArgs ?? [])];
+  const extraArgs = config.cliArgs ?? [];
 
   return {
     async generate(request, signal) {
@@ -80,23 +80,10 @@ function preferReportedFailure(
 }
 
 function parseCodexOutput(stdout: string, model: string): Response {
-  const response: Response = {
-    id: "",
-    model,
-    text: "",
-    usage: {
-      inputTokens: 0,
-      outputTokens: 0,
-      cachedInputTokens: 0,
-      cacheCreationInputTokens: 0,
-      reasoningTokens: 0,
-    },
-    completionReason: "",
-    provider: "openai",
-    flavor: "cli",
-  };
-  let completed = false;
-  let hasFinalMessage = false;
+  let id = "";
+  let text: string | undefined;
+  // Set by `turn.completed`, so its presence is what marks the turn complete.
+  let usage: Usage | undefined;
 
   for (const [index, line] of stdout.split("\n").entries()) {
     if (line.trim() === "") continue;
@@ -104,25 +91,23 @@ function parseCodexOutput(stdout: string, model: string): Response {
 
     switch (readString(event, "type")) {
       case "thread.started":
-        response.id = readString(event, "thread_id");
+        id = readString(event, "thread_id");
         break;
       case "item.completed": {
         const item = asRecord(event.item);
         if (readString(item, "type") === "agent_message") {
-          response.text = readString(item, "text");
-          hasFinalMessage = true;
+          text = readString(item, "text");
         }
         break;
       }
       case "turn.completed": {
-        const usage = asRecord(event.usage);
-        completed = true;
-        response.usage = {
-          inputTokens: readCount(usage, "input_tokens"),
-          outputTokens: readCount(usage, "output_tokens"),
-          cachedInputTokens: readCount(usage, "cached_input_tokens"),
-          cacheCreationInputTokens: readCount(usage, "cache_write_input_tokens"),
-          reasoningTokens: readCount(usage, "reasoning_output_tokens"),
+        const reported = asRecord(event.usage);
+        usage = {
+          inputTokens: readCount(reported, "input_tokens"),
+          outputTokens: readCount(reported, "output_tokens"),
+          cachedInputTokens: readCount(reported, "cached_input_tokens"),
+          cacheCreationInputTokens: readCount(reported, "cache_write_input_tokens"),
+          reasoningTokens: readCount(reported, "reasoning_output_tokens"),
         };
         break;
       }
@@ -134,17 +119,15 @@ function parseCodexOutput(stdout: string, model: string): Response {
         );
       case "error":
         throw reportedFailure("error", readString(event, "message"), "Codex CLI stream failed");
-      default:
-        break;
     }
   }
 
-  if (!completed) {
+  if (usage === undefined) {
     throw cliError("openai", "parse_failed", "Codex CLI output did not complete a turn", {
       providerCode: "missing_turn_completion",
     });
   }
-  if (!hasFinalMessage) {
+  if (text === undefined) {
     throw cliError(
       "openai",
       "parse_failed",
@@ -152,7 +135,7 @@ function parseCodexOutput(stdout: string, model: string): Response {
       { providerCode: "missing_final_message" },
     );
   }
-  return response;
+  return { id, model, text, usage, completionReason: "", provider: "openai", flavor: "cli" };
 }
 
 function reportedFailure(providerCode: string, message: string, fallback: string): LLMWrapperError {

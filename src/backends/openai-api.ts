@@ -103,18 +103,24 @@ function assertTerminalStatus(response: OpenAI.Responses.Response): void {
   });
 }
 
+/** Yields the content blocks of every well-formed message item, skipping the rest. */
+function* messageContents(
+  response: OpenAI.Responses.Response,
+): Generator<OpenAI.Responses.ResponseOutputText | OpenAI.Responses.ResponseOutputRefusal> {
+  for (const item of response.output) {
+    if (item.type === "message" && Array.isArray(item.content)) {
+      yield* item.content;
+    }
+  }
+}
+
 function outputText(response: OpenAI.Responses.Response): string {
   let text = "";
-  for (const item of response.output) {
-    if (item.type !== "message" || !Array.isArray(item.content)) {
-      continue;
-    }
-    for (const content of item.content) {
-      if (content.type === "output_text") {
-        text += content.text;
-      } else if (content.type === "refusal") {
-        text += content.refusal;
-      }
+  for (const content of messageContents(response)) {
+    if (content.type === "output_text") {
+      text += content.text;
+    } else if (content.type === "refusal") {
+      text += content.refusal;
     }
   }
   return text;
@@ -127,11 +133,8 @@ function toCompletionReason(response: OpenAI.Responses.Response): CompletionReas
   ) {
     return "max_tokens";
   }
-  for (const item of response.output) {
-    if (item.type !== "message" || !Array.isArray(item.content)) {
-      continue;
-    }
-    if (item.content.some((content) => content.type === "refusal")) {
+  for (const content of messageContents(response)) {
+    if (content.type === "refusal") {
       return "refusal";
     }
   }
