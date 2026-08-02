@@ -1,9 +1,19 @@
 {
   "name": "llmwrapper",
   "version": "0.1.0",
-  "description": "Provider-neutral text generation across Claude and OpenAI, via hosted API or local CLI.",
+  "description": "One text-generation API, four switchable targets: Claude and OpenAI, via hosted API or local CLI.",
   "license": "MIT",
+  "author": "Lucas Abreu Oliveira",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lao/llmwrapper-js.git"
+  },
+  "homepage": "https://github.com/lao/llmwrapper-js#readme",
+  "bugs": {
+    "url": "https://github.com/lao/llmwrapper-js/issues"
+  },
   "type": "module",
+  "sideEffects": false,
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -28,12 +38,13 @@
   },
   "keywords": [
     "llm",
-    "claude",
     "anthropic",
+    "claude",
     "openai",
     "codex",
     "cli",
-    "wrapper"
+    "wrapper",
+    "ai"
   ],
   "scripts": {
     "build": "tsup",
