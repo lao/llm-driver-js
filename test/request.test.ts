@@ -70,6 +70,16 @@ describe("validateRequest", () => {
     });
   });
 
+  it("rejects a non-string system prompt", () => {
+    for (const system of [42, {}, ["a"], null]) {
+      expectInvalidRequest({
+        system: system as unknown as string,
+        messages: [user("hello")],
+        maxTokens: 1,
+      });
+    }
+  });
+
   it("stamps target context on request errors", () => {
     const error = expectInvalidRequest({ messages: [], maxTokens: 1 });
     expect(error.provider).toBe("openai");

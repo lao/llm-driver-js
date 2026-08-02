@@ -34,7 +34,7 @@
     "dist"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=20.12.0"
   },
   "keywords": [
     "llm",
@@ -48,6 +48,8 @@
   ],
   "scripts": {
     "build": "tsup",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm test && npm run lint && npm run typecheck",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "lint": "biome check .",

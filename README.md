@@ -19,8 +19,8 @@ never selects or updates one for you.
 npm install llmwrapper
 ```
 
-Requires Node.js 20 or later. Ships dual ESM + CommonJS builds with TypeScript
-declarations for both.
+Requires Node.js 20.12 or later. Ships dual ESM + CommonJS builds with
+TypeScript declarations for both.
 
 ## Quick start
 
@@ -170,6 +170,9 @@ const response = await client.generate(
 );
 ```
 
+There is no default timeout: without a signal, `generate` waits as long as the
+target takes. Pass `AbortSignal.timeout(ms)` if you need a deadline.
+
 ## Scope and CLI differences
 
 The shared contract is non-streaming, text-only generation: system text,
@@ -182,15 +185,24 @@ equivalents of the hosted APIs:
   the portable request but have no reliable equivalent flag, so it is not
   enforced.
 - Claude CLI runs in single-shot print mode with the default permission mode, so
-  a headless run cannot approve agent tool actions. Codex runs with a read-only
-  sandbox. Agent CLI behavior can still differ from a hosted model endpoint.
+  a headless run cannot approve tool actions that need approval — but tools that
+  are allowed by default still run (see the security note below). Codex runs with
+  a read-only sandbox. Agent CLI behavior can still differ from a hosted model
+  endpoint.
 - System text is passed through Claude's `--append-system-prompt` flag and
   Codex's per-invocation `developer_instructions` config. Conversation text
   stays on stdin. System text may therefore be visible to local process
   inspection.
 - CLI subprocesses inherit the application's working directory and environment
-  so local authentication works. Codex's read-only sandbox prevents writes, not
-  reads; isolate the host process when prompts are not trusted.
+  so local authentication works. **Do not send untrusted prompts to a CLI
+  flavor without isolating the host process.** Codex's read-only sandbox
+  prevents writes, not reads. `claude -p` runs in the default permission mode,
+  which still lets the agent use its default-allowed read tools (`Read`,
+  `Glob`, `Grep`) without prompting, in the inherited working directory — a
+  prompt-injected run can read local files even though it cannot write them.
+  Run the host process in a sandbox or a directory with nothing sensitive in
+  it, and use `cliArgs` to tighten the CLI's own limits, e.g.
+  `cliArgs: ["--disallowed-tools", "Read,Glob,Grep"]`.
 - Usage fields are populated only when a target reports them; everything else
   is `0`.
 - Process-group cleanup on abort is POSIX-only: the subprocess is spawned
@@ -198,6 +210,11 @@ equivalents of the hosted APIs:
   grace period) so CLI-spawned helpers die too. On Windows only the direct child
   is killed, and the CLI flavors are untested there — `.cmd` shims are not
   resolved, so pass an explicit `cliPath`.
+- Being detached also means a terminal Ctrl-C does not reach the CLI child: the
+  signal goes to your process group, not its own. A live child is killed by an
+  explicit `AbortSignal`, or by the library's `process.on("exit")` handler when
+  the host shuts down normally. A host killed outright (`SIGKILL`, or a signal
+  it does not handle) leaves the CLI running until it finishes on its own.
 
 Streaming, tool/function calling, images, structured output, retries, automatic
 fallback, and persisted conversations are outside this library's current scope.

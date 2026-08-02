@@ -1,5 +1,4 @@
-import { APIUserAbortError } from "openai";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createClient } from "../src/client.js";
 import { LLMWrapperError } from "../src/errors.js";
 import { assistant, type Request as GenerateRequest, user } from "../src/types.js";
@@ -73,6 +72,29 @@ async function rejection(promise: Promise<unknown>): Promise<LLMWrapperError> {
 }
 
 describe("openai api backend", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("normalizes a missing api key into invalid_config", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "");
+    // Unresolvable host: if a key ever did resolve, the test fails loudly
+    // instead of reaching a real API.
+    const client = createClient({
+      provider: "openai",
+      flavor: "api",
+      model: "gpt-test",
+      baseUrl: BASE_URL,
+    });
+
+    const error = await rejection(client.generate(PROMPT));
+
+    expect(error.code).toBe("invalid_config");
+    expect(error.provider).toBe("openai");
+    expect(error.flavor).toBe("api");
+    expect(error.operation).toBe("generate");
+  });
+
   it("maps the request onto the Responses API", async () => {
     const stub = stubFetch(200, RESPONSE);
     await clientWith(stub.impl).generate(PROMPT);
@@ -249,8 +271,9 @@ describe("openai api backend", () => {
     expect(error.operation).toBe("generate");
   });
 
-  it("aborts an in-flight request and surfaces the abort reason untouched", async () => {
+  it("aborts an in-flight request and surfaces the abort reason itself", async () => {
     const controller = new AbortController();
+    const reason = new Error("my-timeout");
     const client = clientWith(
       (_input, init) =>
         new Promise((_resolve, reject) => {
@@ -259,15 +282,8 @@ describe("openai api backend", () => {
     );
 
     const pending = client.generate(PROMPT, { signal: controller.signal });
-    controller.abort();
+    controller.abort(reason);
 
-    const error = await pending.then(
-      () => {
-        throw new Error("expected generate() to reject");
-      },
-      (reason: unknown) => reason,
-    );
-    expect(error).not.toBeInstanceOf(LLMWrapperError);
-    expect(error).toBeInstanceOf(APIUserAbortError);
+    await expect(pending).rejects.toBe(reason);
   });
 });

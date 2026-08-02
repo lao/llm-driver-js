@@ -24,8 +24,9 @@ export function createOpenAiApiBackend(config: Config): Backend {
           await client.responses.create(toParams(config.model, request), { signal }),
         );
       } catch (error) {
-        // An abort surfaces its own reason untouched, like the CLI flavors.
-        if (signal?.aborted) throw error;
+        // An abort surfaces the signal's own reason, like the CLI flavors —
+        // never the SDK's APIUserAbortError stand-in.
+        if (signal?.aborted) throw signal.reason;
         throw normalizeError(error);
       }
     },

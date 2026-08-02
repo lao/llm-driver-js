@@ -36,11 +36,22 @@ export function validateConfig(config: Config): void {
     }
   }
 
-  if (config.flavor === "api" && config.baseUrl !== undefined && !isHttpUrl(config.baseUrl)) {
+  if (config.baseUrl !== undefined && !isHttpUrl(config.baseUrl)) {
     throw invalid(config, "baseUrl must be an absolute HTTP(S) URL");
   }
-  if (config.flavor === "cli" && config.cliPath !== undefined && config.cliPath.trim() === "") {
-    throw invalid(config, "cliPath cannot be blank");
+  if (
+    config.cliPath !== undefined &&
+    (typeof config.cliPath !== "string" || !config.cliPath.trim())
+  ) {
+    throw invalid(config, "cliPath must be a non-blank string");
+  }
+  // A JS caller passing a bare string would otherwise be spread into argv one
+  // character at a time, and a non-string element would crash spawn().
+  if (
+    config.cliArgs !== undefined &&
+    (!Array.isArray(config.cliArgs) || config.cliArgs.some((arg) => typeof arg !== "string"))
+  ) {
+    throw invalid(config, "cliArgs must be an array of strings");
   }
 }
 

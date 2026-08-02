@@ -1,5 +1,6 @@
-import { APIUserAbortError } from "@anthropic-ai/sdk";
-import { describe, expect, it } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createClient } from "../src/client.js";
 import { LLMWrapperError } from "../src/errors.js";
 import { assistant, type Request as GenerateRequest, user } from "../src/types.js";
@@ -66,6 +67,32 @@ async function rejection(promise: Promise<unknown>): Promise<LLMWrapperError> {
 }
 
 describe("anthropic api backend", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("normalizes unresolvable credentials into invalid_config", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "");
+    // Keeps the SDK's credential chain off any config file this machine has.
+    vi.stubEnv("ANTHROPIC_CONFIG_DIR", join(tmpdir(), "llmwrapper-absent-config"));
+    // Unresolvable host: if credentials ever did resolve, the test fails loudly
+    // instead of reaching a real API.
+    const client = createClient({
+      provider: "claude",
+      flavor: "api",
+      model: "claude-test",
+      baseUrl: BASE_URL,
+    });
+
+    const error = await rejection(client.generate(PROMPT));
+
+    expect(error.code).toBe("invalid_config");
+    expect(error.provider).toBe("claude");
+    expect(error.flavor).toBe("api");
+    expect(error.operation).toBe("generate");
+  });
+
   it("maps the request onto the Messages API", async () => {
     const stub = stubFetch(200, MESSAGE);
     await clientWith(stub.impl).generate(PROMPT);
@@ -185,8 +212,9 @@ describe("anthropic api backend", () => {
     expect(error.operation).toBe("generate");
   });
 
-  it("aborts an in-flight request and surfaces the abort reason untouched", async () => {
+  it("aborts an in-flight request and surfaces the abort reason itself", async () => {
     const controller = new AbortController();
+    const reason = new Error("my-timeout");
     const client = clientWith(
       (_input, init) =>
         new Promise((_resolve, reject) => {
@@ -195,15 +223,8 @@ describe("anthropic api backend", () => {
     );
 
     const pending = client.generate(PROMPT, { signal: controller.signal });
-    controller.abort();
+    controller.abort(reason);
 
-    const error = await pending.then(
-      () => {
-        throw new Error("expected generate() to reject");
-      },
-      (reason: unknown) => reason,
-    );
-    expect(error).not.toBeInstanceOf(LLMWrapperError);
-    expect(error).toBeInstanceOf(APIUserAbortError);
+    await expect(pending).rejects.toBe(reason);
   });
 });

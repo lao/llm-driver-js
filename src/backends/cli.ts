@@ -6,6 +6,8 @@ import type { Message, Provider } from "../types.js";
 const MAX_OUTPUT_BYTES = 16 << 20;
 /** Grace period between SIGTERM and SIGKILL once a run is aborted. */
 const KILL_GRACE_MS = 250;
+/** Cap on the stderr excerpt quoted in a `process_failed` message. */
+const MAX_STDERR_MESSAGE_CHARS = 4 << 10;
 
 /** One CLI invocation: argv is built directly and the prompt goes on stdin. */
 export interface Command {
@@ -69,9 +71,12 @@ export async function executeCli(
   if (result.exitCode !== 0) {
     return {
       stdout: result.stdout,
-      failure: cliError(provider, "process_failed", result.stderr.trim() || "CLI command failed", {
-        status: result.exitCode,
-      }),
+      failure: cliError(
+        provider,
+        "process_failed",
+        truncate(result.stderr.trim()) || "CLI command failed",
+        { status: result.exitCode },
+      ),
     };
   }
   return { stdout: result.stdout };
@@ -158,13 +163,34 @@ export function createBoundedCapture(limit = MAX_OUTPUT_BYTES) {
 
 const POSIX = process.platform !== "win32";
 
+/** Detached children still running, so host exit does not orphan them. */
+const liveChildren = new Set<ChildProcess>();
+let exitHookInstalled = false;
+
+/**
+ * Registers a child for cleanup if the host process exits mid-run. The handler
+ * is installed on first spawn and only does synchronous work, which is all an
+ * `exit` listener can do — `process.kill` qualifies.
+ */
+function trackChild(child: ChildProcess): void {
+  liveChildren.add(child);
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.once("exit", () => {
+    for (const live of liveChildren) killGroup(live, "SIGKILL");
+  });
+}
+
 /**
  * Signals the child's whole process group, so the helper processes `claude` and
  * `codex` spawn die with it. Falls back to the direct child when the group is
  * already gone (`ESRCH`) or on Windows, which has no process groups.
  */
 function killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (POSIX && child.pid !== undefined) {
+  // Once the child is reaped its pid can be recycled, and `-pid` would then
+  // signal an unrelated group; only the direct-child kill stays safe.
+  const alive = child.exitCode === null && child.signalCode === null;
+  if (POSIX && alive && child.pid !== undefined) {
     try {
       process.kill(-child.pid, signal);
       return;
@@ -192,6 +218,7 @@ export const spawnRunner: CommandRunner = (command, signal) =>
       stdio: ["pipe", "pipe", "pipe"],
       detached: POSIX,
     });
+    trackChild(child);
     const stdout = createBoundedCapture();
     const stderr = createBoundedCapture();
     let killTimer: NodeJS.Timeout | undefined;
@@ -205,10 +232,21 @@ export const spawnRunner: CommandRunner = (command, signal) =>
     const settle = (finish: () => void) => {
       if (settled) return;
       settled = true;
+      liveChildren.delete(child);
       signal?.removeEventListener("abort", onAbort);
       clearTimeout(killTimer);
       finish();
     };
+    const finishRun = (code: number | null) =>
+      settle(() => {
+        if (signal?.aborted) {
+          reject(signal.reason);
+        } else if (stdout.overflowed() || stderr.overflowed()) {
+          reject(new Error(`CLI output exceeds ${MAX_OUTPUT_BYTES} bytes`));
+        } else {
+          resolve({ stdout: stdout.text(), stderr: stderr.text(), exitCode: code ?? -1 });
+        }
+      });
 
     signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", (chunk: Buffer) => {
@@ -218,17 +256,12 @@ export const spawnRunner: CommandRunner = (command, signal) =>
       if (!stderr.push(chunk)) killGroup(child, "SIGKILL");
     });
     child.on("error", (error) => settle(() => reject(error)));
-    child.on("close", (code) =>
-      settle(() => {
-        if (signal?.aborted) {
-          reject(signal.reason);
-        } else if (stdout.overflowed() || stderr.overflowed()) {
-          reject(new Error(`CLI output exceeds ${MAX_OUTPUT_BYTES} bytes`));
-        } else {
-          resolve({ stdout: stdout.text(), stderr: stderr.text(), exitCode: code ?? -1 });
-        }
-      }),
-    );
+    child.on("close", finishRun);
+    // A grandchild that escaped the process group can hold the stdout pipe open
+    // forever, so an aborted run settles on the child's own exit instead.
+    child.on("exit", (code) => {
+      if (signal?.aborted) finishRun(code);
+    });
     // The child may exit before reading the prompt; a broken pipe is not fatal.
     child.stdin.on("error", () => {});
     child.stdin.end(command.stdin);
@@ -252,6 +285,13 @@ function isErrno(error: unknown, code: string): boolean {
   return (
     typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === code
   );
+}
+
+/** Keeps a runaway CLI's stderr from becoming an unbounded error message. */
+function truncate(text: string): string {
+  return text.length <= MAX_STDERR_MESSAGE_CHARS
+    ? text
+    : `${text.slice(0, MAX_STDERR_MESSAGE_CHARS)}… (truncated)`;
 }
 
 function describe(error: unknown): string {

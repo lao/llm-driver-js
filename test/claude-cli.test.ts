@@ -198,6 +198,20 @@ describe("claude cli failures", () => {
       message: "wrong payload",
     },
     {
+      name: "an empty JSON object",
+      result: { stdout: "{}" },
+      code: "api_error",
+      providerCode: "unsuccessful_result",
+      message: "Claude CLI returned an unsuccessful result",
+    },
+    {
+      name: "a result with no subtype",
+      result: { stdout: '{"type":"result"}' },
+      code: "api_error",
+      providerCode: "unsuccessful_result",
+      message: "Claude CLI returned an unsuccessful result",
+    },
+    {
       name: "unsuccessful result without a message",
       result: { stdout: '{"type":"result","subtype":"success","is_error":true,"result":"  "}' },
       code: "api_error",

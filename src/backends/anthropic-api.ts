@@ -10,6 +10,14 @@ export function createAnthropicApiBackend(config: Config): Backend {
   // Built on first use so credential resolution fails from generate() rather
   // than from createClient().
   let client: Anthropic | undefined;
+  // The SDK raises unresolvable credentials as a plain Error while building the
+  // request, so the class alone cannot tell a config problem from a transport
+  // one. Reaching the transport even once proves the credentials resolved.
+  let reachedTransport = false;
+  const fetchImpl: typeof fetch = (input, init) => {
+    reachedTransport = true;
+    return (config.fetch ?? globalThis.fetch)(input, init);
+  };
 
   return {
     async generate(request, signal) {
@@ -17,16 +25,17 @@ export function createAnthropicApiBackend(config: Config): Backend {
         client ??= new Anthropic({
           apiKey: config.apiKey,
           baseURL: config.baseUrl,
-          fetch: config.fetch,
+          fetch: fetchImpl,
           maxRetries: 0, // retries are out of scope: one request per generate()
         });
         return toResponse(
           await client.messages.create(toParams(config.model, request), { signal }),
         );
       } catch (error) {
-        // An abort surfaces its own reason untouched, like the CLI flavors.
-        if (signal?.aborted) throw error;
-        throw normalizeError(error);
+        // An abort surfaces the signal's own reason, like the CLI flavors —
+        // never the SDK's APIUserAbortError stand-in.
+        if (signal?.aborted) throw signal.reason;
+        throw normalizeError(error, reachedTransport);
       }
     },
   };
@@ -87,7 +96,7 @@ function toCompletionReason(reason: Anthropic.StopReason | null): CompletionReas
   }
 }
 
-function normalizeError(error: unknown): LLMWrapperError {
+function normalizeError(error: unknown, reachedTransport: boolean): LLMWrapperError {
   if (error instanceof LLMWrapperError) {
     return error;
   }
@@ -102,14 +111,13 @@ function normalizeError(error: unknown): LLMWrapperError {
       providerCode: error.type ?? undefined,
     });
   }
-  if (error instanceof AnthropicError) {
-    return new LLMWrapperError("invalid_config", error.message, options);
+  const message = error instanceof Error ? error.message : String(error);
+  // An SDK error, or anything raised before a request ever left the process, is
+  // a setup problem — unresolvable credentials above all — not a transport one.
+  if (error instanceof AnthropicError || !reachedTransport) {
+    return new LLMWrapperError("invalid_config", message, options);
   }
-  return new LLMWrapperError(
-    "transport_failed",
-    error instanceof Error ? error.message : String(error),
-    options,
-  );
+  return new LLMWrapperError("transport_failed", message, options);
 }
 
 /** Anthropic reports the human-readable message inside `error.error.message`. */

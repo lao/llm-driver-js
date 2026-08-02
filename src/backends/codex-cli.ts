@@ -73,6 +73,7 @@ function preferReportedFailure(
       return cliError("openai", diagnostic.code, diagnostic.message, {
         status: failure.status,
         providerCode: diagnostic.providerCode,
+        cause: diagnostic.cause,
       });
     }
   }

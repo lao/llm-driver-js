@@ -104,6 +104,29 @@ describe("validateConfig", () => {
     expectInvalidConfig({ provider: "openai", flavor: "api", model: "m", cliArgs: ["--json"] });
   });
 
+  it("rejects cliArgs that is not an array of strings", () => {
+    // A JS caller passing a bare string would otherwise be spread into argv
+    // one character at a time.
+    expectInvalidConfig({
+      provider: "claude",
+      flavor: "cli",
+      model: "m",
+      cliArgs: "--verbose" as unknown as string[],
+    });
+    expectInvalidConfig({
+      provider: "claude",
+      flavor: "cli",
+      model: "m",
+      cliArgs: [1, 2] as unknown as string[],
+    });
+    expectInvalidConfig({
+      provider: "claude",
+      flavor: "cli",
+      model: "m",
+      cliArgs: [null] as unknown as string[],
+    });
+  });
+
   it("rejects a blank cli path", () => {
     expectInvalidConfig({ provider: "claude", flavor: "cli", model: "m", cliPath: "  " });
   });

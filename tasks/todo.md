@@ -8,4 +8,4 @@
 - [x] Checkpoint: full gate green (build/test/coverage/lint/typecheck)
 - [x] Review (five-axis, opus max) + fix findings
 - [x] Simplify (behavior-preserving, −14 LOC)
-- [ ] Ship: README ✓, LICENSE ✓, CLAUDE.md ✓, go/no-go fan-out in progress; npm publish left to user
+- [x] Ship: README, LICENSE, CLAUDE.md, go/no-go fan-out (3 personas) + all findings fixed; npm publish left to user

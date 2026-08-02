@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -142,6 +143,14 @@ describe("executeCli", () => {
     expect(failure?.message).toBe("CLI command failed");
   });
 
+  it("truncates a huge stderr in the process_failed message", async () => {
+    const runner = resultRunner({ stderr: "x".repeat(100_000), exitCode: 1 });
+
+    const { failure } = await executeCli("claude", command, runner);
+
+    expect(failure?.message).toBe(`${"x".repeat(4096)}… (truncated)`);
+  });
+
   it("rethrows a caller abort untouched", async () => {
     const controller = new AbortController();
     const reason = new Error("caller aborted");
@@ -212,6 +221,94 @@ describe("spawnRunner", () => {
       }
     },
     10_000,
+  );
+
+  it("resolves when the child exits before reading a multi-megabyte stdin", async () => {
+    const result = await spawnRunner({
+      executable: node,
+      args: ["-e", "process.exit(0)"],
+      stdin: "x".repeat(8 << 20),
+    });
+
+    expect(result).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+  }, 15_000);
+
+  it.skipIf(process.platform === "win32")(
+    "settles an aborted run even when an escaped grandchild holds stdout open",
+    async () => {
+      const pidFile = join(mkdtempSync(join(tmpdir(), "llmwrapper-")), "escapee.pid");
+      // `detached` puts the grandchild in its own group, out of reach of the
+      // group kill, and it inherits fd 1 so the stdout pipe never closes.
+      const script =
+        "const {spawn}=require('node:child_process');" +
+        "const g=spawn(process.execPath,['-e','setInterval(()=>{},1000)']," +
+        "{detached:true,stdio:['ignore',1,'ignore']});g.unref();" +
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(g.pid));` +
+        "setInterval(()=>{},1000)";
+      const controller = new AbortController();
+      const reason = new Error("cancelled");
+      const running = spawnRunner(
+        { executable: node, args: ["-e", script], stdin: "" },
+        controller.signal,
+      );
+
+      await expect.poll(() => readPid(pidFile), { timeout: 5000 }).toBeGreaterThan(0);
+      const pid = readPid(pidFile);
+      try {
+        controller.abort(reason);
+        await expect(running).rejects.toBe(reason);
+      } finally {
+        if (isRunning(pid)) process.kill(pid, "SIGKILL");
+      }
+    },
+    15_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "kills a live detached child when the host process exits",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "llmwrapper-"));
+      const pidFile = join(dir, "child.pid");
+      const script = join(dir, "host.ts");
+      const cliModule = join(import.meta.dirname, "..", "src", "backends", "cli.ts");
+      // A host that dies mid-run without aborting: only the exit handler can
+      // stop the detached child from outliving it. PID_FILE is inherited, so
+      // neither script has to quote a path inside a quoted script.
+      writeFileSync(
+        script,
+        [
+          'import { existsSync } from "node:fs";',
+          `import { spawnRunner } from ${JSON.stringify(cliModule)};`,
+          "const child =",
+          "  \"require('node:fs').writeFileSync(process.env.PID_FILE, String(process.pid));\" +",
+          '  "setInterval(() => {}, 1000)";',
+          'spawnRunner({ executable: process.execPath, args: ["-e", child], stdin: "" }).catch(() => {});',
+          "const poll = setInterval(() => {",
+          "  if (existsSync(process.env.PID_FILE)) { clearInterval(poll); process.exit(0); }",
+          "}, 50);",
+        ].join("\n"),
+      );
+
+      await new Promise<void>((resolve, reject) => {
+        const host = spawn(process.execPath, ["--import", "tsx/esm", script], {
+          // so `tsx/esm` resolves out of this package's node_modules
+          cwd: join(import.meta.dirname, ".."),
+          env: { ...process.env, PID_FILE: pidFile },
+          stdio: "ignore",
+        });
+        host.on("error", reject);
+        host.on("exit", () => resolve());
+      });
+
+      const pid = readPid(pidFile);
+      expect(pid).toBeGreaterThan(0);
+      try {
+        await expect.poll(() => isRunning(pid), { timeout: 5000 }).toBe(false);
+      } finally {
+        if (isRunning(pid)) process.kill(pid, "SIGKILL");
+      }
+    },
+    30_000,
   );
 
   it("escalates to SIGKILL when an aborted child ignores SIGTERM", async () => {

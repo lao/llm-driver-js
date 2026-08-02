@@ -56,7 +56,10 @@ export function validateRequest(request: Request, config: Config): void {
   if (typeof request !== "object" || request === null) {
     throw invalid(config, "request is required");
   }
-  const { maxTokens, messages } = request;
+  const { maxTokens, messages, system } = request;
+  if (system !== undefined && typeof system !== "string") {
+    throw invalid(config, "system must be a string");
+  }
   if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
     throw invalid(config, "maxTokens must be a positive integer");
   }
