@@ -1,5 +1,5 @@
 import OpenAI, { APIConnectionError, APIError, OpenAIError } from "openai";
-import { LLMWrapperError } from "../errors.js";
+import { LLMShimError } from "../errors.js";
 import type { CompletionReason, Config, Request, Response } from "../types.js";
 import type { Backend } from "./backend.js";
 
@@ -52,7 +52,7 @@ export function createOpenAiApiBackend(config: Config): Backend {
           ) {
             yield { type: "text", text: event.delta };
           } else if (event.type === "error") {
-            throw new LLMWrapperError("api_error", event.message, {
+            throw new LLMShimError("api_error", event.message, {
               ...CONTEXT,
               providerCode: event.code ?? undefined,
             });
@@ -69,7 +69,7 @@ export function createOpenAiApiBackend(config: Config): Backend {
         // here rather than only in the catch.
         if (signal?.aborted) throw signal.reason;
         if (!final) {
-          throw new LLMWrapperError(
+          throw new LLMShimError(
             "parse_failed",
             "OpenAI stream ended without a final response",
             CONTEXT,
@@ -112,7 +112,7 @@ function toParams(
 
 function toResponse(response: OpenAI.Responses.Response): Response {
   if (!Array.isArray(response?.output)) {
-    throw new LLMWrapperError("parse_failed", "OpenAI response contained no output items", CONTEXT);
+    throw new LLMShimError("parse_failed", "OpenAI response contained no output items", CONTEXT);
   }
   assertTerminalStatus(response);
   const usage = response.usage;
@@ -151,7 +151,7 @@ function assertTerminalStatus(response: OpenAI.Responses.Response): void {
     code = incompleteReason;
     message = `OpenAI response was incomplete: ${incompleteReason}`;
   }
-  throw new LLMWrapperError("api_error", message, {
+  throw new LLMShimError("api_error", message, {
     ...CONTEXT,
     providerCode: code || "unknown_status",
   });
@@ -195,8 +195,8 @@ function toCompletionReason(response: OpenAI.Responses.Response): CompletionReas
   return "stop";
 }
 
-function normalizeError(error: unknown): LLMWrapperError {
-  if (error instanceof LLMWrapperError) {
+function normalizeError(error: unknown): LLMShimError {
+  if (error instanceof LLMShimError) {
     return error;
   }
   const options = { ...CONTEXT, cause: error };
@@ -204,18 +204,18 @@ function normalizeError(error: unknown): LLMWrapperError {
     // A mid-stream error payload also arrives as an APIError, without a status;
     // only a connection failure is a transport problem.
     if (error instanceof APIConnectionError) {
-      return new LLMWrapperError("transport_failed", error.message, options);
+      return new LLMShimError("transport_failed", error.message, options);
     }
-    return new LLMWrapperError("api_error", apiErrorMessage(error), {
+    return new LLMShimError("api_error", apiErrorMessage(error), {
       ...options,
       status: error.status,
       providerCode: error.code || error.type || undefined,
     });
   }
   if (error instanceof OpenAIError) {
-    return new LLMWrapperError("invalid_config", error.message, options);
+    return new LLMShimError("invalid_config", error.message, options);
   }
-  return new LLMWrapperError(
+  return new LLMShimError(
     "transport_failed",
     error instanceof Error ? error.message : String(error),
     options,

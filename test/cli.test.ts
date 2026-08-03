@@ -16,7 +16,7 @@ import {
   spawnStreamRunner,
   streamCli,
 } from "../src/backends/cli.js";
-import { LLMWrapperError } from "../src/errors.js";
+import { LLMShimError } from "../src/errors.js";
 import { assistant, user } from "../src/types.js";
 
 const command: Command = { executable: "claude", args: ["-p"], stdin: "Hello" };
@@ -181,7 +181,7 @@ describe("executeCli", () => {
   it("maps a missing executable to executable_not_found", async () => {
     const { failure } = await executeCli("claude", command, failingRunner(enoent()));
 
-    expect(failure).toBeInstanceOf(LLMWrapperError);
+    expect(failure).toBeInstanceOf(LLMShimError);
     expect(failure?.code).toBe("executable_not_found");
     expect(failure?.message).toContain("claude");
     expect(failure?.provider).toBe("claude");

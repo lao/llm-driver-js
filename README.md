@@ -1,6 +1,6 @@
-# llmwrapper
+# llm-shim
 
-`llmwrapper` is a small TypeScript library with one text-generation API and four
+`llm-shim` is a small TypeScript library with one text-generation API and four
 switchable targets. Point it at a hosted provider API or at an agent CLI you are
 already logged into, and switch between them by changing configuration only —
 the `generate` call site never changes. Models are always explicit; the library
@@ -16,7 +16,7 @@ never selects or updates one for you.
 ## Install
 
 ```bash
-npm install llmwrapper
+npm install llm-shim
 ```
 
 Requires Node.js 20.12 or later. Ships dual ESM + CommonJS builds with
@@ -25,7 +25,7 @@ TypeScript declarations for both.
 ## Quick start
 
 ```ts
-import { createClient, user } from "llmwrapper";
+import { createClient, user } from "llm-shim";
 
 const client = createClient({
   provider: "openai",
@@ -45,7 +45,7 @@ console.log(response.text);
 CommonJS works too:
 
 ```js
-const { createClient, user } = require("llmwrapper");
+const { createClient, user } = require("llm-shim");
 ```
 
 The response is provider-neutral:
@@ -135,7 +135,7 @@ the iteration rather than from the call:
 - Request validation happens on the first `next()`, not when `generateStream` is
   called — standard async-generator semantics. `const it = client.generateStream(bad)`
   does not throw; the `for await` that drives it does.
-- A failure throws an `LLMWrapperError` from the loop; an abort throws the
+- A failure throws an `LLMShimError` from the loop; an abort throws the
   signal's own reason untouched, identically across all four targets.
 - Stopping early cleans up the transport. `break`, `return`, or `throw` inside
   the loop aborts the HTTP stream, or signals the CLI process group (SIGTERM,
@@ -198,11 +198,11 @@ client — or `cliPath`/`cliArgs` to an `api` client — is rejected with an
 
 ## Error handling
 
-Every failure is an `LLMWrapperError` carrying a stable `code` plus whatever
+Every failure is an `LLMShimError` carrying a stable `code` plus whatever
 context the target reported.
 
 ```ts
-import { createClient, LLMWrapperError, user } from "llmwrapper";
+import { createClient, LLMShimError, user } from "llm-shim";
 
 try {
   const response = await client.generate({
@@ -211,7 +211,7 @@ try {
   });
   console.log(response.text);
 } catch (error) {
-  if (error instanceof LLMWrapperError) {
+  if (error instanceof LLMShimError) {
     console.error(error.code, error.provider, error.flavor, error.status);
   }
   throw error;
@@ -233,7 +233,7 @@ Other fields: `provider`, `flavor`, `operation` (e.g. `"generate"`), `status`
 
 Abort is deliberately different. Pass an `AbortSignal` and, when it fires,
 `generate` rejects with the signal's abort reason itself — never a wrapped
-`LLMWrapperError` — identically across all four targets:
+`LLMShimError` — identically across all four targets:
 
 ```ts
 const response = await client.generate(

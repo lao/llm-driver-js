@@ -8,7 +8,7 @@ import type {
   Config,
   ErrorCode,
   Flavor,
-  LLMWrapperErrorOptions,
+  LLMShimErrorOptions,
   Message,
   Provider,
   Request,
@@ -20,7 +20,7 @@ import type {
 import * as barrel from "../src/index.js";
 
 /** The public surface SPEC.md promises; anything else is an internal leak. */
-const RUNTIME_EXPORTS = ["LLMWrapperError", "assistant", "createClient", "user"];
+const RUNTIME_EXPORTS = ["LLMShimError", "assistant", "createClient", "user"];
 
 // Compile-time proof that every documented type is exported from the barrel;
 // `tsc --noEmit` fails if one goes missing.
@@ -30,7 +30,7 @@ type _Types = [
   Config,
   ErrorCode,
   Flavor,
-  LLMWrapperErrorOptions,
+  LLMShimErrorOptions,
   Message,
   Provider,
   Request,
@@ -49,7 +49,7 @@ describe("src/index.ts barrel", () => {
     expect(typeof barrel.createClient).toBe("function");
     expect(barrel.user("hi")).toEqual({ role: "user", text: "hi" });
     expect(barrel.assistant("yo")).toEqual({ role: "assistant", text: "yo" });
-    expect(new barrel.LLMWrapperError("invalid_config", "nope").code).toBe("invalid_config");
+    expect(new barrel.LLMShimError("invalid_config", "nope").code).toBe("invalid_config");
   });
 });
 

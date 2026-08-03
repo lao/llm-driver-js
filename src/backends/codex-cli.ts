@@ -1,4 +1,4 @@
-import { LLMWrapperError } from "../errors.js";
+import { LLMShimError } from "../errors.js";
 import type { Config, Request, Response, Usage } from "../types.js";
 import type { Backend } from "./backend.js";
 import {
@@ -75,17 +75,13 @@ export function createCodexCliBackend(
  * A crashed `codex exec` usually still streams why it failed, so a reported
  * turn failure beats the bare exit code — keeping the exit code as the status.
  */
-function preferReportedFailure(
-  failure: LLMWrapperError,
-  stdout: string,
-  model: string,
-): LLMWrapperError {
+function preferReportedFailure(failure: LLMShimError, stdout: string, model: string): LLMShimError {
   if (failure.status === undefined) return failure;
   try {
     parseCodexOutput(stdout, model);
   } catch (diagnostic) {
     if (
-      diagnostic instanceof LLMWrapperError &&
+      diagnostic instanceof LLMShimError &&
       (diagnostic.providerCode === "turn_failed" || diagnostic.providerCode === "error")
     ) {
       return cliError("openai", diagnostic.code, diagnostic.message, {
@@ -157,6 +153,6 @@ function parseCodexOutput(stdout: string, model: string): Response {
   return { id, model, text, usage, completionReason: "", provider: "openai", flavor: "cli" };
 }
 
-function reportedFailure(providerCode: string, message: string, fallback: string): LLMWrapperError {
+function reportedFailure(providerCode: string, message: string, fallback: string): LLMShimError {
   return cliError("openai", "api_error", message.trim() || fallback, { providerCode });
 }
