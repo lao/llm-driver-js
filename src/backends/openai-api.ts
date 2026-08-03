@@ -1,4 +1,4 @@
-import OpenAI, { APIError, OpenAIError } from "openai";
+import OpenAI, { APIConnectionError, APIError, OpenAIError } from "openai";
 import { LLMWrapperError } from "../errors.js";
 import type { CompletionReason, Config, Request, Response } from "../types.js";
 import type { Backend } from "./backend.js";
@@ -28,6 +28,64 @@ export function createOpenAiApiBackend(config: Config): Backend {
         // never the SDK's APIUserAbortError stand-in.
         if (signal?.aborted) throw signal.reason;
         throw normalizeError(error);
+      }
+    },
+
+    async *generateStream(request, signal) {
+      // Aborted in the generator's cleanup so an early consumer break tears the
+      // HTTP stream down instead of leaking it.
+      const controller = new AbortController();
+      try {
+        client ??= new OpenAI({
+          apiKey: config.apiKey,
+          baseURL: config.baseUrl,
+          fetch: config.fetch,
+          maxRetries: 0,
+        });
+        const stream = await client.responses.create(
+          { ...toParams(config.model, request), stream: true },
+          { signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal },
+        );
+
+        let final: OpenAI.Responses.Response | undefined;
+        for await (const event of stream) {
+          // Refusal text lands in the final response's text, so it has to be
+          // streamed too for the deltas to add up to it.
+          if (
+            event.type === "response.output_text.delta" ||
+            event.type === "response.refusal.delta"
+          ) {
+            yield { type: "text", text: event.delta };
+          } else if (event.type === "error") {
+            throw new LLMWrapperError("api_error", event.message, {
+              ...CONTEXT,
+              providerCode: event.code ?? undefined,
+            });
+          } else if (
+            event.type === "response.completed" ||
+            event.type === "response.incomplete" ||
+            event.type === "response.failed"
+          ) {
+            final = event.response;
+          }
+        }
+
+        // The SDK ends the iteration silently on abort, so the check has to be
+        // here rather than only in the catch.
+        if (signal?.aborted) throw signal.reason;
+        if (!final) {
+          throw new LLMWrapperError(
+            "parse_failed",
+            "OpenAI stream ended without a final response",
+            CONTEXT,
+          );
+        }
+        yield { type: "done", response: toResponse(final) };
+      } catch (error) {
+        if (signal?.aborted) throw signal.reason;
+        throw normalizeError(error);
+      } finally {
+        controller.abort();
       }
     },
   };
@@ -148,7 +206,9 @@ function normalizeError(error: unknown): LLMWrapperError {
   }
   const options = { ...CONTEXT, cause: error };
   if (error instanceof APIError) {
-    if (typeof error.status !== "number") {
+    // A mid-stream error payload also arrives as an APIError, without a status;
+    // only a connection failure is a transport problem.
+    if (error instanceof APIConnectionError) {
       return new LLMWrapperError("transport_failed", error.message, options);
     }
     return new LLMWrapperError("api_error", apiErrorMessage(error), {

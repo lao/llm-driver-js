@@ -5,12 +5,16 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   type Command,
+  type CommandChunk,
   type CommandRunner,
   createBoundedCapture,
   executeCli,
   readCount,
   renderTranscript,
+  type StreamingCommandRunner,
   spawnRunner,
+  spawnStreamRunner,
+  streamCli,
 } from "../src/backends/cli.js";
 import { LLMWrapperError } from "../src/errors.js";
 import { assistant, user } from "../src/types.js";
@@ -323,4 +327,253 @@ describe("spawnRunner", () => {
 
     await expect(running).rejects.toBe(reason);
   });
+});
+
+describe("streamCli", () => {
+  function chunkRunner(chunks: CommandChunk[], error?: unknown): StreamingCommandRunner {
+    return async function* () {
+      if (error !== undefined) throw error;
+      yield* chunks;
+    };
+  }
+
+  async function collect(lines: AsyncIterable<string>): Promise<string[]> {
+    const seen: string[] = [];
+    for await (const line of lines) seen.push(line);
+    return seen;
+  }
+
+  it("yields stdout lines and forwards the command and signal to the runner", async () => {
+    const seen: Array<{ command: Command; signal?: AbortSignal }> = [];
+    const signal = new AbortController().signal;
+    const runner: StreamingCommandRunner = async function* (received, receivedSignal) {
+      seen.push({ command: received, signal: receivedSignal });
+      yield { type: "line", line: "first" };
+      yield { type: "line", line: "second" };
+      yield { type: "exit", exitCode: 0, stderr: "" };
+    };
+
+    expect(await collect(streamCli("claude", command, runner, signal))).toEqual([
+      "first",
+      "second",
+    ]);
+    expect(seen).toEqual([{ command, signal }]);
+  });
+
+  it("maps a missing executable to executable_not_found", async () => {
+    const lines = streamCli("claude", command, chunkRunner([], enoent()));
+
+    await expect(collect(lines)).rejects.toMatchObject({
+      code: "executable_not_found",
+      provider: "claude",
+      flavor: "cli",
+      operation: "generate",
+    });
+  });
+
+  it("maps any other launch failure to process_failed", async () => {
+    const lines = streamCli("openai", command, chunkRunner([], new Error("launch failed")));
+
+    await expect(collect(lines)).rejects.toMatchObject({
+      code: "process_failed",
+      message: "launch failed",
+      status: undefined,
+    });
+  });
+
+  it("maps a non-zero exit to process_failed after yielding the lines", async () => {
+    const seen: string[] = [];
+    const lines = streamCli(
+      "claude",
+      command,
+      chunkRunner([
+        { type: "line", line: "partial" },
+        { type: "exit", exitCode: 17, stderr: "  boom\n" },
+      ]),
+    );
+
+    await expect(
+      (async () => {
+        for await (const line of lines) seen.push(line);
+      })(),
+    ).rejects.toMatchObject({ code: "process_failed", status: 17, message: "boom" });
+    expect(seen).toEqual(["partial"]);
+  });
+
+  it("truncates a huge stderr in the process_failed message", async () => {
+    const lines = streamCli(
+      "claude",
+      command,
+      chunkRunner([{ type: "exit", exitCode: 1, stderr: "x".repeat(100_000) }]),
+    );
+
+    await expect(collect(lines)).rejects.toMatchObject({
+      message: `${"x".repeat(4096)}… (truncated)`,
+    });
+  });
+
+  it("falls back to a generic message when a failing process writes no stderr", async () => {
+    const lines = streamCli(
+      "claude",
+      command,
+      chunkRunner([{ type: "exit", exitCode: 1, stderr: "" }]),
+    );
+
+    await expect(collect(lines)).rejects.toMatchObject({ message: "CLI command failed" });
+  });
+
+  it("rethrows a caller abort untouched", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    // biome-ignore lint/correctness/useYield: aborting before any output is the case.
+    const runner: StreamingCommandRunner = async function* (_command, signal) {
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+
+    await expect(collect(streamCli("claude", command, runner, controller.signal))).rejects.toBe(
+      reason,
+    );
+  });
+
+  it("closes the runner when the consumer breaks early", async () => {
+    let closed = false;
+    const runner: StreamingCommandRunner = async function* () {
+      try {
+        yield { type: "line", line: "first" };
+        yield { type: "line", line: "second" };
+      } finally {
+        closed = true;
+      }
+    };
+
+    for await (const line of streamCli("claude", command, runner)) {
+      expect(line).toBe("first");
+      break;
+    }
+
+    expect(closed).toBe(true);
+  });
+});
+
+describe("spawnStreamRunner", () => {
+  const node = process.execPath;
+
+  async function drain(chunks: AsyncIterable<CommandChunk>): Promise<CommandChunk[]> {
+    const seen: CommandChunk[] = [];
+    for await (const chunk of chunks) seen.push(chunk);
+    return seen;
+  }
+
+  it("streams stdout lines, then the exit code and buffered stderr", async () => {
+    const script =
+      "let d='';process.stdin.on('data',c=>{d+=c}).on('end',()=>{" +
+      "process.stdout.write('in:'+d+'\\nsecond\\ntrailing');" +
+      "process.stderr.write('err');process.exit(3)})";
+
+    const chunks = await drain(
+      spawnStreamRunner({ executable: node, args: ["-e", script], stdin: "ping" }),
+    );
+
+    expect(chunks).toEqual([
+      { type: "line", line: "in:ping" },
+      { type: "line", line: "second" },
+      { type: "line", line: "trailing" },
+      { type: "exit", exitCode: 3, stderr: "err" },
+    ]);
+  });
+
+  it("delivers a line before the process exits", async () => {
+    const gate = join(mkdtempSync(join(tmpdir(), "llmwrapper-")), "gate");
+    // Writes one line, then waits for the consumer to acknowledge it on disk.
+    const script =
+      "process.stdout.write('first\\n');" +
+      `const t=setInterval(()=>{if(require('node:fs').existsSync(${JSON.stringify(gate)}))` +
+      "{clearInterval(t);process.stdout.write('second\\n');process.exit(0)}},20)";
+
+    const seen: string[] = [];
+    for await (const chunk of spawnStreamRunner({
+      executable: node,
+      args: ["-e", script],
+      stdin: "",
+    })) {
+      if (chunk.type === "line") {
+        seen.push(chunk.line);
+        if (chunk.line === "first") writeFileSync(gate, "go");
+      }
+    }
+
+    expect(seen).toEqual(["first", "second"]);
+  }, 15_000);
+
+  it("reports ENOENT for a missing executable", async () => {
+    const missing = { executable: "llmwrapper-command-that-does-not-exist", args: [], stdin: "" };
+
+    await expect(drain(spawnStreamRunner(missing))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects an already aborted run without spawning", async () => {
+    const controller = new AbortController();
+    const reason = new Error("too late");
+    controller.abort(reason);
+
+    await expect(
+      drain(spawnStreamRunner({ executable: node, args: [], stdin: "" }, controller.signal)),
+    ).rejects.toBe(reason);
+  });
+
+  it("throws the abort reason mid-stream", async () => {
+    const controller = new AbortController();
+    const reason = new Error("cancelled");
+    const script = "process.stdout.write('first\\n');setInterval(()=>{},1000)";
+
+    const iterate = async () => {
+      for await (const chunk of spawnStreamRunner(
+        { executable: node, args: ["-e", script], stdin: "" },
+        controller.signal,
+      )) {
+        if (chunk.type === "line") controller.abort(reason);
+      }
+    };
+
+    await expect(iterate()).rejects.toBe(reason);
+  }, 15_000);
+
+  it("rejects when stdout exceeds the output bound", async () => {
+    const script = "process.stdout.write('x'.repeat(17<<20));setInterval(()=>{},1000)";
+
+    await expect(
+      drain(spawnStreamRunner({ executable: node, args: ["-e", script], stdin: "" })),
+    ).rejects.toThrow(/exceeds/);
+  }, 30_000);
+
+  it.skipIf(process.platform === "win32")(
+    "kills the process group when the consumer breaks early",
+    async () => {
+      const pidFile = join(mkdtempSync(join(tmpdir(), "llmwrapper-")), "grandchild.pid");
+      const grandchild = "setInterval(()=>{},1000)";
+      const script =
+        "const {spawn}=require('node:child_process');" +
+        `const g=spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],{stdio:'ignore'});` +
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(g.pid));` +
+        "process.stdout.write('ready\\n');setInterval(()=>{},1000)";
+
+      for await (const chunk of spawnStreamRunner({
+        executable: node,
+        args: ["-e", script],
+        stdin: "",
+      })) {
+        if (chunk.type === "line") break;
+      }
+
+      const pid = readPid(pidFile);
+      expect(pid).toBeGreaterThan(0);
+      try {
+        await expect.poll(() => isRunning(pid), { timeout: 5000 }).toBe(false);
+      } finally {
+        if (isRunning(pid)) process.kill(pid, "SIGKILL");
+      }
+    },
+    15_000,
+  );
 });

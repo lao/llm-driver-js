@@ -1,4 +1,4 @@
-import Anthropic, { AnthropicError, APIError } from "@anthropic-ai/sdk";
+import Anthropic, { AnthropicError, APIConnectionError, APIError } from "@anthropic-ai/sdk";
 import { LLMWrapperError } from "../errors.js";
 import type { CompletionReason, Config, Request, Response } from "../types.js";
 import type { Backend } from "./backend.js";
@@ -38,6 +38,70 @@ export function createAnthropicApiBackend(config: Config): Backend {
         throw normalizeError(error, reachedTransport);
       }
     },
+
+    async *generateStream(request, signal) {
+      // Aborted in the generator's cleanup so an early consumer break tears the
+      // HTTP stream down instead of leaking it.
+      const controller = new AbortController();
+      try {
+        client ??= new Anthropic({
+          apiKey: config.apiKey,
+          baseURL: config.baseUrl,
+          fetch: fetchImpl,
+          maxRetries: 0,
+        });
+        const stream = await client.messages.create(
+          { ...toParams(config.model, request), stream: true },
+          { signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal },
+        );
+
+        let message: Anthropic.Message | undefined;
+        let text = "";
+        for await (const event of stream) {
+          if (event.type === "message_start") {
+            message = event.message;
+          } else if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+            text += event.delta.text;
+            yield { type: "text", text: event.delta.text };
+          } else if (event.type === "message_delta" && message) {
+            message.stop_reason = event.delta.stop_reason;
+            message.usage = mergeUsage(message.usage, event.usage);
+          }
+        }
+
+        // The SDK ends the iteration silently on abort, so the check has to be
+        // here rather than only in the catch.
+        if (signal?.aborted) throw signal.reason;
+        if (!message) {
+          throw new LLMWrapperError(
+            "parse_failed",
+            "Anthropic stream ended without a message",
+            CONTEXT,
+          );
+        }
+        yield {
+          type: "done",
+          response: toResponse({ ...message, content: [{ type: "text", text, citations: null }] }),
+        };
+      } catch (error) {
+        if (signal?.aborted) throw signal.reason;
+        throw normalizeError(error, reachedTransport);
+      } finally {
+        controller.abort();
+      }
+    },
+  };
+}
+
+/** message_delta reports cumulative counters, but only the ones it knows. */
+function mergeUsage(usage: Anthropic.Usage, delta: Anthropic.MessageDeltaUsage): Anthropic.Usage {
+  return {
+    ...usage,
+    input_tokens: delta.input_tokens ?? usage.input_tokens,
+    output_tokens: delta.output_tokens,
+    cache_read_input_tokens: delta.cache_read_input_tokens ?? usage.cache_read_input_tokens,
+    cache_creation_input_tokens:
+      delta.cache_creation_input_tokens ?? usage.cache_creation_input_tokens,
   };
 }
 
@@ -102,7 +166,9 @@ function normalizeError(error: unknown, reachedTransport: boolean): LLMWrapperEr
   }
   const options = { ...CONTEXT, cause: error };
   if (error instanceof APIError) {
-    if (typeof error.status !== "number") {
+    // A mid-stream `error` event also arrives as an APIError, without a status;
+    // only a connection failure is a transport problem.
+    if (error instanceof APIConnectionError) {
       return new LLMWrapperError("transport_failed", error.message, options);
     }
     return new LLMWrapperError("api_error", apiErrorMessage(error), {

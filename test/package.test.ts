@@ -14,6 +14,7 @@ import type {
   Request,
   Response,
   Role,
+  StreamEvent,
   Usage,
 } from "../src/index.js";
 import * as barrel from "../src/index.js";
@@ -35,6 +36,7 @@ type _Types = [
   Request,
   Response,
   Role,
+  StreamEvent,
   Usage,
 ];
 

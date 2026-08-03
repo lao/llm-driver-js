@@ -5,7 +5,7 @@ import { createCodexCliBackend } from "./backends/codex-cli.js";
 import { createOpenAiApiBackend } from "./backends/openai-api.js";
 import { validateConfig } from "./config.js";
 import { LLMWrapperError } from "./errors.js";
-import type { Client, Config, Request } from "./types.js";
+import type { Client, Config, Request, Response } from "./types.js";
 
 /** Constructs a client for one provider, flavor, and model. */
 export function createClient(config: Config): Client {
@@ -22,19 +22,39 @@ export function createClient(config: Config): Client {
     cliPath: config.cliPath,
     cliArgs: config.cliArgs?.slice(),
   });
-  const backend = selectBackend(snapshot);
+  return createClientWithBackend(snapshot, selectBackend(snapshot));
+}
 
+/**
+ * Internal seam: wraps an already-selected backend. Tests inject fakes through
+ * it; it is never re-exported from the package barrel.
+ */
+export function createClientWithBackend(config: Config, backend: Backend): Client {
   return {
     async generate(request, options) {
-      validateRequest(request, snapshot);
-      const response = await backend.generate(request, options?.signal);
-      return {
-        ...response,
-        model: response.model || snapshot.model,
-        provider: snapshot.provider,
-        flavor: snapshot.flavor,
-      };
+      validateRequest(request, config);
+      return stamp(await backend.generate(request, options?.signal), config);
     },
+
+    async *generateStream(request, options) {
+      // Async-generator semantics: this throws from the first next(), not here.
+      validateRequest(request, config);
+      for await (const event of backend.generateStream(request, options?.signal)) {
+        yield event.type === "done"
+          ? { type: "done", response: stamp(event.response, config) }
+          : event;
+      }
+    },
+  };
+}
+
+/** Applies the target's identity, keeping any model the backend reported. */
+function stamp(response: Response, config: Config): Response {
+  return {
+    ...response,
+    model: response.model || config.model,
+    provider: config.provider,
+    flavor: config.flavor,
   };
 }
 

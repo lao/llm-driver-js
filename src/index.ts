@@ -11,6 +11,7 @@ export {
   type Request,
   type Response,
   type Role,
+  type StreamEvent,
   type Usage,
   user,
 } from "./types.js";

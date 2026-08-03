@@ -69,9 +69,21 @@ export interface Response {
   flavor: Flavor;
 }
 
+/**
+ * One event from {@link Client.generateStream}: zero or more `text` deltas whose
+ * concatenation equals the final text, then exactly one `done`. Delta
+ * granularity is target-dependent and never part of the contract.
+ */
+export type StreamEvent = { type: "text"; text: string } | { type: "done"; response: Response };
+
 /** Sends generation requests through one configured provider and flavor. */
 export interface Client {
   generate(request: Request, options?: { signal?: AbortSignal }): Promise<Response>;
+  /**
+   * Streams the same generation. Request validation errors surface from the
+   * first `next()` rather than from this call, per async-generator semantics.
+   */
+  generateStream(request: Request, options?: { signal?: AbortSignal }): AsyncIterable<StreamEvent>;
 }
 
 /** Builds a user-role text message. */

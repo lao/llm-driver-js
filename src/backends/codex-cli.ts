@@ -1,8 +1,9 @@
 import { LLMWrapperError } from "../errors.js";
-import type { Config, Response, Usage } from "../types.js";
+import type { Config, Request, Response, Usage } from "../types.js";
 import type { Backend } from "./backend.js";
 import {
   asRecord,
+  type Command,
   type CommandRunner,
   cliError,
   executeCli,
@@ -10,7 +11,10 @@ import {
   readCount,
   readString,
   renderTranscript,
+  type StreamingCommandRunner,
   spawnRunner,
+  spawnStreamRunner,
+  streamCli,
 } from "./cli.js";
 
 /**
@@ -20,35 +24,61 @@ import {
  * read-only sandbox, no git-repo check, and a trailing `-` so the prompt is
  * read from stdin. Default tests inject a fake runner and cannot catch a
  * renamed flag, so the opt-in integration test exercises the real binary.
- * `runner` is an internal seam and is never part of the public API.
+ * `runner`/`streamRunner` are internal seams, never public API.
  */
 export function createCodexCliBackend(
   config: Config,
   runner: CommandRunner = spawnRunner,
+  streamRunner: StreamingCommandRunner = spawnStreamRunner,
 ): Backend {
   const executable = config.cliPath ?? "codex";
   const extraArgs = config.cliArgs ?? [];
 
+  const buildCommand = (request: Request): Command => {
+    const args = [
+      "exec",
+      "--json",
+      "--sandbox",
+      "read-only",
+      "--skip-git-repo-check",
+      "--model",
+      config.model,
+    ];
+    if (request.system) {
+      args.push("--config", `developer_instructions=${JSON.stringify(request.system)}`);
+    }
+    args.push(...extraArgs, "-");
+    return { executable, args, stdin: renderTranscript(request.messages) };
+  };
+
   return {
     async generate(request, signal) {
-      const args = [
-        "exec",
-        "--json",
-        "--sandbox",
-        "read-only",
-        "--skip-git-repo-check",
-        "--model",
-        config.model,
-      ];
-      if (request.system) {
-        args.push("--config", `developer_instructions=${JSON.stringify(request.system)}`);
-      }
-      args.push(...extraArgs, "-");
-
-      const command = { executable, args, stdin: renderTranscript(request.messages) };
+      const command = buildCommand(request);
       const { stdout, failure } = await executeCli("openai", command, runner, signal);
       if (failure) throw preferReportedFailure(failure, stdout, config.model);
       return parseCodexOutput(stdout, config.model);
+    },
+
+    /**
+     * `codex exec --json` reports completed items only — no text deltas — so the
+     * whole turn resolves to one coarse `text` event, exactly as SPEC.md allows.
+     * ponytail: swap in per-delta events if the JSONL ever documents them.
+     */
+    async *generateStream(request, signal) {
+      const command = buildCommand(request);
+      const lines: string[] = [];
+      try {
+        for await (const line of streamCli("openai", command, streamRunner, signal)) {
+          lines.push(line);
+        }
+      } catch (error) {
+        if (!(error instanceof LLMWrapperError)) throw error;
+        throw preferReportedFailure(error, lines.join("\n"), config.model);
+      }
+
+      const response = parseCodexOutput(lines.join("\n"), config.model);
+      if (response.text !== "") yield { type: "text", text: response.text };
+      yield { type: "done", response };
     },
   };
 }

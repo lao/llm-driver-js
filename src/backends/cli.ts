@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { type ErrorCode, LLMWrapperError } from "../errors.js";
 import type { Message, Provider } from "../types.js";
 
@@ -28,6 +29,21 @@ export interface CommandResult {
  * exit is a normal result.
  */
 export type CommandRunner = (command: Command, signal?: AbortSignal) => Promise<CommandResult>;
+
+/** One piece of a streaming run: a stdout line, then a single terminal exit. */
+export type CommandChunk =
+  | { type: "line"; line: string }
+  | { type: "exit"; exitCode: number; stderr: string };
+
+/**
+ * Streaming counterpart of {@link CommandRunner}, and the seam CLI streaming
+ * tests drive. Throws on launch failures and on abort; a non-zero exit arrives
+ * as the terminal chunk. Abandoning the iterator kills the process group.
+ */
+export type StreamingCommandRunner = (
+  command: Command,
+  signal?: AbortSignal,
+) => AsyncIterable<CommandChunk>;
 
 /** Outcome of a run; stdout stays readable when the process failed. */
 export interface CliOutcome {
@@ -69,17 +85,47 @@ export async function executeCli(
   }
 
   if (result.exitCode !== 0) {
-    return {
-      stdout: result.stdout,
-      failure: cliError(
-        provider,
-        "process_failed",
-        truncate(result.stderr.trim()) || "CLI command failed",
-        { status: result.exitCode },
-      ),
-    };
+    return { stdout: result.stdout, failure: exitFailure(provider, result) };
   }
   return { stdout: result.stdout };
+}
+
+/**
+ * Streaming counterpart of {@link executeCli}: yields stdout lines as they
+ * arrive and throws the same normalized failures — except an abort, which is
+ * rethrown untouched. A consumer that stops iterating tears the process down.
+ */
+export async function* streamCli(
+  provider: Provider,
+  command: Command,
+  runner: StreamingCommandRunner,
+  signal?: AbortSignal,
+): AsyncGenerator<string> {
+  let exit: { exitCode: number; stderr: string } | undefined;
+  try {
+    for await (const chunk of runner(command, signal)) {
+      if (chunk.type === "line") yield chunk.line;
+      else exit = chunk;
+    }
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    throw launchFailure(provider, command, error);
+  }
+  if (exit !== undefined && exit.exitCode !== 0) throw exitFailure(provider, exit);
+}
+
+function exitFailure(
+  provider: Provider,
+  result: { exitCode: number; stderr: string },
+): LLMWrapperError {
+  return cliError(
+    provider,
+    "process_failed",
+    truncate(result.stderr.trim()) || "CLI command failed",
+    {
+      status: result.exitCode,
+    },
+  );
 }
 
 /** Builds an error already stamped with the CLI target and operation. */
@@ -266,6 +312,101 @@ export const spawnRunner: CommandRunner = (command, signal) =>
     child.stdin.on("error", () => {});
     child.stdin.end(command.stdin);
   });
+
+/**
+ * Streaming default runner: same spawn, group-kill, and bounded-capture rules as
+ * {@link spawnRunner}, but stdout is split into lines and handed over as it
+ * arrives while stderr stays buffered for the `process_failed` message. Aborting
+ * — or simply abandoning the iterator — terminates the whole process group.
+ */
+export const spawnStreamRunner: StreamingCommandRunner = async function* (command, signal) {
+  if (signal?.aborted) throw signal.reason;
+
+  const child = spawn(command.executable, command.args, {
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: POSIX,
+  });
+  trackChild(child);
+
+  const decoder = new StringDecoder("utf8");
+  const stderr = createBoundedCapture();
+  const lines: string[] = [];
+  let partial = "";
+  let stdoutBytes = 0;
+  let failure: unknown;
+  let exitCode: number | undefined;
+  let wake: (() => void) | undefined;
+
+  const notify = () => {
+    wake?.();
+    wake = undefined;
+  };
+  const terminate = () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    killGroup(child, "SIGTERM");
+    // Unref'd, so a pending escalation never keeps the host process alive.
+    setTimeout(() => killGroup(child, "SIGKILL"), KILL_GRACE_MS).unref();
+  };
+  const overflow = () => {
+    failure ??= new Error(`CLI output exceeds ${MAX_OUTPUT_BYTES} bytes`);
+    killGroup(child, "SIGKILL");
+    notify();
+  };
+  const onAbort = () => {
+    failure ??= signal?.reason;
+    terminate();
+    notify();
+  };
+
+  signal?.addEventListener("abort", onAbort, { once: true });
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdoutBytes += chunk.length;
+    if (stdoutBytes > MAX_OUTPUT_BYTES) return overflow();
+    const parts = (partial + decoder.write(chunk)).split("\n");
+    partial = parts.pop() ?? "";
+    lines.push(...parts);
+    notify();
+  });
+  child.stderr.on("data", (chunk: Buffer) => {
+    if (!stderr.push(chunk)) overflow();
+  });
+  child.on("error", (error) => {
+    failure ??= error;
+    notify();
+  });
+  child.on("close", (code) => {
+    exitCode ??= code ?? -1;
+    notify();
+  });
+  // The child may exit before reading the prompt; a broken pipe is not fatal.
+  child.stdin.on("error", () => {});
+  child.stdin.end(command.stdin);
+
+  try {
+    for (;;) {
+      // An abort or a launch error wins over any output already buffered.
+      if (failure !== undefined) throw failure;
+      const line = lines.shift();
+      if (line !== undefined) {
+        yield { type: "line", line };
+        continue;
+      }
+      if (exitCode !== undefined) break;
+      // Nothing buffered and nothing terminal: park until a listener wakes us.
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    }
+    // A last line without a trailing newline is still a line.
+    if (partial !== "") yield { type: "line", line: partial };
+    yield { type: "exit", exitCode: exitCode ?? -1, stderr: stderr.text() };
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    liveChildren.delete(child);
+    // Covers an abandoned iterator as well as an abort: no orphaned group.
+    terminate();
+  }
+};
 
 function launchFailure(provider: Provider, command: Command, error: unknown): LLMWrapperError {
   if (isErrno(error, "ENOENT")) {
