@@ -5,7 +5,6 @@ import {
   type CommandResult,
   type CommandRunner,
   type StreamingCommandRunner,
-  spawnRunner,
 } from "../src/backends/cli.js";
 import { type ErrorCode, LLMWrapperError } from "../src/errors.js";
 import { assistant, type Config, type Request, type StreamEvent, user } from "../src/types.js";
@@ -13,6 +12,11 @@ import { assistant, type Config, type Request, type StreamEvent, user } from "..
 const config: Config = { provider: "claude", flavor: "cli", model: "claude-test" };
 const request: Request = { maxTokens: 32, messages: [user("Hello")] };
 const baseArgs = ["-p", "--output-format", "json", "--permission-mode", "default"];
+
+/** Streaming tests never call generate; a real spawner there would break the offline discipline. */
+const neverSpawn: CommandRunner = () => {
+  throw new Error("buffered runner must not be used in streaming tests");
+};
 
 function fakeRunner(result: Partial<CommandResult>, error?: unknown) {
   const calls: Array<{ command: Command; signal?: AbortSignal }> = [];
@@ -314,7 +318,7 @@ function streamBackend(
   error?: unknown,
 ) {
   const fake = fakeStreamRunner(lines, exit, error);
-  const backend = createClaudeCliBackend(config, spawnRunner, fake.runner);
+  const backend = createClaudeCliBackend(config, neverSpawn, fake.runner);
   return { ...fake, backend };
 }
 
@@ -359,7 +363,7 @@ describe("claude cli streaming command", () => {
     const fake = fakeStreamRunner([resultLine]);
     const backend = createClaudeCliBackend(
       { ...config, cliPath: "/opt/bin/claude-custom", cliArgs: ["--permission-mode", "plan"] },
-      spawnRunner,
+      neverSpawn,
       fake.runner,
     );
 
@@ -507,7 +511,7 @@ describe("claude cli streaming failures", () => {
       controller.abort(reason);
       throw signal?.reason;
     };
-    const backend = createClaudeCliBackend(config, spawnRunner, runner);
+    const backend = createClaudeCliBackend(config, neverSpawn, runner);
 
     await expect(collect(backend.generateStream(request, controller.signal))).rejects.toBe(reason);
   });

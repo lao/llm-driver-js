@@ -24,7 +24,7 @@ effort high** agents (user directive).
 
 ## Dependency graph
 
-```
+```text
 ST1 core plumbing ──► ST2 API streaming ──┐
                 └────► ST3 CLI streaming ──┴─► ST4 contract+example+docs
                                                ▼

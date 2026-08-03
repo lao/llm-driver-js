@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   type Command,
   type CommandChunk,
@@ -53,6 +53,17 @@ function isRunning(pid: number): boolean {
   }
 }
 
+/** Every temp dir is tracked and removed after the file runs, pass or fail. */
+const tempDirs: string[] = [];
+function tempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "llmwrapper-"));
+  tempDirs.push(dir);
+  return dir;
+}
+afterAll(() => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+});
+
 /** Child script fragments: record the pid, then outlive anything but a SIGKILL. */
 const RECORD_PID = "require('node:fs').writeFileSync(process.env.PID_FILE, String(process.pid));";
 const LIVE_FOREVER = "setInterval(() => {}, 1000)";
@@ -71,7 +82,7 @@ const EXIT_ONCE_SPAWNED = [
  * host. Returns the child's pid.
  */
 async function hostExitsMidRun(child: string, start: string): Promise<number> {
-  const dir = mkdtempSync(join(tmpdir(), "llmwrapper-"));
+  const dir = tempDir();
   const pidFile = join(dir, "child.pid");
   const script = join(dir, "host.ts");
   const cliModule = join(import.meta.dirname, "..", "src", "backends", "cli.ts");
@@ -258,7 +269,7 @@ describe("spawnRunner", () => {
   it.skipIf(process.platform === "win32")(
     "kills grandchildren by signalling the whole process group",
     async () => {
-      const pidFile = join(mkdtempSync(join(tmpdir(), "llmwrapper-")), "grandchild.pid");
+      const pidFile = join(tempDir(), "grandchild.pid");
       const grandchild = "setInterval(()=>{},1000)";
       // Spawns a grandchild — like `claude`/`codex` do — records its pid, stays alive.
       const script =
@@ -299,7 +310,7 @@ describe("spawnRunner", () => {
   it.skipIf(process.platform === "win32")(
     "settles an aborted run even when an escaped grandchild holds stdout open",
     async () => {
-      const pidFile = join(mkdtempSync(join(tmpdir(), "llmwrapper-")), "escapee.pid");
+      const pidFile = join(tempDir(), "escapee.pid");
       // `detached` puts the grandchild in its own group, out of reach of the
       // group kill, and it inherits fd 1 so the stdout pipe never closes.
       const script =
@@ -509,7 +520,7 @@ describe("spawnStreamRunner", () => {
   });
 
   it("delivers a line before the process exits", async () => {
-    const gate = join(mkdtempSync(join(tmpdir(), "llmwrapper-")), "gate");
+    const gate = join(tempDir(), "gate");
     // Writes one line, then waits for the consumer to acknowledge it on disk.
     const script =
       "process.stdout.write('first\\n');" +
@@ -573,7 +584,7 @@ describe("spawnStreamRunner", () => {
     async () => {
       const controller = new AbortController();
       const reason = new Error("cancelled");
-      const pidFile = join(mkdtempSync(join(tmpdir(), "llmwrapper-")), "grandchild.pid");
+      const pidFile = join(tempDir(), "grandchild.pid");
       const grandchild = "setInterval(()=>{},1000)";
       // Records a grandchild pid before the line that triggers the abort, so the
       // pid is on disk by the time the run is cancelled.
@@ -660,7 +671,7 @@ describe("spawnStreamRunner", () => {
   it.skipIf(process.platform === "win32")(
     "kills the process group when the consumer breaks early",
     async () => {
-      const pidFile = join(mkdtempSync(join(tmpdir(), "llmwrapper-")), "grandchild.pid");
+      const pidFile = join(tempDir(), "grandchild.pid");
       const grandchild = "setInterval(()=>{},1000)";
       const script =
         "const {spawn}=require('node:child_process');" +

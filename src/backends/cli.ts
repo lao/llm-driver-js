@@ -316,6 +316,10 @@ export const spawnRunner: CommandRunner = (command, signal) =>
       if (!stderr.push(chunk)) killGroup(child, "SIGKILL");
     });
     child.on("error", (error) => settle(() => reject(error)));
+    // A stdio stream can error independently of the process (e.g. EIO after a
+    // kill); without a listener that event crashes the host.
+    child.stdout.on("error", (error) => settle(() => reject(error)));
+    child.stderr.on("error", (error) => settle(() => reject(error)));
     child.on("close", finishRun);
     // A grandchild that escaped the process group can hold the stdout pipe open
     // forever, so an aborted run settles on the child's own exit instead.
@@ -381,6 +385,15 @@ export const spawnStreamRunner: StreamingCommandRunner = async function* (comman
     failure ??= error;
     notify();
   });
+  // A stdio stream can error independently of the process (e.g. EIO after the
+  // overflow SIGKILL); route it into the normal failure path instead of letting
+  // an unhandled stream error crash the host.
+  const onStreamError = (error: Error) => {
+    failure ??= error;
+    notify();
+  };
+  child.stdout.on("error", onStreamError);
+  child.stderr.on("error", onStreamError);
   // No `exit` companion listener here, unlike the buffered runner: an abort sets
   // `failure` and wakes the loop itself, so a grandchild holding stdout open can
   // never stall it.

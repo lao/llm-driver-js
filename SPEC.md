@@ -251,7 +251,7 @@ README.md / SPEC.md / tasks/plan.md / CLAUDE.md
 2. Request tests: empty transcript, empty text, bad role, non-positive/non-integer maxTokens, valid multi-turn.
 3. API adapter tests: injected `fetch` (or local HTTP server) + `baseUrl`; verify request mapping, auth headers, response/usage mapping, normalized HTTP/API errors. Offline.
 4. CLI adapter tests: injected fake runner; verify exact executable + argv, stdin transcript, Claude JSON parsing, Codex JSONL parsing, usage, ENOENT, non-zero exit, malformed output, provider-reported failure, abort.
-5. Contract suite: same neutral request through all four backends (faked transports) asserting identical normalized shape — for both `generate` and `generateStream` (concatenated deltas === done.response.text; done event last and unique).
+5. Contract suite: same neutral request through all four backends (faked transports) asserting identical normalized shape — for both `generate` and `generateStream` (concatenated deltas === done.response.text — for `claude`/`cli` this holds because fixtures are single-message turns, see Streaming contract; done event last and unique).
 5a. Streaming adapter tests: canned SSE bodies via injected fetch (API flavors); fake runner emitting incremental JSONL lines (CLI flavors). Cover: multi-delta happy path, zero-delta + done, mid-stream provider error, malformed event, abort mid-stream (rejects with signal.reason, subprocess group killed), early consumer break (transport cleaned up).
 6. Example compiles (`tsc --noEmit` covers it).
 7. Verification: build + test + coverage + lint + typecheck all green.

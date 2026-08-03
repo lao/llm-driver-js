@@ -171,6 +171,21 @@ const CLAUDE_CLI_STREAM = [
 const CLAUDE_CLI_CONFIG: Config = { provider: "claude", flavor: "cli", model: "claude-cli-test" };
 const CODEX_CLI_CONFIG: Config = { provider: "openai", flavor: "cli", model: "codex-cli-test" };
 
+const claudeCliClient = () =>
+  createClientWithBackend(
+    CLAUDE_CLI_CONFIG,
+    createClaudeCliBackend(
+      CLAUDE_CLI_CONFIG,
+      stubRunner(CLAUDE_CLI_STDOUT),
+      stubStreamRunner(CLAUDE_CLI_STREAM),
+    ),
+  );
+const codexCliClient = () =>
+  createClientWithBackend(
+    CODEX_CLI_CONFIG,
+    createCodexCliBackend(CODEX_CLI_CONFIG, stubRunner(CODEX_CLI_STDOUT)),
+  );
+
 interface Target {
   provider: Provider;
   flavor: Flavor;
@@ -240,18 +255,10 @@ const targets: Target[] = [
     provider: "claude",
     flavor: "cli",
     model: "claude-cli-test",
-    // The runner seam is internal, so CLI targets go through the backend directly.
-    generate: (request) =>
-      createClaudeCliBackend(CLAUDE_CLI_CONFIG, stubRunner(CLAUDE_CLI_STDOUT)).generate(request),
-    stream: (request) =>
-      createClientWithBackend(
-        CLAUDE_CLI_CONFIG,
-        createClaudeCliBackend(
-          CLAUDE_CLI_CONFIG,
-          stubRunner(""),
-          stubStreamRunner(CLAUDE_CLI_STREAM),
-        ),
-      ).generateStream(request),
+    // The runner seam is internal, so CLI targets use createClientWithBackend —
+    // one client per target so generate and stream share the same stamping path.
+    generate: (request) => claudeCliClient().generate(request),
+    stream: (request) => claudeCliClient().generateStream(request),
     id: "session-1",
     completionReason: "",
     reasoningTokens: 0,
@@ -260,16 +267,11 @@ const targets: Target[] = [
     provider: "openai",
     flavor: "cli",
     model: "codex-cli-test",
-    generate: (request) =>
-      createCodexCliBackend(CODEX_CLI_CONFIG, stubRunner(CODEX_CLI_STDOUT)).generate(request),
+    generate: (request) => codexCliClient().generate(request),
     // `codex exec --json` reports completed items only, so the whole turn
     // arrives as one coarse text event — allowed by the contract, which pins no
     // granularity — and `generateStream` just delegates to `generate`.
-    stream: (request) =>
-      createClientWithBackend(
-        CODEX_CLI_CONFIG,
-        createCodexCliBackend(CODEX_CLI_CONFIG, stubRunner(CODEX_CLI_STDOUT)),
-      ).generateStream(request),
+    stream: (request) => codexCliClient().generateStream(request),
     id: "thread-1",
     completionReason: "",
     reasoningTokens: 1,
