@@ -6,11 +6,11 @@
   "author": "Lucas Abreu Oliveira",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lao/llmwrapper-js.git"
+    "url": "git+https://github.com/lao/llm-driver-js.git"
   },
-  "homepage": "https://github.com/lao/llmwrapper-js#readme",
+  "homepage": "https://github.com/lao/llm-driver-js#readme",
   "bugs": {
-    "url": "https://github.com/lao/llmwrapper-js/issues"
+    "url": "https://github.com/lao/llm-driver-js/issues"
   },
   "type": "module",
   "sideEffects": false,
