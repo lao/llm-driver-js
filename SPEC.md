@@ -63,7 +63,12 @@ function createClient(config: Config): Client;
 
 interface Client {
   generate(request: Request, options?: { signal?: AbortSignal }): Promise<Response>;
+  generateStream(request: Request, options?: { signal?: AbortSignal }): AsyncIterable<StreamEvent>;
 }
+
+type StreamEvent =
+  | { type: "text"; text: string }        // incremental text delta, possibly coarse
+  | { type: "done"; response: Response }; // always the final event, exactly once
 
 interface Request {
   system?: string;
@@ -142,14 +147,37 @@ Validation rules (ported from Go):
   `LLMWrapperError` — identically across all four targets.
 - Mirror exact flags from Go reference: `backend_claude_cli.go`, `backend_codex_cli.go`.
 
+### Streaming contract (`generateStream`)
+
+Provider-neutral, deliberately weak enough to hold on all four targets:
+
+- Yields **zero or more** `text` events whose concatenated `text` equals the final
+  `response.text`, then **exactly one** `done` event carrying the same normalized
+  `Response` that `generate` would have produced. Nothing after `done`.
+- **Granularity is target-dependent and never part of the contract**: API flavors
+  stream token-level deltas; Claude CLI streams partial-message chunks
+  (`--output-format stream-json --include-partial-messages`); Codex CLI may yield
+  a single coarse `text` event if its JSONL reports only completed messages.
+- Same request validation, same `LLMWrapperError` normalization (errors throw
+  from iteration), same abort contract: rejects with `signal.reason` untouched.
+- Consumer `break`/early `return` must clean up the transport: abort the HTTP
+  stream / kill the CLI process group. No leaked processes or sockets.
+- `generate` is unchanged; adapters may implement the two paths independently.
+- Claude CLI streaming argv mirrors the non-streaming argv except
+  `--output-format stream-json --include-partial-messages` (plus `--verbose` if
+  the installed CLI requires it with stream-json in print mode — verify against
+  the real binary; the opt-in integration test must cover it). The stream's final
+  `result` event is parsed with the same semantics as json mode. Codex CLI keeps
+  `exec --json` and streams whatever item/delta events the JSONL provides.
+
 ### Scope
 
-In scope: non-streaming text-only generation; system + multi-turn user/assistant
-messages; maxTokens (enforced by API flavors, validated-only by CLI flavors);
-normalized response/usage/errors; base-URL/fetch/cliPath/cliArgs overrides;
-runnable switchable example.
+In scope: non-streaming and streaming text-only generation; system + multi-turn
+user/assistant messages; maxTokens (enforced by API flavors, validated-only by
+CLI flavors); normalized response/usage/errors; base-URL/fetch/cliPath/cliArgs
+overrides; runnable switchable example (incl. `--stream`).
 
-Out of scope: streaming, tool calling, images/audio/files, structured output,
+Out of scope: tool calling, images/audio/files, structured output,
 retries, fallback/routing, model catalogs, conversation persistence.
 
 ## Tech Stack
@@ -213,7 +241,8 @@ README.md / SPEC.md / tasks/plan.md / CLAUDE.md
 2. Request tests: empty transcript, empty text, bad role, non-positive/non-integer maxTokens, valid multi-turn.
 3. API adapter tests: injected `fetch` (or local HTTP server) + `baseUrl`; verify request mapping, auth headers, response/usage mapping, normalized HTTP/API errors. Offline.
 4. CLI adapter tests: injected fake runner; verify exact executable + argv, stdin transcript, Claude JSON parsing, Codex JSONL parsing, usage, ENOENT, non-zero exit, malformed output, provider-reported failure, abort.
-5. Contract suite: same neutral request through all four backends (faked transports) asserting identical normalized shape.
+5. Contract suite: same neutral request through all four backends (faked transports) asserting identical normalized shape — for both `generate` and `generateStream` (concatenated deltas === done.response.text; done event last and unique).
+5a. Streaming adapter tests: canned SSE bodies via injected fetch (API flavors); fake runner emitting incremental JSONL lines (CLI flavors). Cover: multi-delta happy path, zero-delta + done, mid-stream provider error, malformed event, abort mid-stream (rejects with signal.reason, subprocess group killed), early consumer break (transport cleaned up).
 6. Example compiles (`tsc --noEmit` covers it).
 7. Verification: build + test + coverage + lint + typecheck all green.
 
