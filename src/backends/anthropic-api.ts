@@ -64,8 +64,12 @@ export function createAnthropicApiBackend(config: Config): Backend {
             text += event.delta.text;
             yield { type: "text", text: event.delta.text };
           } else if (event.type === "message_delta" && message) {
-            message.stop_reason = event.delta.stop_reason;
-            message.usage = mergeUsage(message.usage, event.usage);
+            // Rebuilt rather than mutated: the SDK's own event object is not ours.
+            message = {
+              ...message,
+              stop_reason: event.delta.stop_reason,
+              usage: mergeUsage(message.usage, event.usage),
+            };
           }
         }
 

@@ -374,6 +374,9 @@ export const spawnStreamRunner: StreamingCommandRunner = async function* (comman
     failure ??= error;
     notify();
   });
+  // No `exit` companion listener here, unlike the buffered runner: an abort sets
+  // `failure` and wakes the loop itself, so a grandchild holding stdout open can
+  // never stall it.
   child.on("close", (code) => {
     exitCode ??= code ?? -1;
     notify();

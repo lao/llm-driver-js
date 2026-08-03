@@ -168,10 +168,6 @@ const CLAUDE_CLI_STREAM = [
   CLAUDE_CLI_STDOUT,
 ];
 
-// `codex exec --json` reports completed items only, so the whole turn arrives as
-// one coarse text event — allowed by the contract, which pins no granularity.
-const CODEX_CLI_STREAM = CODEX_CLI_STDOUT.split("\n");
-
 const CLAUDE_CLI_CONFIG: Config = { provider: "claude", flavor: "cli", model: "claude-cli-test" };
 const CODEX_CLI_CONFIG: Config = { provider: "openai", flavor: "cli", model: "codex-cli-test" };
 
@@ -266,10 +262,13 @@ const targets: Target[] = [
     model: "codex-cli-test",
     generate: (request) =>
       createCodexCliBackend(CODEX_CLI_CONFIG, stubRunner(CODEX_CLI_STDOUT)).generate(request),
+    // `codex exec --json` reports completed items only, so the whole turn
+    // arrives as one coarse text event — allowed by the contract, which pins no
+    // granularity — and `generateStream` just delegates to `generate`.
     stream: (request) =>
       createClientWithBackend(
         CODEX_CLI_CONFIG,
-        createCodexCliBackend(CODEX_CLI_CONFIG, stubRunner(""), stubStreamRunner(CODEX_CLI_STREAM)),
+        createCodexCliBackend(CODEX_CLI_CONFIG, stubRunner(CODEX_CLI_STDOUT)),
       ).generateStream(request),
     id: "thread-1",
     completionReason: "",

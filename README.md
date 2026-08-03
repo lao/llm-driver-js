@@ -108,7 +108,7 @@ type StreamEvent =
   | { type: "done"; response: Response }; // always last, exactly once
 ```
 
-The concatenated `text` deltas always equal `done.response.text`. **Granularity
+The concatenated `text` deltas equal `done.response.text`. **Granularity
 is not part of the contract** — it is whatever the target reports, and a target
 may report nothing until the end:
 
@@ -119,6 +119,16 @@ may report nothing until the end:
 | `claude`/`cli` | Partial-message chunks (`--output-format stream-json --include-partial-messages`) |
 | `openai`/`cli` | One coarse delta: `codex exec --json` reports completed messages only |
 
+> **`claude`/`cli` caveat.** `claude -p` is an agent, not a completion endpoint.
+> It streams deltas for every assistant message in the turn, but its final
+> `result` event — the one that becomes `done.response` — reports only the last
+> message. The concatenation therefore equals `done.response.text` for a
+> single-message turn; if the CLI runs tools, the deltas additionally contain the
+> intermediate assistant text spoken before each tool call. `done.response` is
+> always exactly what `generate` would have returned. Treat `done.response.text`
+> as the answer and the deltas as progress output. The other three targets hold
+> the equality unconditionally.
+
 Errors and aborts work exactly as with `generate`, except that they surface from
 the iteration rather than from the call:
 
@@ -128,8 +138,12 @@ the iteration rather than from the call:
 - A failure throws an `LLMWrapperError` from the loop; an abort throws the
   signal's own reason untouched, identically across all four targets.
 - Stopping early cleans up the transport. `break`, `return`, or `throw` inside
-  the loop aborts the HTTP stream or kills the CLI process group before the
-  iteration finishes — no leaked sockets or subprocesses.
+  the loop aborts the HTTP stream, or signals the CLI process group (SIGTERM,
+  then SIGKILL after a short grace period) — the iteration does not wait around
+  to reap the process, it only guarantees the teardown is under way.
+- That cleanup runs in the generator's `finally`, which `for await` triggers for
+  you. A **manual iterator** must call `.return()` itself (or the `finally` never
+  runs and the transport leaks).
 
 ```ts
 for await (const event of client.generateStream(request, {

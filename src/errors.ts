@@ -14,7 +14,11 @@ export type ErrorCode =
 export interface LLMWrapperErrorOptions {
   provider?: Provider;
   flavor?: Flavor;
-  /** Library operation that failed, e.g. `"generate"`. */
+  /**
+   * Library operation that failed, e.g. `"generate"`. Deliberately `"generate"`
+   * for both `generate` and `generateStream`: one logical operation, two
+   * delivery modes.
+   */
   operation?: string;
   /** HTTP status or process exit code, when available. */
   status?: number;

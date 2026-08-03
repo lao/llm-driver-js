@@ -506,6 +506,26 @@ describe("spawnStreamRunner", () => {
     expect(seen).toEqual(["first", "second"]);
   }, 15_000);
 
+  it("reassembles a multi-byte character split across chunk boundaries", async () => {
+    // "🐛" is 4 bytes: written one byte at a time, so every chunk boundary
+    // falls inside the character and only the StringDecoder can rebuild it.
+    const script =
+      "const b=Buffer.from('a🐛b\\nc🐛d');" +
+      "let i=0;const t=setInterval(()=>{" +
+      "if(i>=b.length){clearInterval(t);process.exit(0)}" +
+      "process.stdout.write(b.subarray(i,i+1));i++},1)";
+
+    const chunks = await drain(
+      spawnStreamRunner({ executable: node, args: ["-e", script], stdin: "" }),
+    );
+
+    expect(chunks).toEqual([
+      { type: "line", line: "a🐛b" },
+      { type: "line", line: "c🐛d" },
+      { type: "exit", exitCode: 0, stderr: "" },
+    ]);
+  }, 15_000);
+
   it("reports ENOENT for a missing executable", async () => {
     const missing = { executable: "llmwrapper-command-that-does-not-exist", args: [], stdin: "" };
 
@@ -522,22 +542,42 @@ describe("spawnStreamRunner", () => {
     ).rejects.toBe(reason);
   });
 
-  it("throws the abort reason mid-stream", async () => {
-    const controller = new AbortController();
-    const reason = new Error("cancelled");
-    const script = "process.stdout.write('first\\n');setInterval(()=>{},1000)";
+  // Group kill is POSIX-only, as documented for the whole CLI flavor.
+  it.skipIf(process.platform === "win32")(
+    "throws the abort reason mid-stream and kills the process group",
+    async () => {
+      const controller = new AbortController();
+      const reason = new Error("cancelled");
+      const pidFile = join(mkdtempSync(join(tmpdir(), "llmwrapper-")), "grandchild.pid");
+      const grandchild = "setInterval(()=>{},1000)";
+      // Records a grandchild pid before the line that triggers the abort, so the
+      // pid is on disk by the time the run is cancelled.
+      const script =
+        "const {spawn}=require('node:child_process');" +
+        `const g=spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],{stdio:'ignore'});` +
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(g.pid));` +
+        "process.stdout.write('first\\n');setInterval(()=>{},1000)";
 
-    const iterate = async () => {
-      for await (const chunk of spawnStreamRunner(
-        { executable: node, args: ["-e", script], stdin: "" },
-        controller.signal,
-      )) {
-        if (chunk.type === "line") controller.abort(reason);
+      const iterate = async () => {
+        for await (const chunk of spawnStreamRunner(
+          { executable: node, args: ["-e", script], stdin: "" },
+          controller.signal,
+        )) {
+          if (chunk.type === "line") controller.abort(reason);
+        }
+      };
+
+      await expect(iterate()).rejects.toBe(reason);
+      const pid = readPid(pidFile);
+      expect(pid).toBeGreaterThan(0);
+      try {
+        await expect.poll(() => isRunning(pid), { timeout: 5000 }).toBe(false);
+      } finally {
+        if (isRunning(pid)) process.kill(pid, "SIGKILL");
       }
-    };
-
-    await expect(iterate()).rejects.toBe(reason);
-  }, 15_000);
+    },
+    15_000,
+  );
 
   it("rejects when stdout exceeds the output bound", async () => {
     const script = "process.stdout.write('x'.repeat(17<<20));setInterval(()=>{},1000)";

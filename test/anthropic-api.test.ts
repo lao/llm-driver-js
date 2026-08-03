@@ -374,6 +374,29 @@ describe("anthropic api backend streaming", () => {
     ]);
   });
 
+  it("reports a refusal from the message_delta stop reason", async () => {
+    const stub = stubSse([
+      sse("message_start", MESSAGE_START),
+      sse("content_block_delta", textDelta("I can't ")),
+      sse("content_block_delta", textDelta("help with that")),
+      sse("message_delta", messageDelta("refusal")),
+      sse("message_stop", { type: "message_stop" }),
+    ]);
+
+    const events = await collect(clientWith(stub.impl).generateStream(PROMPT));
+
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event last");
+    expect(done.response.completionReason).toBe("refusal");
+    expect(
+      events
+        .filter((event) => event.type === "text")
+        .map((event) => event.text)
+        .join(""),
+    ).toBe(done.response.text);
+    expect(done.response.text).toBe("I can't help with that");
+  });
+
   it("normalizes a mid-stream error event into an api_error", async () => {
     const stub = stubSse([
       sse("message_start", MESSAGE_START),

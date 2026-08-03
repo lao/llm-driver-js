@@ -11,10 +11,7 @@ import {
   readCount,
   readString,
   renderTranscript,
-  type StreamingCommandRunner,
   spawnRunner,
-  spawnStreamRunner,
-  streamCli,
 } from "./cli.js";
 
 /**
@@ -24,12 +21,11 @@ import {
  * read-only sandbox, no git-repo check, and a trailing `-` so the prompt is
  * read from stdin. Default tests inject a fake runner and cannot catch a
  * renamed flag, so the opt-in integration test exercises the real binary.
- * `runner`/`streamRunner` are internal seams, never public API.
+ * `runner` is an internal seam, never public API.
  */
 export function createCodexCliBackend(
   config: Config,
   runner: CommandRunner = spawnRunner,
-  streamRunner: StreamingCommandRunner = spawnStreamRunner,
 ): Backend {
   const executable = config.cliPath ?? "codex";
   const extraArgs = config.cliArgs ?? [];
@@ -51,32 +47,24 @@ export function createCodexCliBackend(
     return { executable, args, stdin: renderTranscript(request.messages) };
   };
 
+  const generate = async (request: Request, signal?: AbortSignal): Promise<Response> => {
+    const command = buildCommand(request);
+    const { stdout, failure } = await executeCli("openai", command, runner, signal);
+    if (failure) throw preferReportedFailure(failure, stdout, config.model);
+    return parseCodexOutput(stdout, config.model);
+  };
+
   return {
-    async generate(request, signal) {
-      const command = buildCommand(request);
-      const { stdout, failure } = await executeCli("openai", command, runner, signal);
-      if (failure) throw preferReportedFailure(failure, stdout, config.model);
-      return parseCodexOutput(stdout, config.model);
-    },
+    generate,
 
     /**
-     * `codex exec --json` reports completed items only — no text deltas — so the
-     * whole turn resolves to one coarse `text` event, exactly as SPEC.md allows.
-     * ponytail: swap in per-delta events if the JSONL ever documents them.
+     * Coarse by design: `codex exec --json` reports completed items only — no
+     * text deltas — so nothing can be emitted before the turn ends anyway, and
+     * delegating to `generate` keeps one parse and one abort contract.
+     * ponytail: switch to real deltas if `codex exec --json` ever documents them.
      */
     async *generateStream(request, signal) {
-      const command = buildCommand(request);
-      const lines: string[] = [];
-      try {
-        for await (const line of streamCli("openai", command, streamRunner, signal)) {
-          lines.push(line);
-        }
-      } catch (error) {
-        if (!(error instanceof LLMWrapperError)) throw error;
-        throw preferReportedFailure(error, lines.join("\n"), config.model);
-      }
-
-      const response = parseCodexOutput(lines.join("\n"), config.model);
+      const response = await generate(request, signal);
       if (response.text !== "") yield { type: "text", text: response.text };
       yield { type: "done", response };
     },

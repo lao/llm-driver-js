@@ -158,6 +158,16 @@ Provider-neutral, deliberately weak enough to hold on all four targets:
   stream token-level deltas; Claude CLI streams partial-message chunks
   (`--output-format stream-json --include-partial-messages`); Codex CLI may yield
   a single coarse `text` event if its JSONL reports only completed messages.
+- **`claude`/`cli` scopes the concatenation guarantee to single-message turns.**
+  `claude -p` is an agent, not a completion endpoint: `--include-partial-messages`
+  emits deltas for *every* assistant message in the turn, while the terminal
+  `result` event — and therefore `done.response.text` — carries only the final
+  one. So when the CLI runs tools, the concatenated deltas are a superset of
+  `done.response.text` (they also contain the intermediate assistant text that
+  preceded each tool call). `done.response` remains exactly what `generate`
+  returns. The other three targets hold the equality unconditionally. This is a
+  property of the CLI's own output, not a library defect; the opt-in integration
+  test characterizes it with a tool-forcing prompt.
 - Same request validation, same `LLMWrapperError` normalization (errors throw
   from iteration), same abort contract: rejects with `signal.reason` untouched.
 - Consumer `break`/early `return` must clean up the transport: abort the HTTP
