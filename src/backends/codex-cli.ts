@@ -61,7 +61,7 @@ export function createCodexCliBackend(
      * Coarse by design: `codex exec --json` reports completed items only — no
      * text deltas — so nothing can be emitted before the turn ends anyway, and
      * delegating to `generate` keeps one parse and one abort contract.
-     * ponytail: switch to real deltas if `codex exec --json` ever documents them.
+     * TODO: switch to real deltas if `codex exec --json` ever documents them.
      */
     async *generateStream(request, signal) {
       const response = await generate(request, signal);
