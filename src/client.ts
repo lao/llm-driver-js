@@ -4,7 +4,7 @@ import { createClaudeCliBackend } from "./backends/claude-cli.js";
 import { createCodexCliBackend } from "./backends/codex-cli.js";
 import { createOpenAiApiBackend } from "./backends/openai-api.js";
 import { validateConfig } from "./config.js";
-import { LLMShimError } from "./errors.js";
+import { LLMDriverError } from "./errors.js";
 import type { Client, Config, Request, Response } from "./types.js";
 
 /** Constructs a client for one provider, flavor, and model. */
@@ -96,8 +96,8 @@ export function validateRequest(request: Request, config: Config): void {
   }
 }
 
-function invalid(config: Config, message: string): LLMShimError {
-  return new LLMShimError("invalid_request", message, {
+function invalid(config: Config, message: string): LLMDriverError {
+  return new LLMDriverError("invalid_request", message, {
     provider: config.provider,
     flavor: config.flavor,
     operation: "generate",

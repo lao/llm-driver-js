@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createClient } from "../src/client.js";
-import { LLMShimError } from "../src/errors.js";
+import { LLMDriverError } from "../src/errors.js";
 import {
   assistant,
   type Request as GenerateRequest,
@@ -66,12 +66,12 @@ function clientWith(fetchImpl: typeof fetch) {
   });
 }
 
-async function rejection(promise: Promise<unknown>): Promise<LLMShimError> {
+async function rejection(promise: Promise<unknown>): Promise<LLMDriverError> {
   try {
     await promise;
   } catch (error) {
-    expect(error).toBeInstanceOf(LLMShimError);
-    return error as LLMShimError;
+    expect(error).toBeInstanceOf(LLMDriverError);
+    return error as LLMDriverError;
   }
   throw new Error("expected generate() to reject");
 }

@@ -1,4 +1,4 @@
-# Plan: llm-shim npm package
+# Plan: llm-driver npm package
 
 Source of truth: `SPEC.md`. Go reference implementation: `/Users/lucas/Projects/claudewrap`
 (builders MUST read the referenced Go files before porting — argv, parsing, and
@@ -24,7 +24,7 @@ T3 and T4 run in parallel after T2.
 
 ### T1 — Scaffold toolchain (opus, high)
 
-package.json (name `llm-shim`, version 0.1.0, MIT, `engines.node >= 20`,
+package.json (name `llm-driver`, version 0.1.0, MIT, `engines.node >= 20`,
 `exports` map for ESM+CJS+types, `files: ["dist"]`, scripts per SPEC Commands),
 tsconfig strict NodeNext, biome.json, vitest.config.ts (coverage v8, excludes
 integration by default), tsup.config.ts (entry src/index.ts, esm+cjs+dts),
@@ -34,7 +34,7 @@ integration by default), tsup.config.ts (entry src/index.ts, esm+cjs+dts),
 
 ### T2 — Core: types, errors, config, client (opus, high)
 
-`src/types.ts`, `src/errors.ts` (LLMShimError per SPEC), `src/config.ts`
+`src/types.ts`, `src/errors.ts` (LLMDriverError per SPEC), `src/config.ts`
 (validation incl. cross-flavor option rejection), `src/backends/backend.ts`
 (internal `Backend = { generate(request, signal?): Promise<Response> }`),
 `src/client.ts` (createClient → validate config → select backend via a 4-entry
@@ -43,7 +43,7 @@ Backends stubbed to throw until T3/T4. Tests: `test/config.test.ts`,
 `test/request.test.ts` per SPEC Testing 1–2. Port validation rules from Go
 `config.go` / `types.go` (read them).
 
-**Accept:** vitest green; all four pairs construct; every invalid case yields LLMShimError with correct `code`.
+**Accept:** vitest green; all four pairs construct; every invalid case yields LLMDriverError with correct `code`.
 
 ### T3 — API backends: anthropic-api + openai-api + tests (opus, **max**)
 
@@ -52,7 +52,7 @@ Port `backend_anthropic.go` and `backend_openai.go`. Anthropic Messages via
 stop_reason mapping); OpenAI Responses via `openai` (system → instructions,
 maxTokens → max_output_tokens, usage incl. cached/reasoning tokens,
 incomplete/refusal mapping). Both accept `apiKey`, `baseUrl`, `fetch` overrides.
-Normalize SDK errors → LLMShimError (`api_error` with status+providerCode;
+Normalize SDK errors → LLMDriverError (`api_error` with status+providerCode;
 `transport_failed` for network). Tests per SPEC Testing 3: injected fetch or
 local `node:http` server via baseUrl; no network.
 

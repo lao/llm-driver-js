@@ -1,4 +1,4 @@
-import { LLMShimError } from "./errors.js";
+import { LLMDriverError } from "./errors.js";
 import type { Config, Flavor, Provider } from "./types.js";
 
 const PROVIDERS: Provider[] = ["claude", "openai"];
@@ -15,7 +15,7 @@ const CLI_ONLY = ["cliPath", "cliArgs"] as const;
  */
 export function validateConfig(config: Config): void {
   if (typeof config !== "object" || config === null) {
-    throw new LLMShimError("invalid_config", "config is required", {
+    throw new LLMDriverError("invalid_config", "config is required", {
       operation: "createClient",
     });
   }
@@ -69,8 +69,8 @@ function quoted(values: readonly string[]): string {
   return values.map((value) => `"${value}"`).join(" or ");
 }
 
-function invalid(config: Config, message: string): LLMShimError {
-  return new LLMShimError("invalid_config", message, {
+function invalid(config: Config, message: string): LLMDriverError {
+  return new LLMDriverError("invalid_config", message, {
     provider: config.provider,
     flavor: config.flavor,
     operation: "createClient",

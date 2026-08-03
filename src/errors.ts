@@ -10,8 +10,8 @@ export type ErrorCode =
   | "api_error"
   | "transport_failed";
 
-/** Optional target and failure context attached to an {@link LLMShimError}. */
-export interface LLMShimErrorOptions {
+/** Optional target and failure context attached to an {@link LLMDriverError}. */
+export interface LLMDriverErrorOptions {
   provider?: Provider;
   flavor?: Flavor;
   /**
@@ -28,7 +28,7 @@ export interface LLMShimErrorOptions {
 }
 
 /** Every error thrown by this library. */
-export class LLMShimError extends Error {
+export class LLMDriverError extends Error {
   readonly code: ErrorCode;
   readonly provider?: Provider;
   readonly flavor?: Flavor;
@@ -36,9 +36,9 @@ export class LLMShimError extends Error {
   readonly status?: number;
   readonly providerCode?: string;
 
-  constructor(code: ErrorCode, message: string, options: LLMShimErrorOptions = {}) {
+  constructor(code: ErrorCode, message: string, options: LLMDriverErrorOptions = {}) {
     super(message, { cause: options.cause });
-    this.name = "LLMShimError";
+    this.name = "LLMDriverError";
     this.code = code;
     this.provider = options.provider;
     this.flavor = options.flavor;

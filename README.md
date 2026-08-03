@@ -1,6 +1,6 @@
-# llm-shim
+# llm-driver
 
-`llm-shim` is a small TypeScript library with one text-generation API and four
+`llm-driver` is a small TypeScript library with one text-generation API and four
 switchable targets. Point it at a hosted provider API or at an agent CLI you are
 already logged into, and switch between them by changing configuration only —
 the `generate` call site never changes. Models are always explicit; the library
@@ -16,7 +16,7 @@ never selects or updates one for you.
 ## Install
 
 ```bash
-npm install llm-shim
+npm install llm-driver
 ```
 
 Requires Node.js 20.12 or later. Ships dual ESM + CommonJS builds with
@@ -25,7 +25,7 @@ TypeScript declarations for both.
 ## Quick start
 
 ```ts
-import { createClient, user } from "llm-shim";
+import { createClient, user } from "llm-driver";
 
 const client = createClient({
   provider: "openai",
@@ -45,7 +45,7 @@ console.log(response.text);
 CommonJS works too:
 
 ```js
-const { createClient, user } = require("llm-shim");
+const { createClient, user } = require("llm-driver");
 ```
 
 The response is provider-neutral:
@@ -135,7 +135,7 @@ the iteration rather than from the call:
 - Request validation happens on the first `next()`, not when `generateStream` is
   called — standard async-generator semantics. `const it = client.generateStream(bad)`
   does not throw; the `for await` that drives it does.
-- A failure throws an `LLMShimError` from the loop; an abort throws the
+- A failure throws an `LLMDriverError` from the loop; an abort throws the
   signal's own reason untouched, identically across all four targets.
 - Stopping early cleans up the transport. `break`, `return`, or `throw` inside
   the loop aborts the HTTP stream, or signals the CLI process group (SIGTERM,
@@ -198,11 +198,11 @@ client — or `cliPath`/`cliArgs` to an `api` client — is rejected with an
 
 ## Error handling
 
-Every failure is an `LLMShimError` carrying a stable `code` plus whatever
+Every failure is an `LLMDriverError` carrying a stable `code` plus whatever
 context the target reported.
 
 ```ts
-import { createClient, LLMShimError, user } from "llm-shim";
+import { createClient, LLMDriverError, user } from "llm-driver";
 
 try {
   const response = await client.generate({
@@ -211,7 +211,7 @@ try {
   });
   console.log(response.text);
 } catch (error) {
-  if (error instanceof LLMShimError) {
+  if (error instanceof LLMDriverError) {
     console.error(error.code, error.provider, error.flavor, error.status);
   }
   throw error;
@@ -233,7 +233,7 @@ Other fields: `provider`, `flavor`, `operation` (e.g. `"generate"`), `status`
 
 Abort is deliberately different. Pass an `AbortSignal` and, when it fires,
 `generate` rejects with the signal's abort reason itself — never a wrapped
-`LLMShimError` — identically across all four targets:
+`LLMDriverError` — identically across all four targets:
 
 ```ts
 const response = await client.generate(

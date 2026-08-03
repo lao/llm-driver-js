@@ -1,4 +1,4 @@
-# Spec: llm-shim (npm) — multi-provider text-generation API
+# Spec: llm-driver (npm) — multi-provider text-generation API
 
 ## Objective
 
@@ -16,14 +16,14 @@ Primary user: a Node/TypeScript developer who wants to prototype against a local
 authenticated CLI and later switch to the hosted API — or switch providers — by
 changing only configuration. Call sites never change.
 
-Package name: `llm-shim` (verified available on npm, 2026-08-02).
+Package name: `llm-driver` (verified available on npm, 2026-08-02).
 
 ### Public API
 
 The library owns all public types. Neither provider SDK leaks through the boundary.
 
 ```ts
-import { createClient, user, assistant } from "llm-shim";
+import { createClient, user, assistant } from "llm-driver";
 
 const client = createClient({
   provider: "openai",
@@ -98,7 +98,7 @@ interface Usage {
   reasoningTokens: number;
 }
 
-class LLMShimError extends Error {
+class LLMDriverError extends Error {
   code: ErrorCode;          // stable, for programmatic handling
   provider?: Provider;
   flavor?: Flavor;
@@ -144,7 +144,7 @@ Validation rules (ported from Go):
 - `AbortSignal` kills the subprocess group (SIGTERM, then SIGKILL after grace, so
   CLI-spawned helper processes die too) and aborts API requests.
 - On abort, `generate` rejects with the abort reason itself — never a wrapped
-  `LLMShimError` — identically across all four targets.
+  `LLMDriverError` — identically across all four targets.
 - Mirror exact flags from Go reference: `backend_claude_cli.go`, `backend_codex_cli.go`.
 
 ### Streaming contract (`generateStream`)
@@ -168,7 +168,7 @@ Provider-neutral, deliberately weak enough to hold on all four targets:
   returns. The other three targets hold the equality unconditionally. This is a
   property of the CLI's own output, not a library defect; the opt-in integration
   test characterizes it with a tool-forcing prompt.
-- Same request validation, same `LLMShimError` normalization (errors throw
+- Same request validation, same `LLMDriverError` normalization (errors throw
   from iteration), same abort contract: rejects with `signal.reason` untouched.
 - Consumer `break`/early `return` must clean up the transport: abort the HTTP
   stream / kill the CLI process group. No leaked processes or sockets.
@@ -220,7 +220,7 @@ Opt-in integration smoke test (real binaries) gated by env vars
 package.json / tsconfig.json / biome.json / vitest.config.ts / tsup.config.ts
 src/index.ts              public exports only
 src/types.ts              Config, Request, Response, Message, Usage, enums, user()/assistant()
-src/errors.ts             LLMShimError + ErrorCode
+src/errors.ts             LLMDriverError + ErrorCode
 src/config.ts             config validation
 src/client.ts             createClient, backend selection, generate + request validation
 src/backends/backend.ts   internal Backend interface
@@ -241,7 +241,7 @@ README.md / SPEC.md / tasks/plan.md / CLAUDE.md
   function suffices (`createClient` returns a plain object closing over a backend).
 - SDK imports confined to their adapter file; everything under `src/backends/` is
   internal and never re-exported.
-- Errors always constructed through `LLMShimError`; provider SDK errors are
+- Errors always constructed through `LLMDriverError`; provider SDK errors are
   caught and normalized at the adapter boundary.
 - Biome is the formatting authority.
 

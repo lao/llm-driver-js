@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Command, CommandResult, CommandRunner } from "../src/backends/cli.js";
 import { createCodexCliBackend } from "../src/backends/codex-cli.js";
-import { type ErrorCode, LLMShimError } from "../src/errors.js";
+import { type ErrorCode, LLMDriverError } from "../src/errors.js";
 import { assistant, type Config, type Request, type StreamEvent, user } from "../src/types.js";
 
 const config: Config = { provider: "openai", flavor: "cli", model: "gpt-test" };
@@ -28,13 +28,13 @@ function fakeRunner(result: Partial<CommandResult>, error?: unknown) {
 async function generateError(
   result: Partial<CommandResult>,
   error?: unknown,
-): Promise<LLMShimError> {
+): Promise<LLMDriverError> {
   const { runner } = fakeRunner(result, error);
   try {
     await createCodexCliBackend(config, runner).generate(request);
   } catch (caught) {
-    expect(caught).toBeInstanceOf(LLMShimError);
-    return caught as LLMShimError;
+    expect(caught).toBeInstanceOf(LLMDriverError);
+    return caught as LLMDriverError;
   }
   throw new Error("generate() resolved, want a failure");
 }
@@ -353,11 +353,11 @@ describe("codex cli streaming", () => {
     ).rejects.toBe(reason);
   });
 
-  it("leaves an LLMShimError abort reason untouched", async () => {
+  it("leaves an LLMDriverError abort reason untouched", async () => {
     const controller = new AbortController();
-    // An abort reason that is itself an LLMShimError used to be re-normalized
+    // An abort reason that is itself an LLMDriverError used to be re-normalized
     // into a fresh error by the diagnostic fallback; it must pass through.
-    const reason = new LLMShimError("process_failed", "caller aborted", { status: 9 });
+    const reason = new LLMDriverError("process_failed", "caller aborted", { status: 9 });
     const runner: CommandRunner = async (_command, signal) => {
       controller.abort(reason);
       throw signal?.reason;
