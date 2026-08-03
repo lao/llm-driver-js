@@ -1,6 +1,6 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { type ErrorCode, LLMShimError } from "../errors.js";
+import { type ErrorCode, LLMDriverError } from "../errors.js";
 import type { Message, Provider } from "../types.js";
 
 /** Hard cap on captured stdout and stderr, matching the Go reference. */
@@ -48,7 +48,7 @@ export type StreamingCommandRunner = (
 /** Outcome of a run; stdout stays readable when the process failed. */
 export interface CliOutcome {
   stdout: string;
-  failure?: LLMShimError;
+  failure?: LLMDriverError;
 }
 
 /**
@@ -117,7 +117,7 @@ export async function* streamCli(
 function exitFailure(
   provider: Provider,
   result: { exitCode: number; stderr: string },
-): LLMShimError {
+): LLMDriverError {
   return cliError(
     provider,
     "process_failed",
@@ -134,8 +134,8 @@ export function cliError(
   code: ErrorCode,
   message: string,
   options: { status?: number; providerCode?: string; cause?: unknown } = {},
-): LLMShimError {
-  return new LLMShimError(code, message, {
+): LLMDriverError {
+  return new LLMDriverError(code, message, {
     ...options,
     provider,
     flavor: "cli",
@@ -436,7 +436,7 @@ export const spawnStreamRunner: StreamingCommandRunner = async function* (comman
   }
 };
 
-function launchFailure(provider: Provider, command: Command, error: unknown): LLMShimError {
+function launchFailure(provider: Provider, command: Command, error: unknown): LLMDriverError {
   if (isErrno(error, "ENOENT")) {
     return cliError(
       provider,

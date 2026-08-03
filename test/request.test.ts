@@ -1,19 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { validateRequest } from "../src/client.js";
-import { LLMShimError } from "../src/errors.js";
+import { LLMDriverError } from "../src/errors.js";
 import { assistant, type Config, type Request, type Role, user } from "../src/types.js";
 
 const config: Config = { provider: "openai", flavor: "cli", model: "test-model" };
 
-function expectInvalidRequest(request: Request): LLMShimError {
+function expectInvalidRequest(request: Request): LLMDriverError {
   let caught: unknown;
   try {
     validateRequest(request, config);
   } catch (error) {
     caught = error;
   }
-  expect(caught).toBeInstanceOf(LLMShimError);
-  const error = caught as LLMShimError;
+  expect(caught).toBeInstanceOf(LLMDriverError);
+  const error = caught as LLMDriverError;
   expect(error.code).toBe("invalid_request");
   return error;
 }

@@ -1,18 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { createClient } from "../src/client.js";
 import { validateConfig } from "../src/config.js";
-import { LLMShimError } from "../src/errors.js";
+import { LLMDriverError } from "../src/errors.js";
 import { type Config, type Flavor, type Provider, user } from "../src/types.js";
 
-function expectInvalidConfig(config: Config): LLMShimError {
+function expectInvalidConfig(config: Config): LLMDriverError {
   let caught: unknown;
   try {
     validateConfig(config);
   } catch (error) {
     caught = error;
   }
-  expect(caught).toBeInstanceOf(LLMShimError);
-  const error = caught as LLMShimError;
+  expect(caught).toBeInstanceOf(LLMDriverError);
+  const error = caught as LLMDriverError;
   expect(error.code).toBe("invalid_config");
   return error;
 }
@@ -140,7 +140,7 @@ describe("validateConfig", () => {
 
   it("surfaces config errors from createClient", () => {
     expect(() => createClient({ provider: "claude", flavor: "api", model: "" })).toThrow(
-      LLMShimError,
+      LLMDriverError,
     );
   });
 });
