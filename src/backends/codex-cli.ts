@@ -1,8 +1,9 @@
 import { LLMWrapperError } from "../errors.js";
-import type { Config, Response, Usage } from "../types.js";
+import type { Config, Request, Response, Usage } from "../types.js";
 import type { Backend } from "./backend.js";
 import {
   asRecord,
+  type Command,
   type CommandRunner,
   cliError,
   executeCli,
@@ -20,7 +21,7 @@ import {
  * read-only sandbox, no git-repo check, and a trailing `-` so the prompt is
  * read from stdin. Default tests inject a fake runner and cannot catch a
  * renamed flag, so the opt-in integration test exercises the real binary.
- * `runner` is an internal seam and is never part of the public API.
+ * `runner` is an internal seam, never public API.
  */
 export function createCodexCliBackend(
   config: Config,
@@ -29,26 +30,43 @@ export function createCodexCliBackend(
   const executable = config.cliPath ?? "codex";
   const extraArgs = config.cliArgs ?? [];
 
-  return {
-    async generate(request, signal) {
-      const args = [
-        "exec",
-        "--json",
-        "--sandbox",
-        "read-only",
-        "--skip-git-repo-check",
-        "--model",
-        config.model,
-      ];
-      if (request.system) {
-        args.push("--config", `developer_instructions=${JSON.stringify(request.system)}`);
-      }
-      args.push(...extraArgs, "-");
+  const buildCommand = (request: Request): Command => {
+    const args = [
+      "exec",
+      "--json",
+      "--sandbox",
+      "read-only",
+      "--skip-git-repo-check",
+      "--model",
+      config.model,
+    ];
+    if (request.system) {
+      args.push("--config", `developer_instructions=${JSON.stringify(request.system)}`);
+    }
+    args.push(...extraArgs, "-");
+    return { executable, args, stdin: renderTranscript(request.messages) };
+  };
 
-      const command = { executable, args, stdin: renderTranscript(request.messages) };
-      const { stdout, failure } = await executeCli("openai", command, runner, signal);
-      if (failure) throw preferReportedFailure(failure, stdout, config.model);
-      return parseCodexOutput(stdout, config.model);
+  const generate = async (request: Request, signal?: AbortSignal): Promise<Response> => {
+    const command = buildCommand(request);
+    const { stdout, failure } = await executeCli("openai", command, runner, signal);
+    if (failure) throw preferReportedFailure(failure, stdout, config.model);
+    return parseCodexOutput(stdout, config.model);
+  };
+
+  return {
+    generate,
+
+    /**
+     * Coarse by design: `codex exec --json` reports completed items only — no
+     * text deltas — so nothing can be emitted before the turn ends anyway, and
+     * delegating to `generate` keeps one parse and one abort contract.
+     * TODO: switch to real deltas if `codex exec --json` ever documents them.
+     */
+    async *generateStream(request, signal) {
+      const response = await generate(request, signal);
+      if (response.text !== "") yield { type: "text", text: response.text };
+      yield { type: "done", response };
     },
   };
 }

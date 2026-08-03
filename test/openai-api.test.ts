@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createClient } from "../src/client.js";
 import { LLMWrapperError } from "../src/errors.js";
-import { assistant, type Request as GenerateRequest, user } from "../src/types.js";
+import {
+  assistant,
+  type Request as GenerateRequest,
+  type StreamEvent,
+  user,
+} from "../src/types.js";
 
 const BASE_URL = "https://openai.test";
 
@@ -285,5 +290,277 @@ describe("openai api backend", () => {
     controller.abort(reason);
 
     await expect(pending).rejects.toBe(reason);
+  });
+});
+
+function outputTextDelta(delta: string) {
+  return {
+    type: "response.output_text.delta",
+    delta,
+    item_id: "msg_123",
+    output_index: 0,
+    content_index: 0,
+    sequence_number: 1,
+  };
+}
+
+function sse(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/**
+ * Serves a canned SSE body. `keepOpen` leaves the stream unfinished so abort and
+ * early-break tests can observe the transport being torn down.
+ */
+function stubSse(chunks: string[], options: { keepOpen?: boolean } = {}) {
+  const requests: Request[] = [];
+  const signals: (AbortSignal | undefined)[] = [];
+  const impl: typeof fetch = async (input, init) => {
+    requests.push(new Request(input, init));
+    const signal = init?.signal ?? undefined;
+    signals.push(signal);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk));
+        if (options.keepOpen) {
+          signal?.addEventListener("abort", () => controller.error(signal.reason));
+        } else {
+          controller.close();
+        }
+      },
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  };
+  return { impl, requests, signals };
+}
+
+async function collect(stream: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> {
+  const events: StreamEvent[] = [];
+  for await (const event of stream) events.push(event);
+  return events;
+}
+
+describe("openai api backend streaming", () => {
+  it("streams text deltas and ends with a done event", async () => {
+    const stub = stubSse([
+      sse("response.created", { type: "response.created", response: { ...RESPONSE, output: [] } }),
+      sse("response.output_text.delta", outputTextDelta("Hello, ")),
+      sse("response.output_text.delta", outputTextDelta("world")),
+      sse("response.completed", { type: "response.completed", response: RESPONSE }),
+    ]);
+
+    const events = await collect(clientWith(stub.impl).generateStream(PROMPT));
+
+    expect(await (stub.requests[0] as Request).json()).toMatchObject({
+      stream: true,
+      model: "gpt-test",
+      max_output_tokens: 64,
+    });
+    expect(events).toEqual([
+      { type: "text", text: "Hello, " },
+      { type: "text", text: "world" },
+      {
+        type: "done",
+        response: {
+          id: "resp_123",
+          model: "gpt-test",
+          text: "Hello, world",
+          completionReason: "stop",
+          provider: "openai",
+          flavor: "api",
+          usage: {
+            inputTokens: 10,
+            outputTokens: 7,
+            cachedInputTokens: 3,
+            cacheCreationInputTokens: 4,
+            reasoningTokens: 2,
+          },
+        },
+      },
+    ]);
+  });
+
+  it("yields only a done event when the stream carries no text", async () => {
+    const stub = stubSse([
+      sse("response.completed", {
+        type: "response.completed",
+        response: { ...RESPONSE, output: [] },
+      }),
+    ]);
+
+    const events = await collect(clientWith(stub.impl).generateStream(PROMPT));
+
+    expect(events).toEqual([
+      { type: "done", response: expect.objectContaining({ text: "", completionReason: "stop" }) },
+    ]);
+  });
+
+  it("keeps truncated text and reports max_tokens", async () => {
+    const stub = stubSse([
+      sse("response.output_text.delta", outputTextDelta("partial answer")),
+      sse("response.incomplete", {
+        type: "response.incomplete",
+        response: {
+          ...RESPONSE,
+          status: "incomplete",
+          incomplete_details: { reason: "max_output_tokens" },
+          output: [
+            {
+              id: "msg_incomplete",
+              type: "message",
+              status: "incomplete",
+              role: "assistant",
+              content: [{ type: "output_text", text: "partial answer", annotations: [] }],
+            },
+          ],
+        },
+      }),
+    ]);
+
+    const events = await collect(clientWith(stub.impl).generateStream(PROMPT));
+
+    expect(events[0]).toEqual({ type: "text", text: "partial answer" });
+    expect(events[1]).toEqual({
+      type: "done",
+      response: expect.objectContaining({ text: "partial answer", completionReason: "max_tokens" }),
+    });
+  });
+
+  it("streams refusal deltas so the concatenation still matches the done text", async () => {
+    const stub = stubSse([
+      sse("response.refusal.delta", {
+        type: "response.refusal.delta",
+        delta: "I cannot help with that.",
+        item_id: "msg_refusal",
+        output_index: 0,
+        content_index: 0,
+        sequence_number: 1,
+      }),
+      sse("response.completed", {
+        type: "response.completed",
+        response: {
+          ...RESPONSE,
+          output: [
+            {
+              id: "msg_refusal",
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "refusal", refusal: "I cannot help with that." }],
+            },
+          ],
+        },
+      }),
+    ]);
+
+    const events = await collect(clientWith(stub.impl).generateStream(PROMPT));
+
+    expect(events[0]).toEqual({ type: "text", text: "I cannot help with that." });
+    expect(events[1]).toEqual({
+      type: "done",
+      response: expect.objectContaining({
+        text: "I cannot help with that.",
+        completionReason: "refusal",
+      }),
+    });
+  });
+
+  it("normalizes a mid-stream error event into an api_error", async () => {
+    const stub = stubSse([
+      sse("response.output_text.delta", outputTextDelta("Hello")),
+      sse("error", {
+        type: "error",
+        code: "server_error",
+        message: "an internal error occurred",
+        param: null,
+        sequence_number: 2,
+      }),
+    ]);
+
+    const error = await rejection(collect(clientWith(stub.impl).generateStream(PROMPT)));
+
+    expect(error.code).toBe("api_error");
+    expect(error.providerCode).toBe("server_error");
+    expect(error.message).toBe("an internal error occurred");
+    expect(error.provider).toBe("openai");
+    expect(error.flavor).toBe("api");
+  });
+
+  it("normalizes a failed final response into an api_error", async () => {
+    const stub = stubSse([
+      sse("response.failed", {
+        type: "response.failed",
+        response: {
+          ...RESPONSE,
+          status: "failed",
+          output: [],
+          error: { code: "server_error", message: "generation failed" },
+        },
+      }),
+    ]);
+
+    const error = await rejection(collect(clientWith(stub.impl).generateStream(PROMPT)));
+
+    expect(error.code).toBe("api_error");
+    expect(error.providerCode).toBe("server_error");
+    expect(error.message).toBe("generation failed");
+  });
+
+  it("normalizes a stream that never reports a final response", async () => {
+    const stub = stubSse([sse("response.output_text.delta", outputTextDelta("orphan"))]);
+
+    const error = await rejection(collect(clientWith(stub.impl).generateStream(PROMPT)));
+
+    expect(error.code).toBe("parse_failed");
+    expect(error.provider).toBe("openai");
+  });
+
+  it("normalizes a malformed SSE event instead of leaking a SyntaxError", async () => {
+    const stub = stubSse([
+      sse("response.output_text.delta", outputTextDelta("Hello")),
+      "event: response.completed\ndata: {not json\n\n",
+    ]);
+
+    const error = await rejection(collect(clientWith(stub.impl).generateStream(PROMPT)));
+
+    // The SDK raises the parse failure as a plain SyntaxError mid-iteration.
+    expect(error.code).toBe("transport_failed");
+    expect(error.cause).toBeInstanceOf(SyntaxError);
+    expect(error.provider).toBe("openai");
+    expect(error.flavor).toBe("api");
+  });
+
+  it("aborts mid-stream and surfaces the abort reason itself", async () => {
+    const stub = stubSse([sse("response.output_text.delta", outputTextDelta("Hello"))], {
+      keepOpen: true,
+    });
+    const controller = new AbortController();
+    const reason = new Error("my-timeout");
+    const stream = clientWith(stub.impl).generateStream(PROMPT, { signal: controller.signal });
+
+    const drain = (async () => {
+      for await (const event of stream) {
+        expect(event).toEqual({ type: "text", text: "Hello" });
+        controller.abort(reason);
+      }
+    })();
+
+    await expect(drain).rejects.toBe(reason);
+  });
+
+  it("aborts the http stream when the consumer breaks early", async () => {
+    const stub = stubSse([sse("response.output_text.delta", outputTextDelta("Hello"))], {
+      keepOpen: true,
+    });
+
+    for await (const event of clientWith(stub.impl).generateStream(PROMPT)) {
+      expect(event).toEqual({ type: "text", text: "Hello" });
+      break;
+    }
+
+    expect(stub.signals[0]?.aborted).toBe(true);
   });
 });

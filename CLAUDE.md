@@ -44,6 +44,23 @@ subprocess, `codex exec` subprocess.
   All adapters normalize failures into `LLMWrapperError` with a stable `code`; the one
   exception is abort: on `AbortSignal`, `generate` rejects with the raw abort reason,
   never a wrapped error, identically across all four targets.
+- `generateStream` is the streaming half of the same contract: zero or more `text`
+  deltas whose concatenation equals `done.response.text`, then exactly one `done`
+  event carrying the Response `generate` would have returned. Granularity is
+  target-dependent and deliberately unspecified (API flavors stream token deltas,
+  `claude -p` streams partial messages, `codex exec` yields one coarse delta —
+  `generateStream` there just delegates to `generate`).
+  The concatenation guarantee is **scoped for `claude`/`cli`**: `claude -p` emits
+  deltas for every assistant message in the turn while `done.response` comes from
+  the final `result` event only, so the equality holds for single-message turns
+  and the deltas are a superset once the CLI runs tools. Not fixable in the
+  adapter (the deltas are already emitted by the time the turn goes agentic);
+  documented in SPEC.md and README, characterized in `test/integration.test.ts`.
+  Each adapter implements `generateStream` next to its `generate` — client-side
+  validation and stamping live in `src/client.ts` (validation surfaces on the
+  first `next()`), the CLI streaming runner in `src/backends/cli.ts`
+  (`spawnStreamRunner`/`streamCli`). Consumer `break` must tear the transport
+  down, so every adapter aborts or kills in the generator's `finally`.
 - `src/backends/cli.ts` is the shared subprocess runner: argv array + stdin transcript,
   never a shell; 16 MiB bounded stdout/stderr capture that kills on overflow; detached
   spawn on POSIX so aborts kill the whole process group (SIGTERM, then SIGKILL after

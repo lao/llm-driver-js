@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Command, CommandResult, CommandRunner } from "../src/backends/cli.js";
 import { createCodexCliBackend } from "../src/backends/codex-cli.js";
 import { type ErrorCode, LLMWrapperError } from "../src/errors.js";
-import { assistant, type Config, type Request, user } from "../src/types.js";
+import { assistant, type Config, type Request, type StreamEvent, user } from "../src/types.js";
 
 const config: Config = { provider: "openai", flavor: "cli", model: "gpt-test" };
 const request: Request = { maxTokens: 32, messages: [user("Hello")] };
@@ -262,6 +262,109 @@ describe("codex cli failures", () => {
 
     await expect(
       createCodexCliBackend(config, runner).generate(request, controller.signal),
+    ).rejects.toBe(reason);
+  });
+});
+
+async function collect(events: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> {
+  const seen: StreamEvent[] = [];
+  for await (const event of events) seen.push(event);
+  return seen;
+}
+
+/**
+ * `generateStream` delegates to `generate`, so the failure-normalization matrix
+ * above covers both paths; only the event contract is tested here.
+ */
+describe("codex cli streaming", () => {
+  const successStream = [
+    '{"type":"thread.started","thread_id":"thread-123"}',
+    '{"type":"item.completed","item":{"id":"message-1","type":"agent_message","text":"Final answer"}}',
+    '{"type":"turn.completed","usage":{"input_tokens":19,"cached_input_tokens":11,"cache_write_input_tokens":5,"output_tokens":7,"reasoning_output_tokens":3}}',
+    "",
+  ].join("\n");
+
+  it("reuses the generate argv and forwards the signal", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStream });
+    const signal = new AbortController().signal;
+
+    await collect(createCodexCliBackend(config, runner).generateStream(request, signal));
+
+    expect(calls[0]?.command).toEqual({
+      executable: "codex",
+      args: [...baseArgs, "--model", "gpt-test", "-"],
+      stdin: "Hello",
+    });
+    expect(calls[0]?.signal).toBe(signal);
+  });
+
+  it("yields one coarse text event, then the response generate would return", async () => {
+    const { runner } = fakeRunner({ stdout: successStream });
+
+    const events = await collect(createCodexCliBackend(config, runner).generateStream(request));
+
+    expect(events).toEqual([
+      { type: "text", text: "Final answer" },
+      {
+        type: "done",
+        response: {
+          id: "thread-123",
+          model: "gpt-test",
+          text: "Final answer",
+          usage: {
+            inputTokens: 19,
+            outputTokens: 7,
+            cachedInputTokens: 11,
+            cacheCreationInputTokens: 5,
+            reasoningTokens: 3,
+          },
+          completionReason: "",
+          provider: "openai",
+          flavor: "cli",
+        },
+      },
+    ]);
+  });
+
+  it("emits only the done event when the agent message is empty", async () => {
+    const { runner } = fakeRunner({
+      stdout: [
+        '{"type":"item.completed","item":{"type":"agent_message","text":""}}',
+        '{"type":"turn.completed","usage":{}}',
+      ].join("\n"),
+    });
+
+    const events = await collect(createCodexCliBackend(config, runner).generateStream(request));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "done", response: { text: "" } });
+  });
+
+  it("propagates a caller abort unwrapped mid-stream", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    const runner: CommandRunner = async (_command, signal) => {
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+
+    await expect(
+      collect(createCodexCliBackend(config, runner).generateStream(request, controller.signal)),
+    ).rejects.toBe(reason);
+  });
+
+  it("leaves an LLMWrapperError abort reason untouched", async () => {
+    const controller = new AbortController();
+    // An abort reason that is itself an LLMWrapperError used to be re-normalized
+    // into a fresh error by the diagnostic fallback; it must pass through.
+    const reason = new LLMWrapperError("process_failed", "caller aborted", { status: 9 });
+    const runner: CommandRunner = async (_command, signal) => {
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+
+    await expect(
+      collect(createCodexCliBackend(config, runner).generateStream(request, controller.signal)),
     ).rejects.toBe(reason);
   });
 });

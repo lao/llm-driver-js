@@ -5,10 +5,15 @@
  */
 import { parseArgs } from "node:util";
 // In your own project this import is `from "llmwrapper"`.
-import { createClient, LLMWrapperError, user } from "../src/index.js";
+import {
+  createClient,
+  type Response as GenerateResponse,
+  LLMWrapperError,
+  user,
+} from "../src/index.js";
 
 const USAGE = `Usage: npm run example -- --provider <claude|openai> --flavor <api|cli> \\
-  --model <model> --prompt <text> [--system <text>] [--max-tokens <n>]`;
+  --model <model> --prompt <text> [--system <text>] [--max-tokens <n>] [--stream]`;
 
 async function main(): Promise<void> {
   const { values } = parseArgs({
@@ -19,6 +24,7 @@ async function main(): Promise<void> {
       prompt: { type: "string" },
       system: { type: "string" },
       "max-tokens": { type: "string", default: "1024" },
+      stream: { type: "boolean", default: false },
     },
   });
 
@@ -32,19 +38,33 @@ async function main(): Promise<void> {
   }
 
   const client = createClient({ provider, flavor, model });
-  const response = await client.generate({
-    system: values.system,
-    messages: [user(prompt)],
-    maxTokens,
-  });
+  const request = { system: values.system, messages: [user(prompt)], maxTokens };
 
-  console.log(response.text);
-  console.log(
+  if (!values.stream) {
+    const response = await client.generate(request);
+    console.log(response.text);
+    console.log(summary(response));
+    return;
+  }
+
+  // Deltas arrive at whatever granularity the target reports; the final `done`
+  // event carries exactly what generate() would have returned.
+  for await (const event of client.generateStream(request)) {
+    if (event.type === "text") {
+      process.stdout.write(event.text);
+    } else {
+      console.log(summary(event.response));
+    }
+  }
+}
+
+function summary(response: GenerateResponse): string {
+  return (
     `\n[${response.provider}/${response.flavor} ${response.model}] ` +
-      `in=${response.usage.inputTokens} out=${response.usage.outputTokens} ` +
-      `cached=${response.usage.cachedInputTokens} ` +
-      `cacheWrite=${response.usage.cacheCreationInputTokens} ` +
-      `reasoning=${response.usage.reasoningTokens}`,
+    `in=${response.usage.inputTokens} out=${response.usage.outputTokens} ` +
+    `cached=${response.usage.cachedInputTokens} ` +
+    `cacheWrite=${response.usage.cacheCreationInputTokens} ` +
+    `reasoning=${response.usage.reasoningTokens}`
   );
 }
 

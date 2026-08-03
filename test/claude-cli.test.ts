@@ -1,12 +1,22 @@
 import { describe, expect, it } from "vitest";
 import { createClaudeCliBackend } from "../src/backends/claude-cli.js";
-import type { Command, CommandResult, CommandRunner } from "../src/backends/cli.js";
+import {
+  type Command,
+  type CommandResult,
+  type CommandRunner,
+  type StreamingCommandRunner,
+} from "../src/backends/cli.js";
 import { type ErrorCode, LLMWrapperError } from "../src/errors.js";
-import { assistant, type Config, type Request, user } from "../src/types.js";
+import { assistant, type Config, type Request, type StreamEvent, user } from "../src/types.js";
 
 const config: Config = { provider: "claude", flavor: "cli", model: "claude-test" };
 const request: Request = { maxTokens: 32, messages: [user("Hello")] };
 const baseArgs = ["-p", "--output-format", "json", "--permission-mode", "default"];
+
+/** Streaming tests never call generate; a real spawner there would break the offline discipline. */
+const neverSpawn: CommandRunner = () => {
+  throw new Error("buffered runner must not be used in streaming tests");
+};
 
 function fakeRunner(result: Partial<CommandResult>, error?: unknown) {
   const calls: Array<{ command: Command; signal?: AbortSignal }> = [];
@@ -247,5 +257,262 @@ describe("claude cli failures", () => {
     await expect(
       createClaudeCliBackend(config, runner).generate(request, controller.signal),
     ).rejects.toBe(reason);
+  });
+});
+
+const streamBaseArgs = [
+  "-p",
+  "--output-format",
+  "stream-json",
+  "--include-partial-messages",
+  "--verbose",
+  "--permission-mode",
+  "default",
+];
+
+function delta(text: string): string {
+  return JSON.stringify({
+    type: "stream_event",
+    event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+    session_id: "session-123",
+  });
+}
+
+const resultLine = JSON.stringify({
+  type: "result",
+  subtype: "success",
+  is_error: false,
+  result: "Hello, world",
+  session_id: "session-123",
+  usage: {
+    input_tokens: 11,
+    output_tokens: 7,
+    cache_read_input_tokens: 5,
+    cache_creation_input_tokens: 3,
+  },
+});
+
+function fakeStreamRunner(
+  lines: string[],
+  exit: Partial<{ exitCode: number; stderr: string }> = {},
+  error?: unknown,
+) {
+  const calls: Array<{ command: Command; signal?: AbortSignal }> = [];
+  let closed = false;
+  const runner: StreamingCommandRunner = async function* (command, signal) {
+    calls.push({ command, signal });
+    try {
+      if (error !== undefined) throw error;
+      for (const line of lines) yield { type: "line", line };
+      yield { type: "exit", exitCode: 0, stderr: "", ...exit };
+    } finally {
+      closed = true;
+    }
+  };
+  return { runner, calls, wasClosed: () => closed };
+}
+
+function streamBackend(
+  lines: string[],
+  exit?: Partial<{ exitCode: number; stderr: string }>,
+  error?: unknown,
+) {
+  const fake = fakeStreamRunner(lines, exit, error);
+  const backend = createClaudeCliBackend(config, neverSpawn, fake.runner);
+  return { ...fake, backend };
+}
+
+async function collect(events: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> {
+  const seen: StreamEvent[] = [];
+  for await (const event of events) seen.push(event);
+  return seen;
+}
+
+async function streamError(
+  lines: string[],
+  exit?: Partial<{ exitCode: number; stderr: string }>,
+  error?: unknown,
+): Promise<LLMWrapperError> {
+  const { backend } = streamBackend(lines, exit, error);
+  try {
+    await collect(backend.generateStream(request));
+  } catch (caught) {
+    expect(caught).toBeInstanceOf(LLMWrapperError);
+    return caught as LLMWrapperError;
+  }
+  throw new Error("generateStream() completed, want a failure");
+}
+
+describe("claude cli streaming command", () => {
+  it("builds the stream-json argv and forwards the signal", async () => {
+    const { backend, calls } = streamBackend([resultLine]);
+    const signal = new AbortController().signal;
+
+    await collect(backend.generateStream(request, signal));
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.command).toEqual({
+      executable: "claude",
+      args: [...streamBaseArgs, "--model", "claude-test"],
+      stdin: "Hello",
+    });
+    expect(calls[0]?.signal).toBe(signal);
+  });
+
+  it("appends the system prompt and extra cli args like generate does", async () => {
+    const fake = fakeStreamRunner([resultLine]);
+    const backend = createClaudeCliBackend(
+      { ...config, cliPath: "/opt/bin/claude-custom", cliArgs: ["--permission-mode", "plan"] },
+      neverSpawn,
+      fake.runner,
+    );
+
+    await collect(
+      backend.generateStream({
+        system: "Be concise.",
+        maxTokens: 32,
+        messages: [user("First"), assistant("Second"), user("Third")],
+      }),
+    );
+
+    expect(fake.calls[0]?.command).toEqual({
+      executable: "/opt/bin/claude-custom",
+      args: [
+        ...streamBaseArgs,
+        "--model",
+        "claude-test",
+        "--append-system-prompt",
+        "Be concise.",
+        "--permission-mode",
+        "plan",
+      ],
+      stdin: "User: First\n\nAssistant: Second\n\nUser: Third",
+    });
+  });
+});
+
+describe("claude cli streaming events", () => {
+  it("yields partial text deltas, then the same response generate would return", async () => {
+    const { backend } = streamBackend([
+      '{"type":"system","subtype":"init","session_id":"session-123"}',
+      delta("Hello, "),
+      '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}}',
+      delta("world"),
+      '{"type":"assistant","message":{"role":"assistant"}}',
+      "",
+      resultLine,
+    ]);
+
+    const events = await collect(backend.generateStream(request));
+
+    expect(events.slice(0, 2)).toEqual([
+      { type: "text", text: "Hello, " },
+      { type: "text", text: "world" },
+    ]);
+    expect(events[2]).toEqual({
+      type: "done",
+      response: {
+        id: "session-123",
+        model: "claude-test",
+        text: "Hello, world",
+        usage: {
+          inputTokens: 11,
+          outputTokens: 7,
+          cachedInputTokens: 5,
+          cacheCreationInputTokens: 3,
+          reasoningTokens: 0,
+        },
+        completionReason: "",
+        provider: "claude",
+        flavor: "cli",
+      },
+    });
+    const text = events
+      .filter((event) => event.type === "text")
+      .map((event) => event.text)
+      .join("");
+    expect(text).toBe("Hello, world");
+  });
+
+  it("emits only the done event when no partial messages arrive", async () => {
+    const { backend } = streamBackend([resultLine]);
+
+    const events = await collect(backend.generateStream(request));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "done", response: { text: "Hello, world" } });
+  });
+
+  it("closes the runner when the consumer breaks early", async () => {
+    const { backend, wasClosed } = streamBackend([delta("Hello, "), delta("world"), resultLine]);
+
+    for await (const event of backend.generateStream(request)) {
+      expect(event).toEqual({ type: "text", text: "Hello, " });
+      break;
+    }
+
+    expect(wasClosed()).toBe(true);
+  });
+});
+
+describe("claude cli streaming failures", () => {
+  it("normalizes a malformed event line", async () => {
+    const error = await streamError([delta("hi"), "not-json"]);
+
+    expect(error.code).toBe("parse_failed");
+    expect(error.message).toContain("event 2");
+    expect(error.provider).toBe("claude");
+    expect(error.flavor).toBe("cli");
+  });
+
+  it("normalizes a stream that never reports a result", async () => {
+    const error = await streamError([delta("hi")]);
+
+    expect(error.code).toBe("parse_failed");
+    expect(error.providerCode).toBe("missing_result");
+  });
+
+  it("normalizes an unsuccessful result exactly like generate", async () => {
+    const error = await streamError([
+      '{"type":"result","subtype":"error_max_turns","result":"turn limit reached"}',
+    ]);
+
+    expect(error.code).toBe("api_error");
+    expect(error.providerCode).toBe("error_max_turns");
+    expect(error.message).toBe("turn limit reached");
+  });
+
+  it("normalizes a non-zero exit", async () => {
+    const error = await streamError([delta("hi")], {
+      exitCode: 17,
+      stderr: "authentication failed\n",
+    });
+
+    expect(error.code).toBe("process_failed");
+    expect(error.status).toBe(17);
+    expect(error.message).toBe("authentication failed");
+  });
+
+  it("normalizes a missing executable", async () => {
+    const error = await streamError(
+      [],
+      {},
+      Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" }),
+    );
+
+    expect(error.code).toBe("executable_not_found");
+  });
+
+  it("propagates a caller abort unwrapped mid-stream", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    const runner: StreamingCommandRunner = async function* (_command, signal) {
+      yield { type: "line", line: delta("Hello, ") };
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+    const backend = createClaudeCliBackend(config, neverSpawn, runner);
+
+    await expect(collect(backend.generateStream(request, controller.signal))).rejects.toBe(reason);
   });
 });

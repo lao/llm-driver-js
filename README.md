@@ -83,6 +83,78 @@ createClient({ provider: "openai", flavor: "cli", model: "gpt-5.6-sol" });
 
 The request and the `generate` call stay identical across all four.
 
+## Streaming
+
+`generateStream` takes the same request and returns an async iterable of events:
+zero or more `text` deltas, then exactly one final `done` event carrying the
+same `Response` `generate` would have returned. Nothing follows `done`.
+
+```ts
+for await (const event of client.generateStream({
+  messages: [user("Explain dependency inversion")],
+  maxTokens: 1024,
+})) {
+  if (event.type === "text") {
+    process.stdout.write(event.text);
+  } else {
+    console.log("\n", event.response.usage);
+  }
+}
+```
+
+```ts
+type StreamEvent =
+  | { type: "text"; text: string } // incremental delta, possibly coarse
+  | { type: "done"; response: Response }; // always last, exactly once
+```
+
+The concatenated `text` deltas equal `done.response.text`. **Granularity
+is not part of the contract** — it is whatever the target reports, and a target
+may report nothing until the end:
+
+| Target | Granularity |
+| --- | --- |
+| `claude`/`api` | Token-level deltas (Messages API SSE) |
+| `openai`/`api` | Token-level deltas (Responses API SSE) |
+| `claude`/`cli` | Partial-message chunks (`--output-format stream-json --include-partial-messages`) |
+| `openai`/`cli` | One coarse delta: `codex exec --json` reports completed messages only |
+
+> **`claude`/`cli` caveat.** `claude -p` is an agent, not a completion endpoint.
+> It streams deltas for every assistant message in the turn, but its final
+> `result` event — the one that becomes `done.response` — reports only the last
+> message. The concatenation therefore equals `done.response.text` for a
+> single-message turn; if the CLI runs tools, the deltas additionally contain the
+> intermediate assistant text spoken before each tool call. `done.response` is
+> always exactly what `generate` would have returned. Treat `done.response.text`
+> as the answer and the deltas as progress output. The other three targets hold
+> the equality unconditionally.
+
+Errors and aborts work exactly as with `generate`, except that they surface from
+the iteration rather than from the call:
+
+- Request validation happens on the first `next()`, not when `generateStream` is
+  called — standard async-generator semantics. `const it = client.generateStream(bad)`
+  does not throw; the `for await` that drives it does.
+- A failure throws an `LLMWrapperError` from the loop; an abort throws the
+  signal's own reason untouched, identically across all four targets.
+- Stopping early cleans up the transport. `break`, `return`, or `throw` inside
+  the loop aborts the HTTP stream, or signals the CLI process group (SIGTERM,
+  then SIGKILL after a short grace period) — the iteration does not wait around
+  to reap the process, it only guarantees the teardown is under way.
+- That cleanup runs in the generator's `finally`, which `for await` triggers for
+  you. A **manual iterator** must call `.return()` itself (or the `finally` never
+  runs and the transport leaks). Note that `.return()` cannot preempt a pending
+  `next()`: it is queued behind it, so a stalled stream is only preempted by the
+  `AbortSignal`.
+
+```ts
+for await (const event of client.generateStream(request, {
+  signal: AbortSignal.timeout(30_000),
+})) {
+  if (event.type === "text" && event.text.includes("STOP")) break; // transport torn down
+}
+```
+
 ## Authentication and configuration
 
 API flavors use the official provider SDKs. Set `ANTHROPIC_API_KEY` or
@@ -175,7 +247,7 @@ target takes. Pass `AbortSignal.timeout(ms)` if you need a deadline.
 
 ## Scope and CLI differences
 
-The shared contract is non-streaming, text-only generation: system text,
+The shared contract is text-only generation, streaming or not: system text,
 multi-turn user/assistant messages, normalized text, and usage when reported.
 
 The CLI flavors intentionally wrap agent CLIs. They are not byte-for-byte
@@ -216,8 +288,8 @@ equivalents of the hosted APIs:
   the host shuts down normally. A host killed outright (`SIGKILL`, or a signal
   it does not handle) leaves the CLI running until it finishes on its own.
 
-Streaming, tool/function calling, images, structured output, retries, automatic
-fallback, and persisted conversations are outside this library's current scope.
+Tool/function calling, images, structured output, retries, automatic fallback,
+and persisted conversations are outside this library's current scope.
 
 ## Example
 
@@ -231,7 +303,8 @@ npm run example -- \
   --prompt "Explain dependency inversion in one paragraph"
 ```
 
-Optional flags: `--system <text>` and `--max-tokens <n>` (default `1024`).
+Optional flags: `--system <text>`, `--max-tokens <n>` (default `1024`), and
+`--stream` to print deltas as they arrive followed by the usage line.
 Swap in `--provider claude --flavor api --model claude-sonnet-4-5` and the
 example's generation code is unchanged.
 
