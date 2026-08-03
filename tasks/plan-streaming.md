@@ -1,7 +1,7 @@
 # Plan: streaming support (`generateStream`) — v0.2.0
 
 Source of truth: SPEC.md ("Streaming contract" section). Branch: `feat/streaming`.
-Goal: PR against `main` on lao/llmwrapper-js.
+Goal: PR against `main` on lao/llm-driver-js.
 
 Orchestration: Fable authored spec+plan. All remaining phases run as **opus,
 effort high** agents (user directive).
