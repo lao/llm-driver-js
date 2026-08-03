@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { type ErrorCode, LLMWrapperError } from "../errors.js";
 import type { Message, Provider } from "../types.js";
@@ -228,6 +228,22 @@ function trackChild(child: ChildProcess): void {
 }
 
 /**
+ * Spawns the executable directly — never a shell — inheriting cwd and env so the
+ * CLI's own login is used, and leading its own process group on POSIX. The child
+ * may exit before reading the prompt, so a broken stdin pipe is not fatal.
+ */
+function launchChild(command: Command): ChildProcessWithoutNullStreams {
+  const child = spawn(command.executable, command.args, {
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: POSIX,
+  });
+  trackChild(child);
+  child.stdin.on("error", () => {});
+  child.stdin.end(command.stdin);
+  return child;
+}
+
+/**
  * Signals the child's whole process group, so the helper processes `claude` and
  * `codex` spawn die with it. Falls back to the direct child when the group is
  * already gone (`ESRCH`) or on Windows, which has no process groups.
@@ -248,11 +264,15 @@ function killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
 }
 
 /**
- * Default runner: spawns the executable directly — never through a shell — and
- * inherits cwd and env so the CLI's own login is used. The child leads its own
- * process group; an abort sends SIGTERM to the group and escalates to SIGKILL
- * after a short grace period.
+ * Ends a run: SIGTERM to the group, escalating to SIGKILL after a short grace
+ * period. The escalation is unref'd, so it never keeps the host process alive.
  */
+function terminateGroup(child: ChildProcess): NodeJS.Timeout {
+  killGroup(child, "SIGTERM");
+  return setTimeout(() => killGroup(child, "SIGKILL"), KILL_GRACE_MS).unref();
+}
+
+/** Default runner: buffers the whole run, aborting via {@link terminateGroup}. */
 export const spawnRunner: CommandRunner = (command, signal) =>
   new Promise<CommandResult>((resolve, reject) => {
     if (signal?.aborted) {
@@ -260,20 +280,14 @@ export const spawnRunner: CommandRunner = (command, signal) =>
       return;
     }
 
-    const child = spawn(command.executable, command.args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: POSIX,
-    });
-    trackChild(child);
+    const child = launchChild(command);
     const stdout = createBoundedCapture();
     const stderr = createBoundedCapture();
     let killTimer: NodeJS.Timeout | undefined;
     let settled = false;
 
     const onAbort = () => {
-      killGroup(child, "SIGTERM");
-      killTimer = setTimeout(() => killGroup(child, "SIGKILL"), KILL_GRACE_MS);
-      killTimer.unref();
+      killTimer = terminateGroup(child);
     };
     const settle = (finish: () => void) => {
       if (settled) return;
@@ -308,9 +322,6 @@ export const spawnRunner: CommandRunner = (command, signal) =>
     child.on("exit", (code) => {
       if (signal?.aborted) finishRun(code);
     });
-    // The child may exit before reading the prompt; a broken pipe is not fatal.
-    child.stdin.on("error", () => {});
-    child.stdin.end(command.stdin);
   });
 
 /**
@@ -322,12 +333,7 @@ export const spawnRunner: CommandRunner = (command, signal) =>
 export const spawnStreamRunner: StreamingCommandRunner = async function* (command, signal) {
   if (signal?.aborted) throw signal.reason;
 
-  const child = spawn(command.executable, command.args, {
-    stdio: ["pipe", "pipe", "pipe"],
-    detached: POSIX,
-  });
-  trackChild(child);
-
+  const child = launchChild(command);
   const decoder = new StringDecoder("utf8");
   const stderr = createBoundedCapture();
   const lines: string[] = [];
@@ -342,10 +348,7 @@ export const spawnStreamRunner: StreamingCommandRunner = async function* (comman
     wake = undefined;
   };
   const terminate = () => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    killGroup(child, "SIGTERM");
-    // Unref'd, so a pending escalation never keeps the host process alive.
-    setTimeout(() => killGroup(child, "SIGKILL"), KILL_GRACE_MS).unref();
+    if (child.exitCode === null && child.signalCode === null) terminateGroup(child);
   };
   const overflow = () => {
     failure ??= new Error(`CLI output exceeds ${MAX_OUTPUT_BYTES} bytes`);
@@ -381,9 +384,6 @@ export const spawnStreamRunner: StreamingCommandRunner = async function* (comman
     exitCode ??= code ?? -1;
     notify();
   });
-  // The child may exit before reading the prompt; a broken pipe is not fatal.
-  child.stdin.on("error", () => {});
-  child.stdin.end(command.stdin);
 
   try {
     for (;;) {

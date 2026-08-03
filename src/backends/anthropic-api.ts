@@ -18,18 +18,19 @@ export function createAnthropicApiBackend(config: Config): Backend {
     reachedTransport = true;
     return (config.fetch ?? globalThis.fetch)(input, init);
   };
+  const ensureClient = (): Anthropic =>
+    (client ??= new Anthropic({
+      apiKey: config.apiKey,
+      baseURL: config.baseUrl,
+      fetch: fetchImpl,
+      maxRetries: 0, // retries are out of scope: one request per generate()
+    }));
 
   return {
     async generate(request, signal) {
       try {
-        client ??= new Anthropic({
-          apiKey: config.apiKey,
-          baseURL: config.baseUrl,
-          fetch: fetchImpl,
-          maxRetries: 0, // retries are out of scope: one request per generate()
-        });
         return toResponse(
-          await client.messages.create(toParams(config.model, request), { signal }),
+          await ensureClient().messages.create(toParams(config.model, request), { signal }),
         );
       } catch (error) {
         // An abort surfaces the signal's own reason, like the CLI flavors —
@@ -44,13 +45,7 @@ export function createAnthropicApiBackend(config: Config): Backend {
       // HTTP stream down instead of leaking it.
       const controller = new AbortController();
       try {
-        client ??= new Anthropic({
-          apiKey: config.apiKey,
-          baseURL: config.baseUrl,
-          fetch: fetchImpl,
-          maxRetries: 0,
-        });
-        const stream = await client.messages.create(
+        const stream = await ensureClient().messages.create(
           { ...toParams(config.model, request), stream: true },
           { signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal },
         );
