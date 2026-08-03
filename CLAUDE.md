@@ -41,7 +41,7 @@ subprocess, `codex exec` subprocess.
   selects a backend via an exhaustive `provider/flavor` switch. `generate` validates
   the request, delegates, then stamps `provider`/`flavor`/`model` fallback.
 - `src/backends/*.ts` are internal. SDK imports stay confined to their adapter file.
-  All adapters normalize failures into `LLMWrapperError` with a stable `code`; the one
+  All adapters normalize failures into `LLMShimError` with a stable `code`; the one
   exception is abort: on `AbortSignal`, `generate` rejects with the raw abort reason,
   never a wrapped error, identically across all four targets.
 - `generateStream` is the streaming half of the same contract: zero or more `text`

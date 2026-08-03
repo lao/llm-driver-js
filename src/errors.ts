@@ -10,8 +10,8 @@ export type ErrorCode =
   | "api_error"
   | "transport_failed";
 
-/** Optional target and failure context attached to an {@link LLMWrapperError}. */
-export interface LLMWrapperErrorOptions {
+/** Optional target and failure context attached to an {@link LLMShimError}. */
+export interface LLMShimErrorOptions {
   provider?: Provider;
   flavor?: Flavor;
   /**
@@ -28,7 +28,7 @@ export interface LLMWrapperErrorOptions {
 }
 
 /** Every error thrown by this library. */
-export class LLMWrapperError extends Error {
+export class LLMShimError extends Error {
   readonly code: ErrorCode;
   readonly provider?: Provider;
   readonly flavor?: Flavor;
@@ -36,9 +36,9 @@ export class LLMWrapperError extends Error {
   readonly status?: number;
   readonly providerCode?: string;
 
-  constructor(code: ErrorCode, message: string, options: LLMWrapperErrorOptions = {}) {
+  constructor(code: ErrorCode, message: string, options: LLMShimErrorOptions = {}) {
     super(message, { cause: options.cause });
-    this.name = "LLMWrapperError";
+    this.name = "LLMShimError";
     this.code = code;
     this.provider = options.provider;
     this.flavor = options.flavor;

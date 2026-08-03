@@ -1,6 +1,6 @@
 {
-  "name": "llmwrapper",
-  "version": "0.2.0",
+  "name": "llm-shim",
+  "version": "0.1.0",
   "description": "One text-generation API, four switchable targets: Claude and OpenAI, via hosted API or local CLI.",
   "license": "MIT",
   "author": "Lucas Abreu Oliveira",

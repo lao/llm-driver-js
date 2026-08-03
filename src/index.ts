@@ -1,5 +1,5 @@
 export { createClient } from "./client.js";
-export { type ErrorCode, LLMWrapperError, type LLMWrapperErrorOptions } from "./errors.js";
+export { type ErrorCode, LLMShimError, type LLMShimErrorOptions } from "./errors.js";
 export {
   assistant,
   type Client,

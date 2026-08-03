@@ -1,5 +1,5 @@
 import Anthropic, { AnthropicError, APIConnectionError, APIError } from "@anthropic-ai/sdk";
-import { LLMWrapperError } from "../errors.js";
+import { LLMShimError } from "../errors.js";
 import type { CompletionReason, Config, Request, Response } from "../types.js";
 import type { Backend } from "./backend.js";
 
@@ -72,7 +72,7 @@ export function createAnthropicApiBackend(config: Config): Backend {
         // here rather than only in the catch.
         if (signal?.aborted) throw signal.reason;
         if (!message) {
-          throw new LLMWrapperError(
+          throw new LLMShimError(
             "parse_failed",
             "Anthropic stream ended without a message",
             CONTEXT,
@@ -121,7 +121,7 @@ function toParams(model: string, request: Request): Anthropic.MessageCreateParam
 
 function toResponse(message: Anthropic.Message): Response {
   if (!Array.isArray(message?.content)) {
-    throw new LLMWrapperError(
+    throw new LLMShimError(
       "parse_failed",
       "Anthropic response contained no content blocks",
       CONTEXT,
@@ -159,8 +159,8 @@ function toCompletionReason(reason: Anthropic.StopReason | null): CompletionReas
   }
 }
 
-function normalizeError(error: unknown, reachedTransport: boolean): LLMWrapperError {
-  if (error instanceof LLMWrapperError) {
+function normalizeError(error: unknown, reachedTransport: boolean): LLMShimError {
+  if (error instanceof LLMShimError) {
     return error;
   }
   const options = { ...CONTEXT, cause: error };
@@ -168,9 +168,9 @@ function normalizeError(error: unknown, reachedTransport: boolean): LLMWrapperEr
     // A mid-stream `error` event also arrives as an APIError, without a status;
     // only a connection failure is a transport problem.
     if (error instanceof APIConnectionError) {
-      return new LLMWrapperError("transport_failed", error.message, options);
+      return new LLMShimError("transport_failed", error.message, options);
     }
-    return new LLMWrapperError("api_error", apiErrorMessage(error), {
+    return new LLMShimError("api_error", apiErrorMessage(error), {
       ...options,
       status: error.status,
       providerCode: error.type ?? undefined,
@@ -180,9 +180,9 @@ function normalizeError(error: unknown, reachedTransport: boolean): LLMWrapperEr
   // An SDK error, or anything raised before a request ever left the process, is
   // a setup problem — unresolvable credentials above all — not a transport one.
   if (error instanceof AnthropicError || !reachedTransport) {
-    return new LLMWrapperError("invalid_config", message, options);
+    return new LLMShimError("invalid_config", message, options);
   }
-  return new LLMWrapperError("transport_failed", message, options);
+  return new LLMShimError("transport_failed", message, options);
 }
 
 /** Anthropic reports the human-readable message inside `error.error.message`. */

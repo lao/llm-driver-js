@@ -1,19 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { validateRequest } from "../src/client.js";
-import { LLMWrapperError } from "../src/errors.js";
+import { LLMShimError } from "../src/errors.js";
 import { assistant, type Config, type Request, type Role, user } from "../src/types.js";
 
 const config: Config = { provider: "openai", flavor: "cli", model: "test-model" };
 
-function expectInvalidRequest(request: Request): LLMWrapperError {
+function expectInvalidRequest(request: Request): LLMShimError {
   let caught: unknown;
   try {
     validateRequest(request, config);
   } catch (error) {
     caught = error;
   }
-  expect(caught).toBeInstanceOf(LLMWrapperError);
-  const error = caught as LLMWrapperError;
+  expect(caught).toBeInstanceOf(LLMShimError);
+  const error = caught as LLMShimError;
   expect(error.code).toBe("invalid_request");
   return error;
 }

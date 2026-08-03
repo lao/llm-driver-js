@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { createClaudeCliBackend } from "../src/backends/claude-cli.js";
-import {
-  type Command,
-  type CommandResult,
-  type CommandRunner,
-  type StreamingCommandRunner,
+import type {
+  Command,
+  CommandResult,
+  CommandRunner,
+  StreamingCommandRunner,
 } from "../src/backends/cli.js";
-import { type ErrorCode, LLMWrapperError } from "../src/errors.js";
+import { type ErrorCode, LLMShimError } from "../src/errors.js";
 import { assistant, type Config, type Request, type StreamEvent, user } from "../src/types.js";
 
 const config: Config = { provider: "claude", flavor: "cli", model: "claude-test" };
@@ -31,13 +31,13 @@ function fakeRunner(result: Partial<CommandResult>, error?: unknown) {
 async function generateError(
   result: Partial<CommandResult>,
   error?: unknown,
-): Promise<LLMWrapperError> {
+): Promise<LLMShimError> {
   const { runner } = fakeRunner(result, error);
   try {
     await createClaudeCliBackend(config, runner).generate(request);
   } catch (caught) {
-    expect(caught).toBeInstanceOf(LLMWrapperError);
-    return caught as LLMWrapperError;
+    expect(caught).toBeInstanceOf(LLMShimError);
+    return caught as LLMShimError;
   }
   throw new Error("generate() resolved, want a failure");
 }
@@ -332,13 +332,13 @@ async function streamError(
   lines: string[],
   exit?: Partial<{ exitCode: number; stderr: string }>,
   error?: unknown,
-): Promise<LLMWrapperError> {
+): Promise<LLMShimError> {
   const { backend } = streamBackend(lines, exit, error);
   try {
     await collect(backend.generateStream(request));
   } catch (caught) {
-    expect(caught).toBeInstanceOf(LLMWrapperError);
-    return caught as LLMWrapperError;
+    expect(caught).toBeInstanceOf(LLMShimError);
+    return caught as LLMShimError;
   }
   throw new Error("generateStream() completed, want a failure");
 }

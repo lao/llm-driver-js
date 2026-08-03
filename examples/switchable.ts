@@ -4,11 +4,11 @@
  *   npm run example -- --provider openai --flavor cli --model gpt-5.6-sol --prompt "hi"
  */
 import { parseArgs } from "node:util";
-// In your own project this import is `from "llmwrapper"`.
+// In your own project this import is `from "llm-shim"`.
 import {
   createClient,
   type Response as GenerateResponse,
-  LLMWrapperError,
+  LLMShimError,
   user,
 } from "../src/index.js";
 
@@ -88,7 +88,7 @@ function oneOf<T extends string>(
 }
 
 main().catch((error: unknown) => {
-  if (error instanceof LLMWrapperError) {
+  if (error instanceof LLMShimError) {
     console.error(`error (${error.code}): ${error.message}`);
   } else {
     console.error(error instanceof Error ? error.message : String(error));
