@@ -143,7 +143,9 @@ the iteration rather than from the call:
   to reap the process, it only guarantees the teardown is under way.
 - That cleanup runs in the generator's `finally`, which `for await` triggers for
   you. A **manual iterator** must call `.return()` itself (or the `finally` never
-  runs and the transport leaks).
+  runs and the transport leaks). Note that `.return()` cannot preempt a pending
+  `next()`: it is queued behind it, so a stalled stream is only preempted by the
+  `AbortSignal`.
 
 ```ts
 for await (const event of client.generateStream(request, {

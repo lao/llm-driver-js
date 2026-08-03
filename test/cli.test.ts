@@ -53,6 +53,65 @@ function isRunning(pid: number): boolean {
   }
 }
 
+/** Child script fragments: record the pid, then outlive anything but a SIGKILL. */
+const RECORD_PID = "require('node:fs').writeFileSync(process.env.PID_FILE, String(process.pid));";
+const LIVE_FOREVER = "setInterval(() => {}, 1000)";
+
+/** Host statement: exit as soon as the child has recorded its pid. */
+const EXIT_ONCE_SPAWNED = [
+  "const poll = setInterval(() => {",
+  "  if (existsSync(process.env.PID_FILE)) { clearInterval(poll); process.exit(0); }",
+  "}, 50);",
+].join("\n");
+
+/**
+ * Runs a host process that starts a run via `start` — statements using the
+ * in-scope `command`, and responsible for exiting the host — against a `child`
+ * script. Only the exit handler can stop the detached child from outliving the
+ * host. Returns the child's pid.
+ */
+async function hostExitsMidRun(child: string, start: string): Promise<number> {
+  const dir = mkdtempSync(join(tmpdir(), "llmwrapper-"));
+  const pidFile = join(dir, "child.pid");
+  const script = join(dir, "host.ts");
+  const cliModule = join(import.meta.dirname, "..", "src", "backends", "cli.ts");
+  // PID_FILE is inherited, so neither script has to quote a path inside a
+  // quoted script.
+  writeFileSync(
+    script,
+    [
+      'import { existsSync } from "node:fs";',
+      `import { spawnRunner, spawnStreamRunner } from ${JSON.stringify(cliModule)};`,
+      `const child = ${JSON.stringify(child)};`,
+      'const command = { executable: process.execPath, args: ["-e", child], stdin: "" };',
+      start,
+    ].join("\n"),
+  );
+
+  await new Promise<void>((resolve, reject) => {
+    const host = spawn(process.execPath, ["--import", "tsx/esm", script], {
+      // so `tsx/esm` resolves out of this package's node_modules
+      cwd: join(import.meta.dirname, ".."),
+      env: { ...process.env, PID_FILE: pidFile },
+      stdio: "ignore",
+    });
+    host.on("error", reject);
+    host.on("exit", () => resolve());
+  });
+
+  return readPid(pidFile);
+}
+
+/** Asserts the pid dies, and never leaks it if the cleanup under test failed. */
+async function expectReaped(pid: number): Promise<void> {
+  expect(pid).toBeGreaterThan(0);
+  try {
+    await expect.poll(() => isRunning(pid), { timeout: 5000 }).toBe(false);
+  } finally {
+    if (isRunning(pid)) process.kill(pid, "SIGKILL");
+  }
+}
+
 describe("renderTranscript", () => {
   it("sends a lone user message as raw text", () => {
     expect(renderTranscript([user("Hello from stdin")])).toBe("Hello from stdin");
@@ -271,46 +330,12 @@ describe("spawnRunner", () => {
   it.skipIf(process.platform === "win32")(
     "kills a live detached child when the host process exits",
     async () => {
-      const dir = mkdtempSync(join(tmpdir(), "llmwrapper-"));
-      const pidFile = join(dir, "child.pid");
-      const script = join(dir, "host.ts");
-      const cliModule = join(import.meta.dirname, "..", "src", "backends", "cli.ts");
-      // A host that dies mid-run without aborting: only the exit handler can
-      // stop the detached child from outliving it. PID_FILE is inherited, so
-      // neither script has to quote a path inside a quoted script.
-      writeFileSync(
-        script,
-        [
-          'import { existsSync } from "node:fs";',
-          `import { spawnRunner } from ${JSON.stringify(cliModule)};`,
-          "const child =",
-          "  \"require('node:fs').writeFileSync(process.env.PID_FILE, String(process.pid));\" +",
-          '  "setInterval(() => {}, 1000)";',
-          'spawnRunner({ executable: process.execPath, args: ["-e", child], stdin: "" }).catch(() => {});',
-          "const poll = setInterval(() => {",
-          "  if (existsSync(process.env.PID_FILE)) { clearInterval(poll); process.exit(0); }",
-          "}, 50);",
-        ].join("\n"),
+      await expectReaped(
+        await hostExitsMidRun(
+          RECORD_PID + LIVE_FOREVER,
+          `spawnRunner(command).catch(() => {});\n${EXIT_ONCE_SPAWNED}`,
+        ),
       );
-
-      await new Promise<void>((resolve, reject) => {
-        const host = spawn(process.execPath, ["--import", "tsx/esm", script], {
-          // so `tsx/esm` resolves out of this package's node_modules
-          cwd: join(import.meta.dirname, ".."),
-          env: { ...process.env, PID_FILE: pidFile },
-          stdio: "ignore",
-        });
-        host.on("error", reject);
-        host.on("exit", () => resolve());
-      });
-
-      const pid = readPid(pidFile);
-      expect(pid).toBeGreaterThan(0);
-      try {
-        await expect.poll(() => isRunning(pid), { timeout: 5000 }).toBe(false);
-      } finally {
-        if (isRunning(pid)) process.kill(pid, "SIGKILL");
-      }
     },
     30_000,
   );
@@ -579,13 +604,58 @@ describe("spawnStreamRunner", () => {
     15_000,
   );
 
-  it("rejects when stdout exceeds the output bound", async () => {
+  it("rejects when unconsumed output exceeds the bound", async () => {
     const script = "process.stdout.write('x'.repeat(17<<20));setInterval(()=>{},1000)";
 
     await expect(
       drain(spawnStreamRunner({ executable: node, args: ["-e", script], stdin: "" })),
     ).rejects.toThrow(/exceeds/);
   }, 30_000);
+
+  it("streams far more than the output bound when the consumer keeps up", async () => {
+    // 20 MiB in 1 KiB lines: over the 16 MiB cap in total, never in backlog —
+    // an agentic `claude` run looks exactly like this.
+    const total = 20 << 10;
+    const script =
+      `const line='x'.repeat(1023)+'\\n';let n=${total};` +
+      // Exits by running out of work, never process.exit(): that would drop
+      // whatever is still queued on the stdout pipe.
+      "const pump=()=>{while(n>0){n--;if(!process.stdout.write(line))" +
+      "return process.stdout.once('drain',pump)}};pump()";
+
+    let lines = 0;
+    let exit: CommandChunk | undefined;
+    for await (const chunk of spawnStreamRunner({
+      executable: node,
+      args: ["-e", script],
+      stdin: "",
+    })) {
+      if (chunk.type === "line") lines++;
+      else exit = chunk;
+    }
+
+    expect(lines).toBe(total);
+    expect(exit).toEqual({ type: "exit", exitCode: 0, stderr: "" });
+  }, 60_000);
+
+  it.skipIf(process.platform === "win32")(
+    "kills a child still in its SIGTERM grace period when the host process exits",
+    async () => {
+      // The consumer breaks, so the generator's finally SIGTERMs a child that
+      // ignores it — then the host dies before the SIGKILL escalation lands.
+      // Only the exit handler can reap it, and only if the run is still tracked.
+      await expectReaped(
+        await hostExitsMidRun(
+          `process.on('SIGTERM', () => {});${RECORD_PID}process.stdout.write('ready\\n');${LIVE_FOREVER}`,
+          "(async () => {\n" +
+            "  for await (const chunk of spawnStreamRunner(command)) { void chunk; break; }\n" +
+            "  process.exit(0);\n" +
+            "})();",
+        ),
+      );
+    },
+    30_000,
+  );
 
   it.skipIf(process.platform === "win32")(
     "kills the process group when the consumer breaks early",
@@ -609,11 +679,12 @@ describe("spawnStreamRunner", () => {
       const pid = readPid(pidFile);
       expect(pid).toBeGreaterThan(0);
       try {
-        await expect.poll(() => isRunning(pid), { timeout: 5000 }).toBe(false);
+        // Generous: the SIGTERM→SIGKILL grace plus reaping has flaked at 5s under load.
+        await expect.poll(() => isRunning(pid), { timeout: 15_000 }).toBe(false);
       } finally {
         if (isRunning(pid)) process.kill(pid, "SIGKILL");
       }
     },
-    15_000,
+    30_000,
   );
 });

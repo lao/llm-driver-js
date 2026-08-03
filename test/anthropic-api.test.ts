@@ -428,6 +428,22 @@ describe("anthropic api backend streaming", () => {
     expect(error.provider).toBe("claude");
   });
 
+  it("normalizes a malformed SSE event instead of leaking a SyntaxError", async () => {
+    const stub = stubSse([
+      sse("message_start", MESSAGE_START),
+      sse("content_block_delta", textDelta("Hello")),
+      "event: content_block_delta\ndata: {not json\n\n",
+    ]);
+
+    const error = await rejection(collect(clientWith(stub.impl).generateStream(PROMPT)));
+
+    // The SDK raises the parse failure as a plain SyntaxError mid-iteration.
+    expect(error.code).toBe("transport_failed");
+    expect(error.cause).toBeInstanceOf(SyntaxError);
+    expect(error.provider).toBe("claude");
+    expect(error.flavor).toBe("api");
+  });
+
   it("aborts mid-stream and surfaces the abort reason itself", async () => {
     const stub = stubSse(
       [sse("message_start", MESSAGE_START), sse("content_block_delta", textDelta("Hello"))],

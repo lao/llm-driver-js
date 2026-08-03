@@ -337,7 +337,10 @@ export const spawnStreamRunner: StreamingCommandRunner = async function* (comman
   const decoder = new StringDecoder("utf8");
   const stderr = createBoundedCapture();
   const lines: string[] = [];
+  let cursor = 0;
   let partial = "";
+  // Retained stdout, not throughput: a line handed to the consumer is subtracted
+  // again, so a long agentic run is bounded by its backlog rather than its total.
   let stdoutBytes = 0;
   let failure: unknown;
   let exitCode: number | undefined;
@@ -367,7 +370,8 @@ export const spawnStreamRunner: StreamingCommandRunner = async function* (comman
     if (stdoutBytes > MAX_OUTPUT_BYTES) return overflow();
     const parts = (partial + decoder.write(chunk)).split("\n");
     partial = parts.pop() ?? "";
-    lines.push(...parts);
+    // Not `push(...parts)`: spreading a newline-dense chunk blows the arg limit.
+    for (const part of parts) lines.push(part);
     notify();
   });
   child.stderr.on("data", (chunk: Buffer) => {
@@ -381,6 +385,9 @@ export const spawnStreamRunner: StreamingCommandRunner = async function* (comman
   // `failure` and wakes the loop itself, so a grandchild holding stdout open can
   // never stall it.
   child.on("close", (code) => {
+    // Only now is the child confirmed dead: deleting it any earlier would let a
+    // host exit during the SIGTERM→SIGKILL grace period orphan the group.
+    liveChildren.delete(child);
     exitCode ??= code ?? -1;
     notify();
   });
@@ -389,11 +396,17 @@ export const spawnStreamRunner: StreamingCommandRunner = async function* (comman
     for (;;) {
       // An abort or a launch error wins over any output already buffered.
       if (failure !== undefined) throw failure;
-      const line = lines.shift();
-      if (line !== undefined) {
+      if (cursor < lines.length) {
+        const line = lines[cursor++] as string;
+        // Byte-exact for ASCII, an under-count for multi-byte text — which only
+        // makes the bound stricter, never looser.
+        stdoutBytes -= line.length + 1;
         yield { type: "line", line };
         continue;
       }
+      // Drained: reclaim the consumed prefix instead of growing the array forever.
+      lines.length = 0;
+      cursor = 0;
       if (exitCode !== undefined) break;
       // Nothing buffered and nothing terminal: park until a listener wakes us.
       await new Promise<void>((resolve) => {
@@ -405,7 +418,6 @@ export const spawnStreamRunner: StreamingCommandRunner = async function* (comman
     yield { type: "exit", exitCode: exitCode ?? -1, stderr: stderr.text() };
   } finally {
     signal?.removeEventListener("abort", onAbort);
-    liveChildren.delete(child);
     // Covers an abandoned iterator as well as an abort: no orphaned group.
     terminate();
   }

@@ -63,13 +63,18 @@ for (const { provider, envVar } of targets) {
         expect(done.response.text.trim()).not.toBe("");
         expect(done.response.provider).toBe(provider);
         expect(done.response.model).toBe(model);
-        // Granularity is target-dependent; only the sum is contractual.
-        expect(
-          events
-            .filter((event) => event.type === "text")
-            .map((event) => event.text)
-            .join(""),
-        ).toBe(done.response.text);
+        // Granularity is target-dependent; only the sum is contractual — and
+        // only for the three targets that hold it unconditionally. `claude`/`cli`
+        // is an agent whose deltas are a superset once the turn runs tools, so
+        // it keeps the invariants above and is characterized separately below.
+        if (provider !== "claude") {
+          expect(
+            events
+              .filter((event) => event.type === "text")
+              .map((event) => event.text)
+              .join(""),
+          ).toBe(done.response.text);
+        }
       },
       TIMEOUT_MS,
     );

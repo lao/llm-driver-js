@@ -145,3 +145,27 @@ describe("client.generateStream done-event stamping", () => {
     expect(seen).toBe(controller.signal);
   });
 });
+
+describe("client.generateStream teardown", () => {
+  it("closes the backend stream when the consumer breaks early", async () => {
+    let closed = false;
+    const backend: Backend = {
+      generate: () => Promise.reject(new Error("unused")),
+      async *generateStream() {
+        try {
+          yield { type: "text", text: "first" };
+          yield { type: "text", text: "second" };
+        } finally {
+          closed = true;
+        }
+      },
+    };
+
+    for await (const event of createClientWithBackend(config, backend).generateStream(REQUEST)) {
+      expect(event).toEqual({ type: "text", text: "first" });
+      break;
+    }
+
+    expect(closed).toBe(true);
+  });
+});
