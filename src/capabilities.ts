@@ -69,15 +69,15 @@ export const CAPABILITIES: readonly Capability[] = [
     supported: ["claude/api", "openai/api"],
   },
   {
-    // openai/api appends in T11; cli flavors go through the MCP bridge in T14/T15.
+    // cli flavors go through the MCP bridge in T14/T15.
     feature: "tools",
     used: (request) => Array.isArray(request.tools) && request.tools.length > 0,
-    supported: ["claude/api"],
+    supported: ["claude/api", "openai/api"],
   },
   {
     feature: "toolChoice",
     used: (request) => request.toolChoice !== undefined,
-    supported: ["claude/api"],
+    supported: ["claude/api", "openai/api"],
   },
 ];
 

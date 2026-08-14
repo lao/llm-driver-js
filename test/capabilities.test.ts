@@ -199,31 +199,28 @@ describe("tools + toolChoice gate", () => {
     toolChoice: "required",
   };
 
-  it("does not throw at the gate on claude/api", () => {
-    expect(() => assertSupported(toolsReq, CONFIGS["claude/api"])).not.toThrow();
-    expect(() => assertSupported(toolChoiceReq, CONFIGS["claude/api"])).not.toThrow();
+  it.each(["claude/api", "openai/api"] as const)("does not throw at the gate on %s", (target) => {
+    expect(() => assertSupported(toolsReq, CONFIGS[target])).not.toThrow();
+    expect(() => assertSupported(toolChoiceReq, CONFIGS[target])).not.toThrow();
   });
 
   it.each([
     ["tools", toolsReq],
     ["toolChoice", toolChoiceReq],
-  ] as const)(
-    "throws unsupported_feature for %s on every non-claude/api target",
-    (feature, req) => {
-      for (const target of ["openai/api", "claude/cli", "openai/cli"] as const) {
-        let error: unknown;
-        try {
-          assertSupported(req, CONFIGS[target]);
-        } catch (caught) {
-          error = caught;
-        }
-        expect(error).toBeInstanceOf(LLMDriverError);
-        expect((error as LLMDriverError).code).toBe("unsupported_feature");
-        expect((error as LLMDriverError).message).toContain(feature);
-        expect((error as LLMDriverError).message).toContain(target);
+  ] as const)("throws unsupported_feature for %s on both cli targets", (feature, req) => {
+    for (const target of ["claude/cli", "openai/cli"] as const) {
+      let error: unknown;
+      try {
+        assertSupported(req, CONFIGS[target]);
+      } catch (caught) {
+        error = caught;
       }
-    },
-  );
+      expect(error).toBeInstanceOf(LLMDriverError);
+      expect((error as LLMDriverError).code).toBe("unsupported_feature");
+      expect((error as LLMDriverError).message).toContain(feature);
+      expect((error as LLMDriverError).message).toContain(target);
+    }
+  });
 });
 
 describe("temperature on cli flavors", () => {
