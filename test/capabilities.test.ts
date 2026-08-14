@@ -86,6 +86,49 @@ describe("assertSupported (matrix gate)", () => {
   });
 });
 
+/** A minimal request exercising exactly one gated feature, keyed by feature name. */
+const FEATURE_REQUESTS: Record<string, GenerateRequest> = {
+  temperature: { maxTokens: 8, messages: [user("hi")], temperature: 0.7 },
+  topP: { maxTokens: 8, messages: [user("hi")], topP: 0.9 },
+  topK: { maxTokens: 8, messages: [user("hi")], topK: 40 },
+  stopSequences: { maxTokens: 8, messages: [user("hi")], stopSequences: ["STOP"] },
+  "metadata.userId": { maxTokens: 8, messages: [user("hi")], metadata: { userId: "u1" } },
+};
+
+describe("matrix gate covers every feature × target cell", () => {
+  // Table-driven from CAPABILITIES itself: each ✅ cell passes the gate, each ❌
+  // cell throws unsupported_feature naming the feature and target.
+  const cells = CAPABILITIES.flatMap((capability) =>
+    ALL_TARGETS.map((target) => ({ capability, target })),
+  );
+
+  it("has a probe request for every gated feature", () => {
+    for (const capability of CAPABILITIES) {
+      expect(FEATURE_REQUESTS[capability.feature]).toBeDefined();
+    }
+  });
+
+  it.each(cells)("$capability.feature on $target", ({ capability, target }) => {
+    const request = FEATURE_REQUESTS[capability.feature] as GenerateRequest;
+    const call = () => assertSupported(request, CONFIGS[target]);
+    if (capability.supported.includes(target)) {
+      expect(call).not.toThrow();
+      return;
+    }
+    let error: unknown;
+    try {
+      call();
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(LLMDriverError);
+    const err = error as LLMDriverError;
+    expect(err.code).toBe("unsupported_feature");
+    expect(err.message).toContain(capability.feature);
+    expect(err.message).toContain(target);
+  });
+});
+
 describe("temperature on cli flavors", () => {
   it.each(["claude/cli", "openai/cli"] as const)(
     "generate() rejects before any spawn on %s",
@@ -199,23 +242,43 @@ describe("temperature passthrough on api flavors", () => {
   });
 });
 
-describe("temperature validation", () => {
+describe("sampling param validation", () => {
   const config: Config = { provider: "claude", flavor: "api", model: "m" };
 
+  /** Runs one request through the claude/api gate with fetch stubbed. */
+  async function reject(request: GenerateRequest) {
+    const stub = stubFetch({});
+    const withFetch: Config = { ...config, apiKey: "k", fetch: stub.impl };
+    const client = createClientWithBackend(withFetch, createAnthropicApiBackend(withFetch));
+    const error = await client.generate(request).catch((caught) => caught);
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect((error as LLMDriverError).code).toBe("invalid_request");
+    expect(stub.calls).toHaveLength(0);
+  }
+
   it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
-    "rejects non-finite temperature %s with invalid_request",
-    async (value) => {
-      const stub = stubFetch({});
-      const withFetch: Config = { ...config, apiKey: "k", fetch: stub.impl };
-      const client = createClientWithBackend(withFetch, createAnthropicApiBackend(withFetch));
-
-      const error = await client
-        .generate({ maxTokens: 8, messages: [user("hi")], temperature: value })
-        .catch((caught) => caught);
-
-      expect(error).toBeInstanceOf(LLMDriverError);
-      expect((error as LLMDriverError).code).toBe("invalid_request");
-      expect(stub.calls).toHaveLength(0);
-    },
+    "rejects non-finite temperature %s",
+    (value) => reject({ maxTokens: 8, messages: [user("hi")], temperature: value }),
   );
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])("rejects non-finite topP %s", (value) =>
+    reject({ maxTokens: 8, messages: [user("hi")], topP: value }),
+  );
+
+  it.each([1.5, Number.NaN])("rejects non-integer topK %s", (value) =>
+    reject({ maxTokens: 8, messages: [user("hi")], topK: value }),
+  );
+
+  it("rejects a non-array stopSequences", () =>
+    reject({ maxTokens: 8, messages: [user("hi")], stopSequences: "STOP" as unknown as string[] }));
+
+  it("rejects non-string entries in stopSequences", () =>
+    reject({ maxTokens: 8, messages: [user("hi")], stopSequences: [1 as unknown as string] }));
+
+  it("rejects a non-string metadata.userId", () =>
+    reject({
+      maxTokens: 8,
+      messages: [user("hi")],
+      metadata: { userId: 42 as unknown as string },
+    }));
 });

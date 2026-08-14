@@ -26,6 +26,26 @@ export const CAPABILITIES: readonly Capability[] = [
     used: (request) => request.temperature !== undefined,
     supported: ["claude/api", "openai/api"],
   },
+  {
+    feature: "topP",
+    used: (request) => request.topP !== undefined,
+    supported: ["claude/api", "openai/api"],
+  },
+  {
+    feature: "topK",
+    used: (request) => request.topK !== undefined,
+    supported: ["claude/api"],
+  },
+  {
+    feature: "stopSequences",
+    used: (request) => request.stopSequences !== undefined,
+    supported: ["claude/api"],
+  },
+  {
+    feature: "metadata.userId",
+    used: (request) => request.metadata?.userId !== undefined,
+    supported: ["claude/api", "openai/api"],
+  },
 ];
 
 /**

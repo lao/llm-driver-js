@@ -110,6 +110,12 @@ function toParams(
   if (request.temperature !== undefined) {
     params.temperature = request.temperature;
   }
+  if (request.topP !== undefined) {
+    params.top_p = request.topP;
+  }
+  if (request.metadata?.userId !== undefined) {
+    params.safety_identifier = request.metadata.userId;
+  }
   return params;
 }
 

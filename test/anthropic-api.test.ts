@@ -129,6 +129,36 @@ describe("anthropic api backend", () => {
     expect(body).not.toHaveProperty("system");
   });
 
+  it("maps sampling params and metadata onto the Messages API", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate({
+      maxTokens: 8,
+      messages: [user("hello")],
+      topP: 0.9,
+      topK: 40,
+      stopSequences: ["STOP", "END"],
+      metadata: { userId: "user-42" },
+    });
+
+    expect(await (stub.calls[0] as Request).json()).toMatchObject({
+      top_p: 0.9,
+      top_k: 40,
+      stop_sequences: ["STOP", "END"],
+      metadata: { user_id: "user-42" },
+    });
+  });
+
+  it("omits sampling params and metadata when the request has none", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("top_p");
+    expect(body).not.toHaveProperty("top_k");
+    expect(body).not.toHaveProperty("stop_sequences");
+    expect(body).not.toHaveProperty("metadata");
+  });
+
   it("maps the response and usage", async () => {
     const stub = stubFetch(200, MESSAGE);
     const response = await clientWith(stub.impl).generate(PROMPT);

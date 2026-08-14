@@ -119,6 +119,18 @@ function toParams(model: string, request: Request): Anthropic.MessageCreateParam
   if (request.temperature !== undefined) {
     params.temperature = request.temperature;
   }
+  if (request.topP !== undefined) {
+    params.top_p = request.topP;
+  }
+  if (request.topK !== undefined) {
+    params.top_k = request.topK;
+  }
+  if (request.stopSequences !== undefined) {
+    params.stop_sequences = request.stopSequences;
+  }
+  if (request.metadata?.userId !== undefined) {
+    params.metadata = { user_id: request.metadata.userId };
+  }
   return params;
 }
 

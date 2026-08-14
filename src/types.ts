@@ -51,6 +51,29 @@ export interface Request {
    * API flavors only — throws `unsupported_feature` on CLI flavors.
    */
   temperature?: number;
+  /**
+   * Nucleus sampling cutoff, passed through verbatim.
+   * API flavors only — throws `unsupported_feature` on CLI flavors.
+   */
+  topP?: number;
+  /**
+   * Top-k sampling cutoff, passed through verbatim.
+   * `claude`/`api` only — throws `unsupported_feature` on every other target.
+   */
+  topK?: number;
+  /**
+   * Sequences that stop generation when produced.
+   * `claude`/`api` only — throws `unsupported_feature` on every other target.
+   */
+  stopSequences?: string[];
+  /**
+   * Request metadata. API flavors only — throws `unsupported_feature` on CLI
+   * flavors.
+   */
+  metadata?: {
+    /** Stable end-user identifier for abuse monitoring. */
+    userId?: string;
+  };
 }
 
 /** Token counts reported by a target; unreported counts are `0`. */

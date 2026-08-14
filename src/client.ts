@@ -87,6 +87,23 @@ export function validateRequest(request: Request, config: Config): void {
   if (request.temperature !== undefined && !Number.isFinite(request.temperature)) {
     throw invalid(config, "temperature must be a finite number");
   }
+  if (request.topP !== undefined && !Number.isFinite(request.topP)) {
+    throw invalid(config, "topP must be a finite number");
+  }
+  if (request.topK !== undefined && !Number.isInteger(request.topK)) {
+    throw invalid(config, "topK must be an integer");
+  }
+  if (request.stopSequences !== undefined) {
+    if (
+      !Array.isArray(request.stopSequences) ||
+      request.stopSequences.some((s) => typeof s !== "string")
+    ) {
+      throw invalid(config, "stopSequences must be an array of strings");
+    }
+  }
+  if (request.metadata?.userId !== undefined && typeof request.metadata.userId !== "string") {
+    throw invalid(config, "metadata.userId must be a string");
+  }
   if (!Array.isArray(messages) || messages.length === 0) {
     throw invalid(config, "at least one message is required");
   }

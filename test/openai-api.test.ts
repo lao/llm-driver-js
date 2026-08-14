@@ -137,6 +137,30 @@ describe("openai api backend", () => {
     expect(body).not.toHaveProperty("instructions");
   });
 
+  it("maps topP and metadata.userId onto the Responses API", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate({
+      maxTokens: 8,
+      messages: [user("hello")],
+      topP: 0.9,
+      metadata: { userId: "user-42" },
+    });
+
+    expect(await (stub.calls[0] as Request).json()).toMatchObject({
+      top_p: 0.9,
+      safety_identifier: "user-42",
+    });
+  });
+
+  it("omits topP and safety_identifier when the request has none", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("top_p");
+    expect(body).not.toHaveProperty("safety_identifier");
+  });
+
   it("maps the response and usage", async () => {
     const stub = stubFetch(200, RESPONSE);
     const response = await clientWith(stub.impl).generate(PROMPT);
