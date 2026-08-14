@@ -1,14 +1,30 @@
 import { describe, expect, it } from "vitest";
 import { validateRequest } from "../src/client.js";
 import { LLMDriverError } from "../src/errors.js";
-import { assistant, type Config, type Request, type Role, user } from "../src/types.js";
+import {
+  assistant,
+  type Config,
+  type ContentBlock,
+  type Message,
+  type Request,
+  type Role,
+  user,
+} from "../src/types.js";
 
 const config: Config = { provider: "openai", flavor: "cli", model: "test-model" };
+// API target: content blocks pass the capability gate here so validation, not
+// portability, is what request-shape tests observe.
+const apiConfig: Config = { provider: "claude", flavor: "api", model: "test-model" };
 
-function expectInvalidRequest(request: Request): LLMDriverError {
+const PNG: ContentBlock = {
+  type: "image",
+  source: { base64: "aGVsbG8=", mediaType: "image/png" },
+};
+
+function expectInvalidRequest(request: Request, cfg: Config = config): LLMDriverError {
   let caught: unknown;
   try {
-    validateRequest(request, config);
+    validateRequest(request, cfg);
   } catch (error) {
     caught = error;
   }
@@ -19,9 +35,18 @@ function expectInvalidRequest(request: Request): LLMDriverError {
 }
 
 describe("message helpers", () => {
-  it("builds user and assistant messages", () => {
+  it("builds user and assistant text messages", () => {
     expect(user("hello")).toEqual({ role: "user", text: "hello" });
     expect(assistant("hi")).toEqual({ role: "assistant", text: "hi" });
+  });
+
+  it("builds user and assistant content-block messages", () => {
+    const blocks: ContentBlock[] = [{ type: "text", text: "look" }, PNG];
+    expect(user(blocks)).toEqual({ role: "user", content: blocks });
+    expect(assistant([{ type: "text", text: "ok" }])).toEqual({
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+    });
   });
 });
 
@@ -78,6 +103,86 @@ describe("validateRequest", () => {
         maxTokens: 1,
       });
     }
+  });
+
+  it("accepts a well-formed content-block transcript", () => {
+    expect(() =>
+      validateRequest(
+        {
+          messages: [
+            user([
+              { type: "text", text: "describe" },
+              PNG,
+              { type: "image", source: { url: "https://example.test/a.png" } },
+              { type: "document", source: { base64: "cGRm", mediaType: "application/pdf" } },
+            ]),
+          ],
+          maxTokens: 64,
+        },
+        apiConfig,
+      ),
+    ).not.toThrow();
+  });
+
+  it("rejects a message with both text and content", () => {
+    const error = expectInvalidRequest({
+      messages: [{ role: "user", text: "hi", content: [{ type: "text", text: "hi" }] }],
+      maxTokens: 1,
+    });
+    expect(error.message).toBe("message 0 must have exactly one of text or content");
+  });
+
+  it("rejects a message with neither text nor content", () => {
+    const error = expectInvalidRequest({ messages: [{ role: "user" }], maxTokens: 1 });
+    expect(error.message).toBe("message 0 must have exactly one of text or content");
+  });
+
+  it("rejects an empty content array", () => {
+    const error = expectInvalidRequest({ messages: [user([])], maxTokens: 1 });
+    expect(error.message).toBe("message 0 content must be a non-empty array");
+  });
+
+  it("reports the offending message index for a bad block", () => {
+    const error = expectInvalidRequest(
+      {
+        messages: [user("ok"), user([{ type: "flavour" } as unknown as ContentBlock])],
+        maxTokens: 1,
+      },
+      apiConfig,
+    );
+    expect(error.message).toBe('message 1 content block 0 has unknown type "flavour"');
+  });
+
+  it.each<[string, ContentBlock, string]>([
+    [
+      "empty text block",
+      { type: "text", text: "" },
+      "content block 0 text must be a non-empty string",
+    ],
+    [
+      "image without base64 or url",
+      { type: "image", source: {} as never },
+      "content block 0 image source needs base64 or url",
+    ],
+    [
+      "image with bad media type",
+      { type: "image", source: { base64: "x", mediaType: "image/tiff" as never } },
+      "content block 0 image mediaType is invalid",
+    ],
+    [
+      "document without base64",
+      { type: "document", source: { mediaType: "application/pdf" } as never },
+      "content block 0 document source needs base64",
+    ],
+    [
+      "document with wrong media type",
+      { type: "document", source: { base64: "x", mediaType: "text/plain" as never } },
+      "content block 0 document mediaType must be application/pdf",
+    ],
+  ])("rejects an %s", (_name, block, expected) => {
+    const message: Message = { role: "user", content: [block] };
+    const error = expectInvalidRequest({ messages: [message], maxTokens: 1 }, apiConfig);
+    expect(error.message).toBe(`message 0 ${expected}`);
   });
 
   it("stamps target context on request errors", () => {

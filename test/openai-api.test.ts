@@ -168,6 +168,43 @@ describe("openai api backend", () => {
     });
   });
 
+  it("maps content blocks onto input_image and input_file", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate({
+      maxTokens: 8,
+      messages: [
+        user([
+          { type: "text", text: "describe these" },
+          { type: "image", source: { base64: "aGVsbG8=", mediaType: "image/png" } },
+          { type: "image", source: { url: "https://example.test/a.jpg" } },
+          { type: "document", source: { base64: "cGRm", mediaType: "application/pdf" } },
+        ]),
+      ],
+    });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.input).toEqual([
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "describe these" },
+          {
+            type: "input_image",
+            image_url: "data:image/png;base64,aGVsbG8=",
+            detail: "auto",
+          },
+          { type: "input_image", image_url: "https://example.test/a.jpg", detail: "auto" },
+          {
+            type: "input_file",
+            filename: "document.pdf",
+            file_data: "data:application/pdf;base64,cGRm",
+          },
+        ],
+      },
+    ]);
+  });
+
   it("omits topP and safety_identifier when the request has none", async () => {
     const stub = stubFetch(200, RESPONSE);
     await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
@@ -175,6 +212,16 @@ describe("openai api backend", () => {
     const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
     expect(body).not.toHaveProperty("top_p");
     expect(body).not.toHaveProperty("safety_identifier");
+  });
+
+  it("keeps the v1 single-input_text shape for text-only messages", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.input).toEqual([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+    ]);
   });
 
   it("maps the response and usage", async () => {

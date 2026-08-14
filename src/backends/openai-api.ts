@@ -1,6 +1,6 @@
 import OpenAI, { APIConnectionError, APIError, OpenAIError } from "openai";
 import { LLMDriverError } from "../errors.js";
-import type { CompletionReason, Config, JsonSchema, Request, Response } from "../types.js";
+import type { CompletionReason, Config, JsonSchema, Message, Request, Response } from "../types.js";
 import type { Backend } from "./backend.js";
 
 const CONTEXT = { provider: "openai", flavor: "api", operation: "generate" } as const;
@@ -103,7 +103,7 @@ function toParams(
       (message): OpenAI.Responses.EasyInputMessage => ({
         type: "message",
         role: message.role,
-        content: [{ type: "input_text", text: message.text }],
+        content: toContent(message),
         // Preserve the completed-answer phase so current models keep full
         // follow-up quality on prior assistant turns.
         phase: message.role === "assistant" ? "final_answer" : undefined,
@@ -131,6 +131,33 @@ function toParams(
     };
   }
   return params;
+}
+
+/**
+ * Maps a message onto Responses API content. Text-only messages keep their v1
+ * single-`input_text` shape byte-for-byte.
+ */
+function toContent(message: Message): OpenAI.Responses.ResponseInputMessageContentList {
+  if (message.content === undefined) {
+    return [{ type: "input_text", text: message.text ?? "" }];
+  }
+  return message.content.map((block): OpenAI.Responses.ResponseInputContent => {
+    if (block.type === "text") {
+      return { type: "input_text", text: block.text };
+    }
+    if (block.type === "document") {
+      return {
+        type: "input_file",
+        filename: "document.pdf",
+        file_data: `data:application/pdf;base64,${block.source.base64}`,
+      };
+    }
+    const image_url =
+      "url" in block.source
+        ? block.source.url
+        : `data:${block.source.mediaType};base64,${block.source.base64}`;
+    return { type: "input_image", image_url, detail: "auto" };
+  });
 }
 
 function toResponse(response: OpenAI.Responses.Response, outputSchema?: JsonSchema): Response {

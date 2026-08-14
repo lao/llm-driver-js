@@ -58,10 +58,13 @@ export interface CliOutcome {
 export function renderTranscript(messages: Message[]): string {
   const [first] = messages;
   if (messages.length === 1 && first?.role === "user") {
-    return first.text;
+    return messageText(first);
   }
   return messages
-    .map((message) => `${message.role === "assistant" ? "Assistant: " : "User: "}${message.text}`)
+    .map(
+      (message) =>
+        `${message.role === "assistant" ? "Assistant: " : "User: "}${messageText(message)}`,
+    )
     .join("\n\n");
 }
 
@@ -87,6 +90,16 @@ function timeoutFailure(provider: Provider, timeoutMs: number): LLMDriverError {
   return cliError(provider, "process_failed", `CLI command timed out after ${timeoutMs} ms`, {
     providerCode: "timeout",
   });
+}
+
+/**
+ * Flattens a message to plain text for CLI stdin. Content blocks reaching here
+ * are text-only — image and document blocks are rejected on CLI flavors by the
+ * capability gate before any transport.
+ */
+function messageText(message: Message): string {
+  if (message.content === undefined) return message.text ?? "";
+  return message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
 }
 
 /**

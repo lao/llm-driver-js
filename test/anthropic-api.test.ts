@@ -164,6 +164,37 @@ describe("anthropic api backend", () => {
     });
   });
 
+  it("maps content blocks onto Anthropic image and document blocks", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate({
+      maxTokens: 8,
+      messages: [
+        user([
+          { type: "text", text: "describe these" },
+          { type: "image", source: { base64: "aGVsbG8=", mediaType: "image/png" } },
+          { type: "image", source: { url: "https://example.test/a.jpg" } },
+          { type: "document", source: { base64: "cGRm", mediaType: "application/pdf" } },
+        ]),
+      ],
+    });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.messages).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "describe these" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" } },
+          { type: "image", source: { type: "url", url: "https://example.test/a.jpg" } },
+          {
+            type: "document",
+            source: { type: "base64", media_type: "application/pdf", data: "cGRm" },
+          },
+        ],
+      },
+    ]);
+  });
+
   it("omits sampling params and metadata when the request has none", async () => {
     const stub = stubFetch(200, MESSAGE);
     await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
@@ -173,6 +204,14 @@ describe("anthropic api backend", () => {
     expect(body).not.toHaveProperty("top_k");
     expect(body).not.toHaveProperty("stop_sequences");
     expect(body).not.toHaveProperty("metadata");
+  });
+
+  it("keeps the v1 single-text-block shape for text-only messages", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.messages).toEqual([{ role: "user", content: [{ type: "text", text: "hello" }] }]);
   });
 
   it("maps the response and usage", async () => {
