@@ -1,4 +1,11 @@
-import type { Config, Request, Response, StreamEvent, ToolCallRecord } from "../types.js";
+import type {
+  Config,
+  JsonSchema,
+  Request,
+  Response,
+  StreamEvent,
+  ToolCallRecord,
+} from "../types.js";
 import type { Backend } from "./backend.js";
 import {
   asRecord,
@@ -7,6 +14,7 @@ import {
   cliError,
   executeCli,
   parseJsonObject,
+  parseStructuredText,
   readCount,
   readString,
   renderTranscript,
@@ -63,6 +71,9 @@ export function createClaudeCliBackend(
         args.push("--allowedTools", `mcp__llmdriver__${tool.name}`);
       }
     }
+    if (request.outputSchema) {
+      args.push("--json-schema", JSON.stringify(request.outputSchema));
+    }
     args.push(...extraArgs);
     return { executable, args, stdin: renderTranscript(request.messages) };
   };
@@ -94,6 +105,7 @@ export function createClaudeCliBackend(
           parseJsonObject("claude", "decode Claude CLI output", stdout),
           config.model,
           bridge?.records ?? [],
+          request.outputSchema,
         );
       } finally {
         await bridge?.close();
@@ -152,7 +164,10 @@ export function createClaudeCliBackend(
             providerCode: "missing_result",
           });
         }
-        yield { type: "done", response: toResponse(result, config.model, bridge?.records ?? []) };
+        yield {
+          type: "done",
+          response: toResponse(result, config.model, bridge?.records ?? [], request.outputSchema),
+        };
       } finally {
         await bridge?.close();
       }
@@ -177,6 +192,7 @@ function toResponse(
   result: Record<string, unknown>,
   model: string,
   toolCalls: ToolCallRecord[],
+  outputSchema?: JsonSchema,
 ): Response {
   const type = readString(result, "type");
   const subtype = readString(result, "subtype");
@@ -193,10 +209,14 @@ function toResponse(
   }
 
   const usage = asRecord(result.usage);
-  return {
+  // `--json-schema` makes the model emit JSON; best knowledge is that it lands in
+  // the same `result` text field as plain output, so parse it exactly like the
+  // api flavors. Characterized by the opt-in integration test.
+  const text = readString(result, "result");
+  const response: Response = {
     id: readString(result, "session_id"),
     model,
-    text: readString(result, "result"),
+    text,
     usage: {
       inputTokens: readCount(usage, "input_tokens"),
       outputTokens: readCount(usage, "output_tokens"),
@@ -209,6 +229,10 @@ function toResponse(
     flavor: "cli",
     toolCalls,
   };
+  if (outputSchema !== undefined) {
+    response.structured = parseStructuredText("claude", text);
+  }
+  return response;
 }
 
 function unsuccessfulCode(type: string, subtype: string, isError: boolean): string {

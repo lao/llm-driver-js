@@ -52,10 +52,11 @@ export const CAPABILITIES: readonly Capability[] = [
     supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
   },
   {
-    // CLI flavors gain structured output in T6; until then they reject it.
+    // Structured output on all four targets: API flavors via the provider's
+    // json_schema format, CLI flavors via --json-schema / --output-schema.
     feature: "outputSchema",
     used: (request) => request.outputSchema !== undefined,
-    supported: ["claude/api", "openai/api"],
+    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
   },
   {
     // CLI image support lands in later tasks; ❌ on both CLI targets for now.

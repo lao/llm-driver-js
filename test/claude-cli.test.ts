@@ -117,6 +117,55 @@ describe("claude cli command", () => {
   });
 });
 
+describe("claude cli structured output", () => {
+  const schema = { type: "object", properties: { answer: { type: "number" } } };
+
+  it("adds --json-schema and parses the result payload into structured", async () => {
+    const { runner, calls } = fakeRunner({
+      stdout: '{"type":"result","subtype":"success","result":"{\\"answer\\":42}"}',
+    });
+
+    const response = await createClaudeCliBackend(config, runner).generate({
+      ...request,
+      outputSchema: schema,
+    });
+
+    // Characterized by integration: current best knowledge is that the JSON
+    // lands in the same `result` text field as plain output.
+    expect(calls[0]?.command.args).toContain("--json-schema");
+    const flagIndex = calls[0]?.command.args.indexOf("--json-schema") ?? -1;
+    expect(calls[0]?.command.args[flagIndex + 1]).toBe(JSON.stringify(schema));
+    expect(response.structured).toEqual({ answer: 42 });
+    expect(response.text).toBe('{"answer":42}');
+  });
+
+  it("reports parse_failed when the structured result is not valid JSON", async () => {
+    const { runner } = fakeRunner({
+      stdout: '{"type":"result","subtype":"success","result":"not json"}',
+    });
+
+    const error = await createClaudeCliBackend(config, runner)
+      .generate({ ...request, outputSchema: schema })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect(error.code).toBe("parse_failed");
+    expect(error.provider).toBe("claude");
+    expect(error.flavor).toBe("cli");
+  });
+
+  it("omits --json-schema and leaves structured undefined without a schema", async () => {
+    const { runner, calls } = fakeRunner({
+      stdout: '{"type":"result","subtype":"success","result":"ok"}',
+    });
+
+    const response = await createClaudeCliBackend(config, runner).generate(request);
+
+    expect(calls[0]?.command.args).not.toContain("--json-schema");
+    expect(response.structured).toBeUndefined();
+  });
+});
+
 describe("claude cli parsing", () => {
   it("maps a successful result and its usage", async () => {
     const { runner } = fakeRunner({
