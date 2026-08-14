@@ -22,6 +22,8 @@ export function createClient(config: Config): Client {
     fetch: config.fetch,
     cliPath: config.cliPath,
     cliArgs: config.cliArgs?.slice(),
+    timeoutMs: config.timeoutMs,
+    maxRetries: config.maxRetries,
   });
   return createClientWithBackend(snapshot, selectBackend(snapshot));
 }

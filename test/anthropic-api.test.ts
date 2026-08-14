@@ -232,6 +232,53 @@ describe("anthropic api backend", () => {
 
     await expect(pending).rejects.toBe(reason);
   });
+
+  it("hands maxRetries to the SDK, retrying a retryable failure", async () => {
+    let calls = 0;
+    const impl: typeof fetch = async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify({ type: "error", error: { type: "api_error", message: "boom" } }),
+        // retry-after-ms:0 keeps the retries instant rather than backing off.
+        { status: 500, headers: { "content-type": "application/json", "retry-after-ms": "0" } },
+      );
+    };
+    const client = createClient({
+      provider: "claude",
+      flavor: "api",
+      model: "claude-test",
+      apiKey: "test-key",
+      baseUrl: BASE_URL,
+      fetch: impl,
+      maxRetries: 2,
+    });
+
+    await rejection(client.generate(PROMPT));
+
+    expect(calls).toBe(3); // initial attempt + two retries
+  });
+
+  it("hands timeoutMs to the SDK, which aborts a slow request", async () => {
+    const client = createClient({
+      provider: "claude",
+      flavor: "api",
+      model: "claude-test",
+      apiKey: "test-key",
+      baseUrl: BASE_URL,
+      // Never resolves until the SDK's own timeout aborts it.
+      fetch: (_input, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        }),
+      timeoutMs: 20,
+    });
+
+    const error = await rejection(client.generate(PROMPT));
+
+    expect(error.code).toBe("transport_failed");
+  });
 });
 
 const MESSAGE_START = {

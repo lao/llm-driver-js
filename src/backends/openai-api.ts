@@ -15,7 +15,9 @@ export function createOpenAiApiBackend(config: Config): Backend {
       apiKey: config.apiKey,
       baseURL: config.baseUrl,
       fetch: config.fetch,
-      maxRetries: 0, // retries are out of scope: one request per generate()
+      // Default 0 keeps v1's one-request-per-generate() behavior; a caller opts in.
+      maxRetries: config.maxRetries ?? 0,
+      timeout: config.timeoutMs, // undefined leaves the SDK default in place
     }));
 
   return {

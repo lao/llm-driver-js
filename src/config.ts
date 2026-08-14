@@ -5,7 +5,7 @@ const PROVIDERS: Provider[] = ["claude", "openai"];
 const FLAVORS: Flavor[] = ["api", "cli"];
 
 /** Options that only make sense for one flavor, rejected for the other. */
-const API_ONLY = ["apiKey", "baseUrl", "fetch"] as const;
+const API_ONLY = ["apiKey", "baseUrl", "fetch", "maxRetries"] as const;
 const CLI_ONLY = ["cliPath", "cliArgs"] as const;
 
 /**
@@ -52,6 +52,21 @@ export function validateConfig(config: Config): void {
     (!Array.isArray(config.cliArgs) || config.cliArgs.some((arg) => typeof arg !== "string"))
   ) {
     throw invalid(config, "cliArgs must be an array of strings");
+  }
+  if (
+    config.timeoutMs !== undefined &&
+    (typeof config.timeoutMs !== "number" ||
+      !Number.isFinite(config.timeoutMs) ||
+      config.timeoutMs <= 0)
+  ) {
+    throw invalid(config, "timeoutMs must be a positive number");
+  }
+  // maxRetries on a cli flavor already failed the API_ONLY check above.
+  if (
+    config.maxRetries !== undefined &&
+    (!Number.isInteger(config.maxRetries) || config.maxRetries < 0)
+  ) {
+    throw invalid(config, "maxRetries must be a non-negative integer");
   }
 }
 
