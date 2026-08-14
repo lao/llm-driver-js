@@ -429,3 +429,205 @@ describe("codex cli streaming", () => {
     ).rejects.toBe(reason);
   });
 });
+
+// ── Tools via the MCP bridge (T15) ─────────────────────────────────────────
+// These drive the REAL loopback bridge: the fake runner reads the bridge URL
+// out of the argv it is handed and plays codex, calling the bridge over HTTP.
+//
+// FLAG: the `-c mcp_servers.llmdriver.url=` key syntax is characterized by the
+// env-gated integration test against the real binary (SPEC-v2 open question 4).
+
+const toolsRequest: Request = {
+  maxTokens: 32,
+  messages: [user("add 1 and 2")],
+  tools: [
+    {
+      name: "add",
+      description: "adds two numbers",
+      inputSchema: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } } },
+      execute: (input) => `sum:${JSON.stringify(input)}`,
+    },
+    {
+      name: "mul",
+      description: "multiplies two numbers",
+      inputSchema: { type: "object" },
+      execute: () => "0",
+    },
+  ],
+};
+
+const toolsStdout = [
+  '{"type":"thread.started","thread_id":"thread-1"}',
+  '{"type":"item.completed","item":{"type":"agent_message","text":"the sum is 3"}}',
+  '{"type":"turn.completed","usage":{}}',
+  "",
+].join("\n");
+
+/** Reads the bridge URL the adapter wrote into the `-c mcp_servers.*` override. */
+function bridgeUrl(command: Command): string {
+  const index = command.args.indexOf("-c");
+  const override = command.args[index + 1] as string;
+  // `mcp_servers.llmdriver.url="http://..."` — key is fixed, value is JSON-quoted.
+  const value = override.slice(override.indexOf("=") + 1);
+  return JSON.parse(value) as string;
+}
+
+/** One JSON-RPC call to the live bridge; rejects if the bridge is closed. */
+async function rpc(url: string, method: string, params?: unknown): Promise<Response> {
+  return fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+}
+
+describe("codex cli tools argv", () => {
+  it("adds the -c mcp_servers.llmdriver.url override (parsed) and keeps stdin last", async () => {
+    const { runner, calls } = fakeRunner({ stdout: toolsStdout });
+
+    await createCodexCliBackend(config, runner).generate(toolsRequest);
+
+    const args = calls[0]?.command.args ?? [];
+    // The stdin marker stays last even with the tool override present.
+    expect(args.at(-1)).toBe("-");
+
+    const cIndex = args.indexOf("-c");
+    expect(cIndex).toBeGreaterThanOrEqual(0);
+    const override = args[cIndex + 1] as string;
+    const [key, ...rest] = override.split("=");
+    expect(key).toBe("mcp_servers.llmdriver.url");
+    // Value is a JSON-quoted loopback bridge URL, not a brittle string match.
+    expect(JSON.parse(rest.join("="))).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/[0-9a-f-]{36}$/);
+  });
+
+  it("keeps the v1 argv untouched when the request carries no tools", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+
+    await createCodexCliBackend(config, runner).generate(request);
+
+    const args = calls[0]?.command.args ?? [];
+    expect(args).not.toContain("-c");
+    expect(args.some((arg) => arg.startsWith("mcp_servers."))).toBe(false);
+  });
+});
+
+describe("codex cli tools bridge lifecycle", () => {
+  it("keeps the bridge reachable during the run, then closes it on resolve", async () => {
+    let url = "";
+    let statusDuringRun = 0;
+    const runner: CommandRunner = async (command) => {
+      url = bridgeUrl(command);
+      statusDuringRun = (await rpc(url, "tools/list")).status;
+      return { stdout: toolsStdout, stderr: "", exitCode: 0 };
+    };
+
+    await createCodexCliBackend(config, runner).generate(toolsRequest);
+
+    expect(statusDuringRun).toBe(200);
+    await expect(rpc(url, "tools/list")).rejects.toThrow(); // connection refused after close
+  });
+
+  it("closes the bridge when the run fails", async () => {
+    let url = "";
+    const runner: CommandRunner = async (command) => {
+      url = bridgeUrl(command);
+      return { stdout: "", stderr: "boom\n", exitCode: 1 };
+    };
+
+    await expect(
+      createCodexCliBackend(config, runner).generate(toolsRequest),
+    ).rejects.toBeInstanceOf(LLMDriverError);
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+
+  it("closes the bridge when the run aborts", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    let url = "";
+    const runner: CommandRunner = async (command, signal) => {
+      url = bridgeUrl(command);
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+
+    await expect(
+      createCodexCliBackend(config, runner).generate(toolsRequest, controller.signal),
+    ).rejects.toBe(reason);
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+
+  it("closes the bridge when the stream consumer breaks early", async () => {
+    let url = "";
+    const runner: CommandRunner = async (command) => {
+      url = bridgeUrl(command);
+      return { stdout: toolsStdout, stderr: "", exitCode: 0 };
+    };
+    const backend = createCodexCliBackend(config, runner);
+
+    for await (const _event of backend.generateStream(toolsRequest)) break;
+
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+});
+
+describe("codex cli tools round-trip", () => {
+  it("populates response.toolCalls from a mid-turn tool call (generate)", async () => {
+    const runner: CommandRunner = async (command) => {
+      await rpc(bridgeUrl(command), "tools/call", { name: "add", arguments: { a: 1, b: 2 } });
+      return { stdout: toolsStdout, stderr: "", exitCode: 0 };
+    };
+
+    const response = await createCodexCliBackend(config, runner).generate(toolsRequest);
+
+    expect(response.toolCalls).toEqual([
+      {
+        id: expect.any(String),
+        name: "add",
+        input: { a: 1, b: 2 },
+        output: { text: 'sum:{"a":1,"b":2}', isError: false },
+        isError: false,
+      },
+    ]);
+  });
+
+  it("emits tool_call before tool_result and lands them in the done response (stream)", async () => {
+    const runner: CommandRunner = async (command) => {
+      await rpc(bridgeUrl(command), "tools/call", { name: "add", arguments: { a: 1, b: 2 } });
+      return { stdout: toolsStdout, stderr: "", exitCode: 0 };
+    };
+
+    const events = await collect(
+      createCodexCliBackend(config, runner).generateStream(toolsRequest),
+    );
+
+    const callAt = events.findIndex((event) => event.type === "tool_call");
+    const resultAt = events.findIndex((event) => event.type === "tool_result");
+    expect(callAt).toBeGreaterThanOrEqual(0);
+    expect(callAt).toBeLessThan(resultAt);
+    const call = events[callAt];
+    const toolResult = events[resultAt];
+    if (call?.type !== "tool_call" || toolResult?.type !== "tool_result") {
+      throw new Error("unreachable");
+    }
+    expect(call).toMatchObject({ name: "add", input: { a: 1, b: 2 } });
+    expect(toolResult).toMatchObject({
+      id: call.id,
+      name: "add",
+      output: { text: 'sum:{"a":1,"b":2}', isError: false },
+      isError: false,
+    });
+
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event last");
+    expect(events.filter((event) => event.type === "done")).toHaveLength(1);
+    expect(done.response.toolCalls).toEqual([
+      {
+        id: call.id,
+        name: "add",
+        input: { a: 1, b: 2 },
+        output: { text: 'sum:{"a":1,"b":2}', isError: false },
+        isError: false,
+      },
+    ]);
+  });
+});
