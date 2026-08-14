@@ -176,6 +176,40 @@ describe.skipIf(!process.env.LLMWRAPPER_CLAUDE_CLI_MODEL)("claude cli image inpu
 });
 
 /**
+ * codex `-i` image input against the real binary. A 1x1 PNG is staged to a temp
+ * file and attached to the final user turn; we only assert the turn completes,
+ * since the model's description of a single pixel is not deterministic.
+ */
+describe.skipIf(!process.env.LLMWRAPPER_CODEX_CLI_MODEL)("codex cli image input", () => {
+  // 1x1 transparent PNG.
+  const PNG_B64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+  it(
+    "describes a base64 PNG through the real CLI",
+    async () => {
+      const model = process.env.LLMWRAPPER_CODEX_CLI_MODEL as string;
+      const client = createClient({ provider: "openai", flavor: "cli", model });
+
+      const response = await client.generate({
+        messages: [
+          user([
+            { type: "image", source: { base64: PNG_B64, mediaType: "image/png" } },
+            { type: "text", text: "Reply with the word: seen" },
+          ]),
+        ],
+        maxTokens: 64,
+      });
+
+      expect(response.text.trim()).not.toBe("");
+      expect(response.provider).toBe("openai");
+      expect(response.flavor).toBe("cli");
+    },
+    TIMEOUT_MS,
+  );
+});
+
+/**
  * Real `codex exec` running a client tool through the MCP bridge. Also the sole
  * confirmation of the `-c mcp_servers.llmdriver.url=` streamable-HTTP key syntax
  * (SPEC-v2 open question 4) against the real codex 0.147 binary: if codex ignores
