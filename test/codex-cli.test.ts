@@ -55,6 +55,32 @@ describe("codex cli command", () => {
     expect(calls[0]?.signal).toBe(signal);
   });
 
+  it("passes reasoning.effort as -c model_reasoning_effort before the stdin marker", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+    const backend = createCodexCliBackend({ ...config, cliArgs: ["--color", "never"] }, runner);
+
+    await backend.generate({ ...request, reasoning: { effort: "low" } });
+
+    expect(calls[0]?.command.args).toEqual([
+      ...baseArgs,
+      "--model",
+      "gpt-test",
+      "-c",
+      'model_reasoning_effort="low"',
+      "--color",
+      "never",
+      "-",
+    ]);
+  });
+
+  it("omits the reasoning override when the request has none (byte-identical to v1)", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+
+    await createCodexCliBackend(config, runner).generate(request);
+
+    expect(calls[0]?.command.args).toEqual([...baseArgs, "--model", "gpt-test", "-"]);
+  });
+
   it("JSON-encodes developer instructions and keeps the stdin marker last", async () => {
     const { runner, calls } = fakeRunner({ stdout: successStdout });
     const backend = createCodexCliBackend(

@@ -49,6 +49,9 @@ export function createClaudeCliBackend(
     if (request.system) {
       args.push("--append-system-prompt", request.system);
     }
+    if (request.reasoning) {
+      args.push("--effort", request.reasoning.effort);
+    }
     args.push(...extraArgs);
     return { executable, args, stdin: renderTranscript(request.messages) };
   };

@@ -6,7 +6,10 @@ import { createOpenAiApiBackend } from "./backends/openai-api.js";
 import { assertSupported } from "./capabilities.js";
 import { validateConfig } from "./config.js";
 import { LLMDriverError } from "./errors.js";
-import type { Client, Config, Request, Response } from "./types.js";
+import type { Client, Config, ReasoningEffort, Request, Response } from "./types.js";
+
+/** Neutral reasoning-effort levels; validated here, mapped per target in adapters. */
+const REASONING_EFFORTS: readonly ReasoningEffort[] = ["minimal", "low", "medium", "high"];
 
 /** Constructs a client for one provider, flavor, and model. */
 export function createClient(config: Config): Client {
@@ -103,6 +106,12 @@ export function validateRequest(request: Request, config: Config): void {
   }
   if (request.metadata?.userId !== undefined && typeof request.metadata.userId !== "string") {
     throw invalid(config, "metadata.userId must be a string");
+  }
+  if (
+    request.reasoning !== undefined &&
+    !REASONING_EFFORTS.includes(request.reasoning?.effort as ReasoningEffort)
+  ) {
+    throw invalid(config, `reasoning.effort must be one of ${REASONING_EFFORTS.join(", ")}`);
   }
   if (!Array.isArray(messages) || messages.length === 0) {
     throw invalid(config, "at least one message is required");

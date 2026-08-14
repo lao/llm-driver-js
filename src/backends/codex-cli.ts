@@ -43,6 +43,10 @@ export function createCodexCliBackend(
     if (request.system) {
       args.push("--config", `developer_instructions=${JSON.stringify(request.system)}`);
     }
+    if (request.reasoning) {
+      // TOML string value, so the level is quoted (matches the developer_instructions form).
+      args.push("-c", `model_reasoning_effort=${JSON.stringify(request.reasoning.effort)}`);
+    }
     args.push(...extraArgs, "-");
     return { executable, args, stdin: renderTranscript(request.messages) };
   };
