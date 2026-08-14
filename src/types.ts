@@ -46,6 +46,11 @@ export interface Request {
    * validate it for request portability but cannot enforce it.
    */
   maxTokens: number;
+  /**
+   * Sampling temperature, passed through verbatim; provider range rules apply.
+   * API flavors only — throws `unsupported_feature` on CLI flavors.
+   */
+  temperature?: number;
 }
 
 /** Token counts reported by a target; unreported counts are `0`. */

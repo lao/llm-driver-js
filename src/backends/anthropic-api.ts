@@ -116,6 +116,9 @@ function toParams(model: string, request: Request): Anthropic.MessageCreateParam
   if (request.system) {
     params.system = [{ type: "text", text: request.system }];
   }
+  if (request.temperature !== undefined) {
+    params.temperature = request.temperature;
+  }
   return params;
 }
 

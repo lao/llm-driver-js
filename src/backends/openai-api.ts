@@ -107,6 +107,9 @@ function toParams(
   if (request.system) {
     params.instructions = request.system;
   }
+  if (request.temperature !== undefined) {
+    params.temperature = request.temperature;
+  }
   return params;
 }
 
