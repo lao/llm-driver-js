@@ -470,6 +470,36 @@ describe("openai api backend streaming", () => {
     ]);
   });
 
+  it("maps reasoning summary deltas to interleaved reasoning without polluting the text", async () => {
+    const reasoningDelta = (delta: string) => ({
+      type: "response.reasoning_summary_text.delta",
+      delta,
+      item_id: "rs_123",
+      output_index: 0,
+      summary_index: 0,
+      sequence_number: 1,
+    });
+    const stub = stubSse([
+      sse("response.reasoning_summary_text.delta", reasoningDelta("Think")),
+      sse("response.output_text.delta", outputTextDelta("Hello, ")),
+      sse("response.reasoning_summary_text.delta", reasoningDelta("ing")),
+      sse("response.output_text.delta", outputTextDelta("world")),
+      sse("response.completed", { type: "response.completed", response: RESPONSE }),
+    ]);
+
+    const events = await collect(clientWith(stub.impl).generateStream(PROMPT));
+
+    expect(events.slice(0, 4)).toEqual([
+      { type: "reasoning", text: "Think" },
+      { type: "text", text: "Hello, " },
+      { type: "reasoning", text: "ing" },
+      { type: "text", text: "world" },
+    ]);
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event");
+    expect(done.response.text).toBe("Hello, world");
+  });
+
   it("yields only a done event when the stream carries no text", async () => {
     const stub = stubSse([
       sse("response.completed", {
@@ -483,6 +513,8 @@ describe("openai api backend streaming", () => {
     expect(events).toEqual([
       { type: "done", response: expect.objectContaining({ text: "", completionReason: "stop" }) },
     ]);
+    // No reasoning summary deltas in the stream, so no reasoning events.
+    expect(events.some((event) => event.type === "reasoning")).toBe(false);
   });
 
   it("keeps truncated text and reports max_tokens", async () => {

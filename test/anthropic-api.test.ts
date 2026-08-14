@@ -450,6 +450,38 @@ describe("anthropic api backend streaming", () => {
     ]);
   });
 
+  it("maps thinking_delta events to interleaved reasoning without polluting the text", async () => {
+    const stub = stubSse([
+      sse("message_start", MESSAGE_START),
+      sse("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking: "Think" },
+      }),
+      sse("content_block_delta", textDelta("Hello, ")),
+      sse("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking: "ing" },
+      }),
+      sse("content_block_delta", textDelta("world")),
+      sse("message_delta", messageDelta("end_turn")),
+      sse("message_stop", { type: "message_stop" }),
+    ]);
+
+    const events = await collect(clientWith(stub.impl).generateStream(PROMPT));
+
+    expect(events.slice(0, 4)).toEqual([
+      { type: "reasoning", text: "Think" },
+      { type: "text", text: "Hello, " },
+      { type: "reasoning", text: "ing" },
+      { type: "text", text: "world" },
+    ]);
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event");
+    expect(done.response.text).toBe("Hello, world");
+  });
+
   it("yields only a done event when the stream carries no text", async () => {
     const stub = stubSse([
       sse("message_start", MESSAGE_START),
@@ -465,6 +497,8 @@ describe("anthropic api backend streaming", () => {
         response: expect.objectContaining({ text: "", completionReason: "max_tokens" }),
       },
     ]);
+    // No reasoning deltas in the stream, so no reasoning events (no placeholders).
+    expect(events.some((event) => event.type === "reasoning")).toBe(false);
   });
 
   it("reports a refusal from the message_delta stop reason", async () => {

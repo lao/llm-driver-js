@@ -60,6 +60,12 @@ export function createAnthropicApiBackend(config: Config): Backend {
           } else if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
             text += event.delta.text;
             yield { type: "text", text: event.delta.text };
+          } else if (
+            event.type === "content_block_delta" &&
+            event.delta.type === "thinking_delta"
+          ) {
+            // Reasoning is surfaced but never folded into `text`.
+            yield { type: "reasoning", text: event.delta.thinking };
           } else if (event.type === "message_delta" && message) {
             // Rebuilt rather than mutated: the SDK's own event object is not ours.
             message = {

@@ -52,6 +52,8 @@ async function main(): Promise<void> {
   for await (const event of client.generateStream(request)) {
     if (event.type === "text") {
       process.stdout.write(event.text);
+    } else if (event.type === "reasoning") {
+      process.stderr.write(event.text);
     } else {
       console.log(summary(event.response));
     }

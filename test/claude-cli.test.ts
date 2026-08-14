@@ -416,7 +416,7 @@ describe("claude cli streaming command", () => {
 });
 
 describe("claude cli streaming events", () => {
-  it("yields partial text deltas, then the same response generate would return", async () => {
+  it("yields interleaved reasoning and text deltas, then the same response generate would return", async () => {
     const { backend } = streamBackend([
       '{"type":"system","subtype":"init","session_id":"session-123"}',
       delta("Hello, "),
@@ -429,11 +429,13 @@ describe("claude cli streaming events", () => {
 
     const events = await collect(backend.generateStream(request));
 
-    expect(events.slice(0, 2)).toEqual([
+    // Reasoning is interleaved in source order between the two text deltas.
+    expect(events.slice(0, 3)).toEqual([
       { type: "text", text: "Hello, " },
+      { type: "reasoning", text: "hmm" },
       { type: "text", text: "world" },
     ]);
-    expect(events[2]).toEqual({
+    expect(events[3]).toEqual({
       type: "done",
       response: {
         id: "session-123",

@@ -124,13 +124,19 @@ export interface Response {
 
 /**
  * One event from {@link Client.generateStream}: zero or more `text` deltas whose
- * concatenation equals the final text, then exactly one `done`. Delta
- * granularity is target-dependent and never part of the contract. Exception:
- * on `claude`/`cli` the equality is scoped to single-message turns — when the
- * CLI runs tools, the deltas also carry intermediate assistant text that the
- * final `done.response.text` does not contain (see SPEC "Streaming contract").
+ * concatenation equals the final text, then exactly one `done`. Interleaved
+ * `reasoning` deltas carry the target's thinking/reasoning-summary text and
+ * never contribute to `done.response.text`; a target that reports no reasoning
+ * emits none (no placeholder events). Delta granularity is target-dependent and
+ * never part of the contract. Exception: on `claude`/`cli` the `text` equality
+ * is scoped to single-message turns — when the CLI runs tools, the deltas also
+ * carry intermediate assistant text that the final `done.response.text` does
+ * not contain (see SPEC "Streaming contract").
  */
-export type StreamEvent = { type: "text"; text: string } | { type: "done"; response: Response };
+export type StreamEvent =
+  | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
+  | { type: "done"; response: Response };
 
 /** Sends generation requests through one configured provider and flavor. */
 export interface Client {
