@@ -102,6 +102,47 @@ for (const { provider, envVar } of targets) {
 }
 
 /**
+ * Real `claude -p` running a client tool through the MCP bridge: the CLI drives
+ * its own loop, calls our in-process handler over loopback HTTP, and the record
+ * lands in `response.toolCalls`.
+ */
+describe.skipIf(!process.env.LLMWRAPPER_CLAUDE_CLI_MODEL)("claude cli tools via bridge", () => {
+  it(
+    "calls a trivial in-process tool and records the call",
+    async () => {
+      const model = process.env.LLMWRAPPER_CLAUDE_CLI_MODEL as string;
+      const client = createClient({ provider: "claude", flavor: "cli", model });
+
+      let called = false;
+      const response = await client.generate({
+        messages: [
+          user(
+            "Call the secret_number tool with no arguments and reply with exactly the number it returns.",
+          ),
+        ],
+        maxTokens: 512,
+        tools: [
+          {
+            name: "secret_number",
+            description: "Returns the secret number. Call it to learn the secret.",
+            inputSchema: { type: "object", properties: {} },
+            execute: () => {
+              called = true;
+              return "1729";
+            },
+          },
+        ],
+      });
+
+      expect(called).toBe(true);
+      expect(response.toolCalls.map((call) => call.name)).toContain("secret_number");
+      expect(response.text).toContain("1729");
+    },
+    TIMEOUT_MS,
+  );
+});
+
+/**
  * Characterization, not a contract assertion: `claude -p` is an agent, so a turn
  * that runs tools streams deltas for every assistant message while
  * `done.response` comes from the final `result` event alone. The concatenation

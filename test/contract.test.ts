@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { createClaudeCliBackend } from "../src/backends/claude-cli.js";
-import type { CommandResult, CommandRunner, StreamingCommandRunner } from "../src/backends/cli.js";
+import type {
+  Command,
+  CommandResult,
+  CommandRunner,
+  StreamingCommandRunner,
+} from "../src/backends/cli.js";
 import { createCodexCliBackend } from "../src/backends/codex-cli.js";
 import { createClient, createClientWithBackend } from "../src/client.js";
 import { LLMDriverError } from "../src/errors.js";
@@ -99,6 +104,36 @@ function stubStreamRunner(lines: string[]): StreamingCommandRunner {
     yield { type: "exit", exitCode: 0, stderr: "" };
   };
 }
+
+/** Plays the claude CLI: calls the live MCP bridge named in the argv over HTTP. */
+async function bridgeCall(
+  command: Command,
+  id: string,
+  name: string,
+  args: unknown,
+): Promise<void> {
+  const configIndex = command.args.indexOf("--mcp-config");
+  const { mcpServers } = JSON.parse(command.args[configIndex + 1] as string) as {
+    mcpServers: { llmdriver: { url: string } };
+  };
+  await fetch(mcpServers.llmdriver.url, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name, arguments: args },
+    }),
+  });
+}
+
+const CLAUDE_CLI_STDOUT_USAGE = {
+  input_tokens: 10,
+  output_tokens: 5,
+  cache_read_input_tokens: 3,
+  cache_creation_input_tokens: 2,
+};
 
 const CLAUDE_API_BODY = {
   id: "msg_123",
@@ -540,9 +575,30 @@ describe("contract across all four targets", () => {
       ]),
     });
 
-    const [claudeResponse, openaiResponse] = await Promise.all([
+    // claude/cli reaches the identical record through the MCP bridge: the fake
+    // runner plays the CLI, calling the live loopback bridge over HTTP with the
+    // shared call id, then returns the final result payload.
+    const cliResult = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "the value is 42",
+      session_id: "session-1",
+      usage: CLAUDE_CLI_STDOUT_USAGE,
+    });
+    const cliRunner: CommandRunner = async (command) => {
+      await bridgeCall(command, "tc_1", "lookup", { q: "x" });
+      return { stdout: cliResult, stderr: "", exitCode: 0 };
+    };
+    const cli = createClientWithBackend(
+      CLAUDE_CLI_CONFIG,
+      createClaudeCliBackend(CLAUDE_CLI_CONFIG, cliRunner),
+    );
+
+    const [claudeResponse, openaiResponse, cliResponse] = await Promise.all([
       claude.generate(request),
       openai.generate(request),
+      cli.generate(request),
     ]);
 
     const expectedToolCalls = [
@@ -556,9 +612,12 @@ describe("contract across all four targets", () => {
     ];
     expect(claudeResponse.toolCalls).toEqual(expectedToolCalls);
     expect(openaiResponse.toolCalls).toEqual(expectedToolCalls);
+    expect(cliResponse.toolCalls).toEqual(expectedToolCalls);
     expect(claudeResponse.toolCalls).toEqual(openaiResponse.toolCalls);
+    expect(cliResponse.toolCalls).toEqual(openaiResponse.toolCalls);
     expect(claudeResponse.text).toBe("the value is 42");
     expect(openaiResponse.text).toBe("the value is 42");
+    expect(cliResponse.text).toBe("the value is 42");
   });
 
   it("streams the same tool event ordering on both api targets", async () => {
