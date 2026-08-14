@@ -13,10 +13,12 @@ import {
   type CommandRunner,
   cliError,
   executeCli,
+  hasContentBlocks,
   parseJsonObject,
   parseStructuredText,
   readCount,
   readString,
+  renderStreamJson,
   renderTranscript,
   type StreamingCommandRunner,
   spawnRunner,
@@ -54,7 +56,13 @@ export function createClaudeCliBackend(
   const extraArgs = config.cliArgs ?? [];
 
   const buildCommand = (request: Request, mode: string[], bridge?: McpBridge): Command => {
-    const args = [...mode, "--permission-mode", "default", "--model", config.model];
+    // Content blocks (images) can only ride in over stream-json stdin. Text-only
+    // requests keep the v1 plain-stdin path byte-for-byte — no extra flag, same
+    // transcript bytes (regression-asserted in the suite).
+    const blocks = hasContentBlocks(request.messages);
+    const args = [...mode];
+    if (blocks) args.push("--input-format", "stream-json");
+    args.push("--permission-mode", "default", "--model", config.model);
     if (request.system) {
       args.push("--append-system-prompt", request.system);
     }
@@ -75,7 +83,8 @@ export function createClaudeCliBackend(
       args.push("--json-schema", JSON.stringify(request.outputSchema));
     }
     args.push(...extraArgs);
-    return { executable, args, stdin: renderTranscript(request.messages) };
+    const stdin = blocks ? renderStreamJson(request.messages) : renderTranscript(request.messages);
+    return { executable, args, stdin };
   };
 
   /** Starts the tool bridge when the request has tools, else nothing to run. */

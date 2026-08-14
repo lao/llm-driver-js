@@ -143,6 +143,39 @@ describe.skipIf(!process.env.LLMWRAPPER_CLAUDE_CLI_MODEL)("claude cli tools via 
 });
 
 /**
+ * Real `claude -p` image input over stream-json stdin (T8). An 8x8 solid-blue
+ * PNG the model should be able to describe; proves the stream-json switch and
+ * base64 image block survive to the CLI. Skips unless the model env var is set.
+ */
+describe.skipIf(!process.env.LLMWRAPPER_CLAUDE_CLI_MODEL)("claude cli image input", () => {
+  // 8x8 solid-blue PNG.
+  const BLUE_PNG =
+    "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEElEQVR4nGNgYPiPAw0pCQCpcD/BFMrqcwAAAABJRU5ErkJggg==";
+
+  it(
+    "describes a PNG passed as a base64 image block",
+    async () => {
+      const model = process.env.LLMWRAPPER_CLAUDE_CLI_MODEL as string;
+      const client = createClient({ provider: "claude", flavor: "cli", model });
+
+      const response = await client.generate({
+        system: "Reply with a single word: the dominant color of the image.",
+        messages: [
+          user([
+            { type: "text", text: "What color is this image?" },
+            { type: "image", source: { base64: BLUE_PNG, mediaType: "image/png" } },
+          ]),
+        ],
+        maxTokens: 64,
+      });
+
+      expect(response.text.toLowerCase()).toContain("blue");
+    },
+    TIMEOUT_MS,
+  );
+});
+
+/**
  * Real `codex exec` running a client tool through the MCP bridge. Also the sole
  * confirmation of the `-c mcp_servers.llmdriver.url=` streamable-HTTP key syntax
  * (SPEC-v2 open question 4) against the real codex 0.147 binary: if codex ignores
