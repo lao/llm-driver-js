@@ -10,7 +10,12 @@ import type {
   ToolChoice,
 } from "../types.js";
 import type { Backend } from "./backend.js";
-import { runToolLoop, type ToolCall, type ToolLoopAdapter } from "./tool-loop.js";
+import {
+  runToolLoop,
+  runToolLoopStream,
+  type ToolCall,
+  type ToolLoopAdapter,
+} from "./tool-loop.js";
 
 const CONTEXT = { provider: "openai", flavor: "api", operation: "generate" } as const;
 
@@ -50,12 +55,62 @@ export function createOpenAiApiBackend(config: Config): Backend {
       const functionCalls = response.output.filter(
         (item): item is OpenAI.Responses.ResponseFunctionToolCall => item.type === "function_call",
       );
-      const calls: ToolCall[] = functionCalls.map((call) => ({
-        id: call.call_id,
-        name: call.name,
-        input: parseArguments(call.arguments),
-      }));
+      const calls = toCalls(functionCalls);
       return { response: toResponse(response), calls, assistantMessage: functionCalls };
+    },
+    async *sendStream(messages, signal) {
+      // Own controller so tearing this round's stream down never touches the
+      // loop's signal; the loop's abort still reaches us through `signal`.
+      const controller = new AbortController();
+      try {
+        const stream = await ensureClient().responses.create(
+          { ...toParams(config.model, request, messages.flat()), stream: true },
+          { signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal },
+        );
+
+        let final: OpenAI.Responses.Response | undefined;
+        for await (const event of stream) {
+          if (
+            event.type === "response.output_text.delta" ||
+            event.type === "response.refusal.delta"
+          ) {
+            yield { type: "text", text: event.delta };
+          } else if (event.type === "error") {
+            throw new LLMDriverError("api_error", event.message, {
+              ...CONTEXT,
+              providerCode: event.code ?? undefined,
+            });
+          } else if (
+            event.type === "response.completed" ||
+            event.type === "response.incomplete" ||
+            event.type === "response.failed"
+          ) {
+            final = event.response;
+          }
+        }
+
+        if (signal?.aborted) throw signal.reason;
+        if (!final) {
+          throw new LLMDriverError(
+            "parse_failed",
+            "OpenAI stream ended without a final response",
+            CONTEXT,
+          );
+        }
+        // Complete function_call items (call_id, name, full arguments) arrive on
+        // the final response, so no per-argument delta accumulation is needed.
+        const functionCalls = final.output.filter(
+          (item): item is OpenAI.Responses.ResponseFunctionToolCall =>
+            item.type === "function_call",
+        );
+        return {
+          response: toResponse(final),
+          calls: toCalls(functionCalls),
+          assistantMessage: functionCalls,
+        };
+      } finally {
+        controller.abort();
+      }
     },
     toolResultMessage(results) {
       return results.map((result) => ({
@@ -93,14 +148,20 @@ export function createOpenAiApiBackend(config: Config): Backend {
     },
 
     async *generateStream(request, signal) {
-      // Streaming tool calls land in T12; until then refuse rather than silently
-      // stream a turn whose function_call items go unexecuted.
       if (request.tools && request.tools.length > 0) {
-        throw new LLMDriverError(
-          "unsupported_feature",
-          "tools in generateStream are not yet supported on openai/api; use generate",
-          CONTEXT,
-        );
+        try {
+          yield* runToolLoopStream(
+            request.tools,
+            toInput(request).map((item) => [item]),
+            toolAdapter(request),
+            CONTEXT,
+            signal,
+          );
+        } catch (error) {
+          if (signal?.aborted) throw signal.reason;
+          throw normalizeError(error);
+        }
+        return;
       }
       // Aborted in the generator's cleanup so an early consumer break tears the
       // HTTP stream down instead of leaking it.
@@ -156,6 +217,15 @@ export function createOpenAiApiBackend(config: Config): Backend {
       }
     },
   };
+}
+
+/** Normalizes Responses function_call items into the loop's neutral ToolCall shape. */
+function toCalls(functionCalls: OpenAI.Responses.ResponseFunctionToolCall[]): ToolCall[] {
+  return functionCalls.map((call) => ({
+    id: call.call_id,
+    name: call.name,
+    input: parseArguments(call.arguments),
+  }));
 }
 
 /** Maps the request transcript to the initial Responses input-item array. */

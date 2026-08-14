@@ -154,6 +154,35 @@ describe("client.generateStream done-event stamping", () => {
     expect(events.some((event) => event.type === "reasoning")).toBe(false);
   });
 
+  it("passes tool_call and tool_result events through unchanged", async () => {
+    const toolCall: StreamEvent = { type: "tool_call", id: "t1", name: "add", input: { a: 1 } };
+    const toolResult: StreamEvent = {
+      type: "tool_result",
+      id: "t1",
+      name: "add",
+      output: { text: "3", isError: false },
+      isError: false,
+    };
+    const client = createClientWithBackend(
+      config,
+      stubBackend([
+        toolCall,
+        toolResult,
+        { type: "text", text: "done" },
+        doneEvent({ text: "done" }),
+      ]),
+    );
+
+    const events = await collect(client.generateStream(REQUEST));
+
+    expect(events.slice(0, 3)).toEqual([toolCall, toolResult, { type: "text", text: "done" }]);
+    // Only the done event is stamped with the target identity.
+    expect(events[3]).toMatchObject({
+      type: "done",
+      response: { provider: "claude", flavor: "api" },
+    });
+  });
+
   it("keeps a model reported by the backend", async () => {
     const client = createClientWithBackend(
       config,

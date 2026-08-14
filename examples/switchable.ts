@@ -54,7 +54,11 @@ async function main(): Promise<void> {
       process.stdout.write(event.text);
     } else if (event.type === "reasoning") {
       process.stderr.write(event.text);
-    } else {
+    } else if (event.type === "tool_call") {
+      process.stderr.write(`\n[tool_call ${event.name}]\n`);
+    } else if (event.type === "tool_result") {
+      process.stderr.write(`[tool_result ${event.name}${event.isError ? " error" : ""}]\n`);
+    } else if (event.type === "done") {
       console.log(summary(event.response));
     }
   }

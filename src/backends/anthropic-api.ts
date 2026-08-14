@@ -10,7 +10,12 @@ import type {
   ToolChoice,
 } from "../types.js";
 import type { Backend } from "./backend.js";
-import { runToolLoop, type ToolCall, type ToolLoopAdapter } from "./tool-loop.js";
+import {
+  runToolLoop,
+  runToolLoopStream,
+  type ToolCall,
+  type ToolLoopAdapter,
+} from "./tool-loop.js";
 
 const CONTEXT = { provider: "claude", flavor: "api", operation: "generate" } as const;
 
@@ -58,6 +63,75 @@ export function createAnthropicApiBackend(config: Config): Backend {
         assistantMessage: { role: "assistant", content: message.content },
       };
     },
+    async *sendStream(messages, signal) {
+      // Own controller so tearing this round's stream down never touches the
+      // loop's signal; the loop's abort still reaches us through `signal`.
+      const controller = new AbortController();
+      try {
+        const stream = await ensureClient().messages.create(
+          { ...toParams(config.model, request, messages), stream: true },
+          { signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal },
+        );
+
+        let message: Anthropic.Message | undefined;
+        const content: Anthropic.ContentBlockParam[] = [];
+        const toolJson = new Map<number, string>();
+        for await (const event of stream) {
+          if (event.type === "message_start") {
+            message = event.message;
+          } else if (event.type === "content_block_start") {
+            content[event.index] = startBlock(event.content_block);
+            if (event.content_block.type === "tool_use") toolJson.set(event.index, "");
+          } else if (event.type === "content_block_delta") {
+            const block = content[event.index];
+            if (event.delta.type === "text_delta" && block?.type === "text") {
+              block.text += event.delta.text;
+              yield { type: "text", text: event.delta.text };
+            } else if (event.delta.type === "input_json_delta") {
+              toolJson.set(
+                event.index,
+                (toolJson.get(event.index) ?? "") + event.delta.partial_json,
+              );
+            }
+          } else if (event.type === "content_block_stop") {
+            const block = content[event.index];
+            if (block?.type === "tool_use") block.input = parseToolInput(toolJson.get(event.index));
+          } else if (event.type === "message_delta" && message) {
+            message = {
+              ...message,
+              stop_reason: event.delta.stop_reason,
+              usage: mergeUsage(message.usage, event.usage),
+            };
+          }
+        }
+
+        if (signal?.aborted) throw signal.reason;
+        if (!message) {
+          throw new LLMDriverError(
+            "parse_failed",
+            "Anthropic stream ended without a message",
+            CONTEXT,
+          );
+        }
+        const blocks = content.filter((block) => block !== undefined);
+        const calls: ToolCall[] = [];
+        for (const block of blocks) {
+          if (block.type === "tool_use") {
+            calls.push({ id: block.id, name: block.name, input: block.input });
+          }
+        }
+        return {
+          response: toResponse({
+            ...message,
+            content: blocks as unknown as Anthropic.ContentBlock[],
+          }),
+          calls,
+          assistantMessage: { role: "assistant", content: blocks },
+        };
+      } finally {
+        controller.abort();
+      }
+    },
     toolResultMessage(results) {
       return {
         role: "user",
@@ -99,14 +173,20 @@ export function createAnthropicApiBackend(config: Config): Backend {
     },
 
     async *generateStream(request, signal) {
-      // Streaming tool calls land in T12; until then refuse rather than silently
-      // stream a turn whose tool_use blocks go unexecuted.
       if (request.tools && request.tools.length > 0) {
-        throw new LLMDriverError(
-          "unsupported_feature",
-          "tools in generateStream are not yet supported on claude/api; use generate",
-          CONTEXT,
-        );
+        try {
+          yield* runToolLoopStream(
+            request.tools,
+            toMessageParams(request),
+            toolAdapter(request),
+            CONTEXT,
+            signal,
+          );
+        } catch (error) {
+          if (signal?.aborted) throw signal.reason;
+          throw normalizeError(error, reachedTransport);
+        }
+        return;
       }
       // Aborted in the generator's cleanup so an early consumer break tears the
       // HTTP stream down instead of leaking it.
@@ -166,6 +246,28 @@ export function createAnthropicApiBackend(config: Config): Backend {
       }
     },
   };
+}
+
+/** Seeds an accumulator block from a content_block_start; only text/tool_use matter here. */
+function startBlock(block: Anthropic.ContentBlock): Anthropic.ContentBlockParam {
+  if (block.type === "tool_use") {
+    return { type: "tool_use", id: block.id, name: block.name, input: {} };
+  }
+  // Every other block type is streamed as text (or ignored); seed an empty text block.
+  return { type: "text", text: block.type === "text" ? block.text : "" };
+}
+
+/** Parses the accumulated input_json_delta string; empty means the model sent no arguments. */
+function parseToolInput(raw: string | undefined): unknown {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch (cause) {
+    throw new LLMDriverError("parse_failed", "Anthropic tool_use input was not valid JSON", {
+      ...CONTEXT,
+      cause,
+    });
+  }
 }
 
 /** message_delta reports cumulative counters, but only the ones it knows. */

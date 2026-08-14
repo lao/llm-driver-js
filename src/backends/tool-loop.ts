@@ -1,5 +1,5 @@
 import { LLMDriverError, type LLMDriverErrorOptions } from "../errors.js";
-import type { Response, Tool, ToolCallRecord, ToolOutput } from "../types.js";
+import type { Response, StreamEvent, Tool, ToolCallRecord, ToolOutput } from "../types.js";
 
 /** Hard cap on tool rounds per generate(); a 17th round is refused (SPEC-v2). */
 const MAX_ROUNDS = 16;
@@ -33,6 +33,12 @@ export interface Round<Msg> {
  */
 export interface ToolLoopAdapter<Msg> {
   send(messages: Msg[], signal?: AbortSignal): Promise<Round<Msg>>;
+  /**
+   * The streaming twin of `send`: yields this round's `text` deltas and returns
+   * the same {@link Round}. The generic loop turns the returned calls into
+   * `tool_call`/`tool_result` events; the adapter only maps the wire.
+   */
+  sendStream(messages: Msg[], signal?: AbortSignal): AsyncGenerator<StreamEvent, Round<Msg>, void>;
   toolResultMessage(results: ToolResult[]): Msg;
 }
 
@@ -76,6 +82,75 @@ export async function runToolLoop<Msg>(
     `tool loop exceeded ${MAX_ROUNDS} rounds`,
     context,
   );
+}
+
+/**
+ * Streaming twin of {@link runToolLoop}: yields each round's `text` deltas, then
+ * a `tool_call` per requested call, runs the handlers concurrently, yields a
+ * `tool_result` per call (in call order), and loops until a terminal stop —
+ * finally exactly one `done`. Termination, error, and abort rules match
+ * `runToolLoop`.
+ *
+ * A single loop-scoped controller drives both transport and handlers, so a
+ * consumer `break` (the generator's `return`) aborts an in-flight `execute` and
+ * tears the round's stream down in the `finally`; abandoned handlers are reaped
+ * there so their post-abort rejections never surface as unhandled.
+ */
+export async function* runToolLoopStream<Msg>(
+  tools: Tool[],
+  initialMessages: Msg[],
+  adapter: ToolLoopAdapter<Msg>,
+  context: LLMDriverErrorOptions,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  const byName = new Map(tools.map((tool) => [tool.name, tool]));
+  const messages = [...initialMessages]; // caller's transcript stays untouched
+  const records: ToolCallRecord[] = [];
+  const controller = new AbortController();
+  const scoped = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  const pending: Promise<unknown>[] = [];
+
+  try {
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      const { response, calls, assistantMessage } = yield* adapter.sendStream(messages, scoped);
+      if (calls.length === 0) {
+        yield { type: "done", response: { ...response, toolCalls: records } };
+        return;
+      }
+      messages.push(assistantMessage);
+
+      for (const call of calls) {
+        yield { type: "tool_call", id: call.id, name: call.name, input: call.input };
+      }
+      const outcomes = calls.map((call) => runCall(call, byName.get(call.name), context, scoped));
+      pending.push(...outcomes);
+      const results: ToolResult[] = [];
+      for (const outcome of outcomes) {
+        const { record, result } = await outcome;
+        records.push(record);
+        results.push(result);
+        yield {
+          type: "tool_result",
+          id: record.id,
+          name: record.name,
+          output: record.output,
+          isError: record.isError,
+        };
+      }
+      messages.push(adapter.toolResultMessage(results));
+    }
+
+    throw new LLMDriverError(
+      "tool_loop_exceeded",
+      `tool loop exceeded ${MAX_ROUNDS} rounds`,
+      context,
+    );
+  } finally {
+    controller.abort();
+    // Reap any handler abandoned by an early break so its post-abort rejection
+    // does not surface as an unhandled promise rejection.
+    await Promise.allSettled(pending);
+  }
 }
 
 async function runCall(
