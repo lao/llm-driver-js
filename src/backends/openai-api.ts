@@ -1,6 +1,6 @@
 import OpenAI, { APIConnectionError, APIError, OpenAIError } from "openai";
 import { LLMDriverError } from "../errors.js";
-import type { CompletionReason, Config, Request, Response } from "../types.js";
+import type { CompletionReason, Config, JsonSchema, Request, Response } from "../types.js";
 import type { Backend } from "./backend.js";
 
 const CONTEXT = { provider: "openai", flavor: "api", operation: "generate" } as const;
@@ -25,6 +25,7 @@ export function createOpenAiApiBackend(config: Config): Backend {
       try {
         return toResponse(
           await ensureClient().responses.create(toParams(config.model, request), { signal }),
+          request.outputSchema,
         );
       } catch (error) {
         // An abort surfaces the signal's own reason, like the CLI flavors —
@@ -80,7 +81,7 @@ export function createOpenAiApiBackend(config: Config): Backend {
             CONTEXT,
           );
         }
-        yield { type: "done", response: toResponse(final) };
+        yield { type: "done", response: toResponse(final, request.outputSchema) };
       } catch (error) {
         if (signal?.aborted) throw signal.reason;
         throw normalizeError(error);
@@ -124,19 +125,25 @@ function toParams(
   if (request.reasoning !== undefined) {
     params.reasoning = { effort: request.reasoning.effort };
   }
+  if (request.outputSchema) {
+    params.text = {
+      format: { type: "json_schema", name: "output", schema: request.outputSchema, strict: true },
+    };
+  }
   return params;
 }
 
-function toResponse(response: OpenAI.Responses.Response): Response {
+function toResponse(response: OpenAI.Responses.Response, outputSchema?: JsonSchema): Response {
   if (!Array.isArray(response?.output)) {
     throw new LLMDriverError("parse_failed", "OpenAI response contained no output items", CONTEXT);
   }
   assertTerminalStatus(response);
   const usage = response.usage;
-  return {
+  const text = outputText(response);
+  const result: Response = {
     id: response.id ?? "",
     model: response.model ?? "",
-    text: outputText(response),
+    text,
     completionReason: toCompletionReason(response),
     usage: {
       inputTokens: usage?.input_tokens ?? 0,
@@ -147,7 +154,24 @@ function toResponse(response: OpenAI.Responses.Response): Response {
     },
     provider: "openai",
     flavor: "api",
+    toolCalls: [],
   };
+  if (outputSchema !== undefined) {
+    result.structured = parseStructured(text);
+  }
+  return result;
+}
+
+/** Parses structured-output text as JSON; unparseable output is `parse_failed`. */
+function parseStructured(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new LLMDriverError("parse_failed", "OpenAI structured output was not valid JSON", {
+      ...CONTEXT,
+      cause: error,
+    });
+  }
 }
 
 /** A truncated response still carries usable text; any other non-completed status is an error. */

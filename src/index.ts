@@ -6,6 +6,7 @@ export {
   type CompletionReason,
   type Config,
   type Flavor,
+  type JsonSchema,
   type Message,
   type Provider,
   type ReasoningEffort,
@@ -13,6 +14,8 @@ export {
   type Response,
   type Role,
   type StreamEvent,
+  type ToolCallRecord,
+  type ToolOutput,
   type Usage,
   user,
 } from "./types.js";

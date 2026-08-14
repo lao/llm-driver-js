@@ -186,6 +186,7 @@ describe("anthropic api backend", () => {
       completionReason: "stop",
       provider: "claude",
       flavor: "api",
+      toolCalls: [],
       usage: {
         inputTokens: 10,
         outputTokens: 5,
@@ -194,6 +195,43 @@ describe("anthropic api backend", () => {
         reasoningTokens: 0,
       },
     });
+  });
+
+  it("maps outputSchema onto output_config.format and parses the result", async () => {
+    const schema = { type: "object", properties: { answer: { type: "number" } } };
+    const stub = stubFetch(200, {
+      ...MESSAGE,
+      content: [{ type: "text", text: '{"answer":42}' }],
+    });
+
+    const response = await clientWith(stub.impl).generate({ ...PROMPT, outputSchema: schema });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.output_config).toEqual({ format: { type: "json_schema", schema } });
+    expect(response.structured).toEqual({ answer: 42 });
+    expect(response.text).toBe('{"answer":42}');
+  });
+
+  it("rejects unparseable structured output with parse_failed", async () => {
+    const stub = stubFetch(200, { ...MESSAGE, content: [{ type: "text", text: "not json" }] });
+
+    const error = await rejection(
+      clientWith(stub.impl).generate({ ...PROMPT, outputSchema: { type: "object" } }),
+    );
+
+    expect(error.code).toBe("parse_failed");
+    expect(error.provider).toBe("claude");
+    expect(error.flavor).toBe("api");
+    expect(error.operation).toBe("generate");
+  });
+
+  it("leaves structured undefined and output_config absent without outputSchema", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    const response = await clientWith(stub.impl).generate(PROMPT);
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("output_config");
+    expect(response).not.toHaveProperty("structured");
   });
 
   it("defaults unreported usage counters to zero", async () => {
@@ -438,6 +476,7 @@ describe("anthropic api backend streaming", () => {
           completionReason: "stop",
           provider: "claude",
           flavor: "api",
+          toolCalls: [],
           usage: {
             inputTokens: 10,
             outputTokens: 5,

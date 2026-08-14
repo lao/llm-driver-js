@@ -51,6 +51,12 @@ export const CAPABILITIES: readonly Capability[] = [
     used: (request) => request.reasoning !== undefined,
     supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
   },
+  {
+    // CLI flavors gain structured output in T6; until then they reject it.
+    feature: "outputSchema",
+    used: (request) => request.outputSchema !== undefined,
+    supported: ["claude/api", "openai/api"],
+  },
 ];
 
 /**
