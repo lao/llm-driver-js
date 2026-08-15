@@ -72,6 +72,22 @@ export type JsonSchema = Record<string, unknown>;
 /** Result a tool `execute()` handler returns; normalized to object form in records. */
 export type ToolOutput = string | { text: string; isError?: boolean };
 
+/**
+ * A handler-based client tool. The library runs the agentic loop and invokes
+ * `execute` in-process whenever the model calls the tool.
+ */
+export interface Tool {
+  /** Tool name the model calls; must match `^[a-zA-Z0-9_-]{1,64}$`. */
+  name: string;
+  description: string;
+  inputSchema: JsonSchema;
+  /** Invoked with the model's arguments; `ctx.signal` mirrors the request abort. */
+  execute(input: unknown, ctx: { signal?: AbortSignal }): Promise<ToolOutput> | ToolOutput;
+}
+
+/** How the model may pick tools; a `{ name }` value forces that one tool. */
+export type ToolChoice = "auto" | "none" | "required" | { name: string };
+
 /** Audit record of one tool invocation during a `generate()` tool loop. */
 export interface ToolCallRecord {
   /** Provider call id, or bridge-generated on CLI flavors. */
@@ -148,6 +164,13 @@ export interface Request {
    * CLI flavors.
    */
   outputSchema?: JsonSchema;
+  /**
+   * Client tools the library exposes to the model; when the model calls one,
+   * the library runs `execute` and loops until a terminal stop.
+   */
+  tools?: Tool[];
+  /** Constrains tool selection; requires `tools`. API flavors only. */
+  toolChoice?: ToolChoice;
 }
 
 /** Token counts reported by a target; unreported counts are `0`. */

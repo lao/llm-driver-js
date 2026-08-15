@@ -115,6 +115,7 @@ export function validateRequest(request: Request, config: Config): void {
   ) {
     throw invalid(config, `reasoning.effort must be one of ${REASONING_EFFORTS.join(", ")}`);
   }
+  validateTools(request, config);
   if (!Array.isArray(messages) || messages.length === 0) {
     throw invalid(config, "at least one message is required");
   }
@@ -182,6 +183,50 @@ function validateBlock(block: unknown, index: number, blockIndex: number, config
     return;
   }
   bad(`has unknown type "${String(type)}"`);
+}
+
+const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
+
+/** Validates `tools`/`toolChoice` shape; the target gate runs separately. */
+function validateTools(request: Request, config: Config): void {
+  if (request.tools !== undefined) {
+    if (!Array.isArray(request.tools)) {
+      throw invalid(config, "tools must be an array");
+    }
+    for (const [index, tool] of request.tools.entries()) {
+      if (typeof tool?.name !== "string" || !TOOL_NAME.test(tool.name)) {
+        throw invalid(config, `tool ${index} name must match ${TOOL_NAME.source}`);
+      }
+      if (typeof tool.description !== "string") {
+        throw invalid(config, `tool ${index} description must be a string`);
+      }
+      if (typeof tool.inputSchema !== "object" || tool.inputSchema === null) {
+        throw invalid(config, `tool ${index} inputSchema must be an object`);
+      }
+      if (typeof tool.execute !== "function") {
+        throw invalid(config, `tool ${index} execute must be a function`);
+      }
+    }
+  }
+  if (request.toolChoice !== undefined) {
+    if (!isValidToolChoice(request.toolChoice)) {
+      throw invalid(config, 'toolChoice must be "auto", "none", "required", or { name }');
+    }
+    if (!request.tools || request.tools.length === 0) {
+      throw invalid(config, "toolChoice requires tools");
+    }
+  }
+}
+
+function isValidToolChoice(choice: unknown): boolean {
+  if (choice === "auto" || choice === "none" || choice === "required") {
+    return true;
+  }
+  return (
+    typeof choice === "object" &&
+    choice !== null &&
+    typeof (choice as { name?: unknown }).name === "string"
+  );
 }
 
 function invalid(config: Config, message: string): LLMDriverError {

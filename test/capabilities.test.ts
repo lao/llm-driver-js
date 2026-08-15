@@ -103,6 +103,14 @@ const FEATURE_REQUESTS: Record<string, GenerateRequest> = {
     maxTokens: 8,
     messages: [user([{ type: "document", source: { base64: "x", mediaType: "application/pdf" } }])],
   },
+  tools: {
+    maxTokens: 8,
+    messages: [user("hi")],
+    tools: [
+      { name: "add", description: "adds", inputSchema: { type: "object" }, execute: () => "3" },
+    ],
+  },
+  toolChoice: { maxTokens: 8, messages: [user("hi")], toolChoice: "required" },
 };
 
 describe("matrix gate covers every feature × target cell", () => {
@@ -177,6 +185,45 @@ describe("image and document gate", () => {
     expect(err.message).toContain(feature);
     expect(err.message).toContain(target);
   });
+});
+
+describe("tools + toolChoice gate", () => {
+  const TOOLS: GenerateRequest["tools"] = [
+    { name: "add", description: "adds", inputSchema: { type: "object" }, execute: () => "3" },
+  ];
+  const toolsReq: GenerateRequest = { maxTokens: 8, messages: [user("hi")], tools: TOOLS };
+  // toolChoice-only so the gate isolates that row (the tools row would fire first).
+  const toolChoiceReq: GenerateRequest = {
+    maxTokens: 8,
+    messages: [user("hi")],
+    toolChoice: "required",
+  };
+
+  it("does not throw at the gate on claude/api", () => {
+    expect(() => assertSupported(toolsReq, CONFIGS["claude/api"])).not.toThrow();
+    expect(() => assertSupported(toolChoiceReq, CONFIGS["claude/api"])).not.toThrow();
+  });
+
+  it.each([
+    ["tools", toolsReq],
+    ["toolChoice", toolChoiceReq],
+  ] as const)(
+    "throws unsupported_feature for %s on every non-claude/api target",
+    (feature, req) => {
+      for (const target of ["openai/api", "claude/cli", "openai/cli"] as const) {
+        let error: unknown;
+        try {
+          assertSupported(req, CONFIGS[target]);
+        } catch (caught) {
+          error = caught;
+        }
+        expect(error).toBeInstanceOf(LLMDriverError);
+        expect((error as LLMDriverError).code).toBe("unsupported_feature");
+        expect((error as LLMDriverError).message).toContain(feature);
+        expect((error as LLMDriverError).message).toContain(target);
+      }
+    },
+  );
 });
 
 describe("temperature on cli flavors", () => {

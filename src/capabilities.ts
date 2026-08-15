@@ -68,6 +68,17 @@ export const CAPABILITIES: readonly Capability[] = [
     used: (request) => hasBlock(request, "document"),
     supported: ["claude/api", "openai/api"],
   },
+  {
+    // openai/api appends in T11; cli flavors go through the MCP bridge in T14/T15.
+    feature: "tools",
+    used: (request) => Array.isArray(request.tools) && request.tools.length > 0,
+    supported: ["claude/api"],
+  },
+  {
+    feature: "toolChoice",
+    used: (request) => request.toolChoice !== undefined,
+    supported: ["claude/api"],
+  },
 ];
 
 /** True when any message carries a content block of the given type. */

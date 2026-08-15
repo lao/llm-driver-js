@@ -1,7 +1,16 @@
 import Anthropic, { AnthropicError, APIConnectionError, APIError } from "@anthropic-ai/sdk";
 import { LLMDriverError } from "../errors.js";
-import type { CompletionReason, Config, JsonSchema, Message, Request, Response } from "../types.js";
+import type {
+  CompletionReason,
+  Config,
+  JsonSchema,
+  Message,
+  Request,
+  Response,
+  ToolChoice,
+} from "../types.js";
 import type { Backend } from "./backend.js";
+import { runToolLoop, type ToolCall, type ToolLoopAdapter } from "./tool-loop.js";
 
 const CONTEXT = { provider: "claude", flavor: "api", operation: "generate" } as const;
 
@@ -28,11 +37,57 @@ export function createAnthropicApiBackend(config: Config): Backend {
       timeout: config.timeoutMs, // undefined leaves the SDK default in place
     }));
 
+  // The tool loop's per-round send, over the Anthropic transcript type.
+  const toolAdapter = (request: Request): ToolLoopAdapter<Anthropic.MessageParam> => ({
+    async send(messages, signal) {
+      const message = await ensureClient().messages.create(
+        toParams(config.model, request, messages),
+        {
+          signal,
+        },
+      );
+      const calls: ToolCall[] = [];
+      for (const block of message.content) {
+        if (block.type === "tool_use") {
+          calls.push({ id: block.id, name: block.name, input: block.input });
+        }
+      }
+      return {
+        response: toResponse(message),
+        calls,
+        assistantMessage: { role: "assistant", content: message.content },
+      };
+    },
+    toolResultMessage(results) {
+      return {
+        role: "user",
+        content: results.map((result) => ({
+          type: "tool_result",
+          tool_use_id: result.id,
+          content: result.output.text,
+          ...(result.output.isError ? { is_error: true } : {}),
+        })),
+      };
+    },
+  });
+
   return {
     async generate(request, signal) {
       try {
+        if (request.tools && request.tools.length > 0) {
+          return await runToolLoop(
+            request.tools,
+            toMessageParams(request),
+            toolAdapter(request),
+            CONTEXT,
+            signal,
+          );
+        }
         return toResponse(
-          await ensureClient().messages.create(toParams(config.model, request), { signal }),
+          await ensureClient().messages.create(
+            toParams(config.model, request, toMessageParams(request)),
+            { signal },
+          ),
           request.outputSchema,
         );
       } catch (error) {
@@ -44,12 +99,21 @@ export function createAnthropicApiBackend(config: Config): Backend {
     },
 
     async *generateStream(request, signal) {
+      // Streaming tool calls land in T12; until then refuse rather than silently
+      // stream a turn whose tool_use blocks go unexecuted.
+      if (request.tools && request.tools.length > 0) {
+        throw new LLMDriverError(
+          "unsupported_feature",
+          "tools in generateStream are not yet supported on claude/api; use generate",
+          CONTEXT,
+        );
+      }
       // Aborted in the generator's cleanup so an early consumer break tears the
       // HTTP stream down instead of leaking it.
       const controller = new AbortController();
       try {
         const stream = await ensureClient().messages.create(
-          { ...toParams(config.model, request), stream: true },
+          { ...toParams(config.model, request, toMessageParams(request)), stream: true },
           { signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal },
         );
 
@@ -116,14 +180,23 @@ function mergeUsage(usage: Anthropic.Usage, delta: Anthropic.MessageDeltaUsage):
   };
 }
 
-function toParams(model: string, request: Request): Anthropic.MessageCreateParamsNonStreaming {
+/** Maps the request transcript to the initial Anthropic message array. */
+function toMessageParams(request: Request): Anthropic.MessageParam[] {
+  return request.messages.map((message) => ({
+    role: message.role,
+    content: toContent(message),
+  }));
+}
+
+function toParams(
+  model: string,
+  request: Request,
+  messages: Anthropic.MessageParam[],
+): Anthropic.MessageCreateParamsNonStreaming {
   const params: Anthropic.MessageCreateParamsNonStreaming = {
     model,
     max_tokens: request.maxTokens,
-    messages: request.messages.map((message) => ({
-      role: message.role,
-      content: toContent(message),
-    })),
+    messages,
   };
   if (request.system) {
     params.system = [{ type: "text", text: request.system }];
@@ -158,6 +231,16 @@ function toParams(model: string, request: Request): Anthropic.MessageCreateParam
       format: { type: "json_schema", schema: request.outputSchema },
     };
   }
+  if (request.tools && request.tools.length > 0) {
+    params.tools = request.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.inputSchema as Anthropic.Tool.InputSchema,
+    }));
+  }
+  if (request.toolChoice !== undefined) {
+    params.tool_choice = toToolChoice(request.toolChoice);
+  }
   return params;
 }
 
@@ -187,6 +270,14 @@ function toContent(message: Message): Anthropic.ContentBlockParam[] {
       source: { type: "base64", media_type: block.source.mediaType, data: block.source.base64 },
     };
   });
+}
+
+/** `required` maps to Anthropic's `any`; a named choice forces that tool. */
+function toToolChoice(choice: ToolChoice): Anthropic.ToolChoice {
+  if (choice === "auto") return { type: "auto" };
+  if (choice === "none") return { type: "none" };
+  if (choice === "required") return { type: "any" };
+  return { type: "tool", name: choice.name };
 }
 
 function toResponse(message: Anthropic.Message, outputSchema?: JsonSchema): Response {
