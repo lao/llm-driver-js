@@ -1,5 +1,13 @@
 import { LLMDriverError } from "../errors.js";
-import type { Config, Request, Response, StreamEvent, ToolCallRecord, Usage } from "../types.js";
+import type {
+  Config,
+  JsonSchema,
+  Request,
+  Response,
+  StreamEvent,
+  ToolCallRecord,
+  Usage,
+} from "../types.js";
 import type { Backend } from "./backend.js";
 import {
   asRecord,
@@ -8,10 +16,12 @@ import {
   cliError,
   executeCli,
   parseJsonObject,
+  parseStructuredText,
   readCount,
   readString,
   renderTranscript,
   spawnRunner,
+  withTempFile,
 } from "./cli.js";
 import { type McpBridge, start as startBridge } from "./mcp-bridge.js";
 
@@ -31,7 +41,7 @@ export function createCodexCliBackend(
   const executable = config.cliPath ?? "codex";
   const extraArgs = config.cliArgs ?? [];
 
-  const buildCommand = (request: Request, bridge?: McpBridge): Command => {
+  const buildCommand = (request: Request, bridge?: McpBridge, schemaPath?: string): Command => {
     const args = [
       "exec",
       "--json",
@@ -59,6 +69,9 @@ export function createCodexCliBackend(
       // characterized by the env-gated integration test.
       args.push("-c", `mcp_servers.llmdriver.url=${JSON.stringify(bridge.url)}`);
     }
+    if (schemaPath) {
+      args.push("--output-schema", schemaPath);
+    }
     args.push(...extraArgs, "-");
     return { executable, args, stdin: renderTranscript(request.messages) };
   };
@@ -80,8 +93,17 @@ export function createCodexCliBackend(
     onCall?: (record: ToolCallRecord) => void,
   ): Promise<{ response: Response; reasoning: string[] }> => {
     const bridge = await openBridge(request, signal, onCall);
+    // Codex takes its schema as a file path, so it is written to a private temp
+    // dir and removed in `finally` — on resolve, reject, and abort alike.
+    let cleanup: (() => Promise<void>) | undefined;
     try {
-      const command = buildCommand(request, bridge);
+      let schemaPath: string | undefined;
+      if (request.outputSchema) {
+        const tmp = await withTempFile("schema.json", JSON.stringify(request.outputSchema));
+        schemaPath = tmp.path;
+        cleanup = tmp.cleanup;
+      }
+      const command = buildCommand(request, bridge, schemaPath);
       const { stdout, failure } = await executeCli(
         "openai",
         command,
@@ -90,8 +112,9 @@ export function createCodexCliBackend(
         config.timeoutMs,
       );
       if (failure) throw preferReportedFailure(failure, stdout, config.model);
-      return parseCodexOutput(stdout, config.model, bridge?.records ?? []);
+      return parseCodexOutput(stdout, config.model, bridge?.records ?? [], request.outputSchema);
     } finally {
+      await cleanup?.();
       await bridge?.close();
     }
   };
@@ -160,6 +183,7 @@ function parseCodexOutput(
   stdout: string,
   model: string,
   toolCalls: ToolCallRecord[] = [],
+  outputSchema?: JsonSchema,
 ): { response: Response; reasoning: string[] } {
   let id = "";
   let text: string | undefined;
@@ -230,6 +254,9 @@ function parseCodexOutput(
     flavor: "cli",
     toolCalls,
   };
+  if (outputSchema !== undefined) {
+    response.structured = parseStructuredText("openai", text);
+  }
   return { response, reasoning };
 }
 

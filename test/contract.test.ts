@@ -840,13 +840,31 @@ const SCHEMA = { type: "object", properties: { answer: { type: "number" } } };
 const STRUCTURED = { answer: 42 };
 const STRUCTURED_TEXT = JSON.stringify(STRUCTURED);
 
-/** Structured output is api-only in T5; both api targets parse the final text. */
+const CLAUDE_CLI_STRUCTURED_STDOUT = JSON.stringify({
+  type: "result",
+  subtype: "success",
+  is_error: false,
+  result: STRUCTURED_TEXT,
+  session_id: "session-1",
+  usage: { input_tokens: 10, output_tokens: 5 },
+});
+
+const CODEX_CLI_STRUCTURED_STDOUT = [
+  '{"type":"thread.started","thread_id":"thread-1"}',
+  `{"type":"item.completed","item":{"type":"agent_message","text":${JSON.stringify(STRUCTURED_TEXT)}}}`,
+  '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}',
+  "",
+].join("\n");
+
+/** All four targets parse their final text into `structured` identically. */
 const structuredTargets: {
   provider: Provider;
+  flavor: Flavor;
   generate: (request: GenerateRequest) => Promise<GenerateResponse>;
 }[] = [
   {
     provider: "claude",
+    flavor: "api",
     generate: (request) =>
       createClient({
         provider: "claude",
@@ -862,6 +880,7 @@ const structuredTargets: {
   },
   {
     provider: "openai",
+    flavor: "api",
     generate: (request) =>
       createClient({
         provider: "openai",
@@ -883,11 +902,29 @@ const structuredTargets: {
         }),
       }).generate(request),
   },
+  {
+    provider: "claude",
+    flavor: "cli",
+    generate: (request) =>
+      createClientWithBackend(
+        CLAUDE_CLI_CONFIG,
+        createClaudeCliBackend(CLAUDE_CLI_CONFIG, stubRunner(CLAUDE_CLI_STRUCTURED_STDOUT)),
+      ).generate(request),
+  },
+  {
+    provider: "openai",
+    flavor: "cli",
+    generate: (request) =>
+      createClientWithBackend(
+        CODEX_CLI_CONFIG,
+        createCodexCliBackend(CODEX_CLI_CONFIG, stubRunner(CODEX_CLI_STRUCTURED_STDOUT)),
+      ).generate(request),
+  },
 ];
 
-describe("structured output across api targets", () => {
+describe("structured output across all four targets", () => {
   for (const target of structuredTargets) {
-    it(`${target.provider}/api parses the final text into structured`, async () => {
+    it(`${target.provider}/${target.flavor} parses the final text into structured`, async () => {
       const response = await target.generate({ ...PROMPT, outputSchema: SCHEMA });
 
       expect(response.structured).toEqual(STRUCTURED);

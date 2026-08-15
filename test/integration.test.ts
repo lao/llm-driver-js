@@ -185,6 +185,43 @@ describe.skipIf(!process.env.LLMWRAPPER_CODEX_CLI_MODEL)("codex cli tools via br
 });
 
 /**
+ * The truth the fixtures cannot prove: that `--json-schema` (claude) and
+ * `--output-schema` (codex) really make the CLI emit JSON we can parse into
+ * `structured`. Env-gated, skipped by default; run before checkpoint sign-off.
+ */
+for (const { provider, envVar } of targets) {
+  const model = process.env[envVar];
+
+  describe.skipIf(!model)(`${provider} cli structured output`, () => {
+    it(
+      "returns parseable structured output for a schema",
+      async () => {
+        const client = createClient({ provider, flavor: "cli", model: model as string });
+
+        const response = await client.generate({
+          system: "Reply only with JSON that satisfies the schema.",
+          messages: [user("The answer to life, the universe, and everything is 42.")],
+          maxTokens: 256,
+          outputSchema: {
+            type: "object",
+            properties: { answer: { type: "number" } },
+            required: ["answer"],
+            additionalProperties: false,
+          },
+        });
+
+        // Parse succeeded (the adapter throws parse_failed otherwise), and the
+        // schema shape came back.
+        expect(response.structured).toBeTypeOf("object");
+        expect(response.structured).not.toBeNull();
+        expect(JSON.parse(response.text)).toEqual(response.structured);
+      },
+      TIMEOUT_MS,
+    );
+  });
+}
+
+/**
  * Characterization, not a contract assertion: `claude -p` is an agent, so a turn
  * that runs tools streams deltas for every assistant message while
  * `done.response` comes from the final `result` event alone. The concatenation

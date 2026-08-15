@@ -269,21 +269,31 @@ describe("outputSchema on cli flavors", () => {
     messages: [user("Hello")],
     outputSchema: { type: "object" },
   };
+  // Structured payload each CLI reports for the request above (T6 flipped both
+  // cells to ✅; the gate must now let the request through to the runner).
+  const stdout: Record<"claude/cli" | "openai/cli", string> = {
+    "claude/cli": '{"type":"result","subtype":"success","result":"{\\"ok\\":true}"}',
+    "openai/cli": [
+      '{"type":"thread.started","thread_id":"t"}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"ok\\":true}"}}',
+      '{"type":"turn.completed","usage":{}}',
+    ].join("\n"),
+  };
 
   it.each(["claude/cli", "openai/cli"] as const)(
-    "generate() rejects unsupported_feature before any spawn on %s",
+    "generate() passes the gate and reaches the runner on %s",
     async (target) => {
-      const { runner, calls } = neverRun();
+      const calls: Command[] = [];
+      const runner: CommandRunner = async (command) => {
+        calls.push(command);
+        return { stdout: stdout[target], stderr: "", exitCode: 0 };
+      };
       const client = cliClient(target, runner);
 
-      const error = await client.generate(schemaRequest).catch((caught) => caught);
+      const response = await client.generate(schemaRequest);
 
-      expect(error).toBeInstanceOf(LLMDriverError);
-      const err = error as LLMDriverError;
-      expect(err.code).toBe("unsupported_feature");
-      expect(err.message).toContain("outputSchema");
-      expect(err.message).toContain(target);
-      expect(calls).toHaveLength(0);
+      expect(calls).toHaveLength(1);
+      expect(response.structured).toEqual({ ok: true });
     },
   );
 });

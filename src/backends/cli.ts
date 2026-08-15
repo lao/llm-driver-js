@@ -1,4 +1,7 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { type ErrorCode, LLMDriverError } from "../errors.js";
 import type { Message, Provider } from "../types.js";
@@ -205,6 +208,44 @@ export function parseJsonObject(
     throw cliError(provider, "parse_failed", `${description}: expected a JSON object`);
   }
   return parsed as Record<string, unknown>;
+}
+
+/**
+ * Parses a CLI's final text as JSON for structured output, mirroring the api
+ * flavors: the result payload is the model's JSON and unparseable output is
+ * `parse_failed`. Callers gate this on `request.outputSchema` being set.
+ */
+export function parseStructuredText(provider: Provider, text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch (cause) {
+    const name = provider === "claude" ? "Claude" : "Codex";
+    throw cliError(provider, "parse_failed", `${name} CLI structured output was not valid JSON`, {
+      cause,
+    });
+  }
+}
+
+/**
+ * Writes `contents` to a fresh private temp dir and hands back the file path plus
+ * an idempotent cleanup. Codex takes its output schema as a file path, so the
+ * caller passes `path` on argv and calls `cleanup()` in a `finally` — the dir is
+ * removed on resolve, reject, and abort alike.
+ */
+export async function withTempFile(
+  name: string,
+  contents: string,
+): Promise<{ path: string; cleanup: () => Promise<void> }> {
+  const dir = await mkdtemp(join(tmpdir(), "llmdriver-"));
+  const cleanup = () => rm(dir, { recursive: true, force: true });
+  const path = join(dir, name);
+  try {
+    await writeFile(path, contents);
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+  return { path, cleanup };
 }
 
 /** Reads a nested object, treating anything else as absent. */

@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { Command, CommandResult, CommandRunner } from "../src/backends/cli.js";
 import { createCodexCliBackend } from "../src/backends/codex-cli.js";
@@ -143,6 +144,120 @@ describe("codex cli parsing", () => {
       flavor: "cli",
       toolCalls: [],
     });
+  });
+});
+
+describe("codex cli structured output", () => {
+  const schema = { type: "object", properties: { answer: { type: "number" } } };
+  const structuredStdout = [
+    '{"type":"thread.started","thread_id":"thread-1"}',
+    '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"answer\\":42}"}}',
+    '{"type":"turn.completed","usage":{}}',
+    "",
+  ].join("\n");
+
+  /**
+   * Captures the --output-schema path and whether the file existed (and its
+   * contents) at the moment the runner was invoked — the temp file must live for
+   * the whole run and be gone once generate settles.
+   */
+  function schemaProbingRunner(result: Partial<CommandResult>, error?: unknown) {
+    const seen: { path?: string; existedDuringRun: boolean; contents?: string } = {
+      existedDuringRun: false,
+    };
+    const runner: CommandRunner = async (command) => {
+      const index = command.args.indexOf("--output-schema");
+      if (index !== -1) {
+        seen.path = command.args[index + 1];
+        seen.existedDuringRun = seen.path !== undefined && existsSync(seen.path);
+        if (seen.existedDuringRun && seen.path) {
+          seen.contents = readFileSync(seen.path, "utf8");
+        }
+      }
+      if (error !== undefined) throw error;
+      return { stdout: "", stderr: "", exitCode: 0, ...result };
+    };
+    return { runner, seen };
+  }
+
+  it("writes the schema to a temp file, passes --output-schema, and cleans up", async () => {
+    const { runner, seen } = schemaProbingRunner({ stdout: structuredStdout });
+
+    const response = await createCodexCliBackend(config, runner).generate({
+      ...request,
+      outputSchema: schema,
+    });
+
+    expect(seen.existedDuringRun).toBe(true);
+    expect(seen.contents).toBe(JSON.stringify(schema));
+    // Gone after resolve.
+    expect(seen.path && existsSync(seen.path)).toBe(false);
+    expect(response.structured).toEqual({ answer: 42 });
+    expect(response.text).toBe('{"answer":42}');
+  });
+
+  it("deletes the temp file even when the run fails", async () => {
+    const { runner, seen } = schemaProbingRunner({}, new Error("launch failed"));
+
+    await expect(
+      createCodexCliBackend(config, runner).generate({ ...request, outputSchema: schema }),
+    ).rejects.toBeInstanceOf(LLMDriverError);
+
+    expect(seen.existedDuringRun).toBe(true);
+    expect(seen.path && existsSync(seen.path)).toBe(false);
+  });
+
+  it("deletes the temp file when the caller aborts", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    let seenPath: string | undefined;
+    let existedDuringRun = false;
+    const runner: CommandRunner = async (command, signal) => {
+      const index = command.args.indexOf("--output-schema");
+      seenPath = command.args[index + 1];
+      existedDuringRun = seenPath !== undefined && existsSync(seenPath);
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+
+    await expect(
+      createCodexCliBackend(config, runner).generate(
+        { ...request, outputSchema: schema },
+        controller.signal,
+      ),
+    ).rejects.toBe(reason);
+
+    expect(existedDuringRun).toBe(true);
+    expect(seenPath && existsSync(seenPath)).toBe(false);
+  });
+
+  it("reports parse_failed when the structured output is not valid JSON", async () => {
+    const { runner } = schemaProbingRunner({
+      stdout: [
+        '{"type":"thread.started","thread_id":"thread-1"}',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"not json"}}',
+        '{"type":"turn.completed","usage":{}}',
+        "",
+      ].join("\n"),
+    });
+
+    const error = await createCodexCliBackend(config, runner)
+      .generate({ ...request, outputSchema: schema })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect(error.code).toBe("parse_failed");
+    expect(error.provider).toBe("openai");
+    expect(error.flavor).toBe("cli");
+  });
+
+  it("omits --output-schema and leaves structured undefined without a schema", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+
+    const response = await createCodexCliBackend(config, runner).generate(request);
+
+    expect(calls[0]?.command.args).not.toContain("--output-schema");
+    expect(response.structured).toBeUndefined();
   });
 });
 
