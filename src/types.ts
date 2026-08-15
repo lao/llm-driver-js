@@ -35,6 +35,19 @@ export interface Config {
   cliPath?: string;
   /** CLI flavor only: extra argv passed verbatim; never shell-expanded. */
   cliArgs?: string[];
+
+  /**
+   * Per-call time budget in milliseconds. API flavors pass it to the SDK as its
+   * request timeout; CLI flavors kill the process group and reject
+   * `process_failed` when it elapses. Omitted: SDK default (api), none (cli).
+   */
+  timeoutMs?: number;
+  /**
+   * API flavor only: transient-failure retry budget handed to the SDK (default
+   * `0`). Throws `invalid_config` on CLI flavors — re-running an agent is not
+   * idempotent.
+   */
+  maxRetries?: number;
 }
 
 /** One text turn in a generation request. */

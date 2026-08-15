@@ -66,20 +66,50 @@ export function renderTranscript(messages: Message[]): string {
 }
 
 /**
+ * Combines the caller's signal with an optional deadline. The returned signal
+ * aborts on either; `timedOut()` tells a fired deadline (→ `process_failed`)
+ * apart from a caller abort (→ raw `signal.reason`), the caller always winning a
+ * race. Reuses the runners' existing abort path, so a deadline kills the group.
+ */
+function withDeadline(
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): { signal: AbortSignal | undefined; timedOut: () => boolean } {
+  if (timeoutMs === undefined) return { signal, timedOut: () => false };
+  const deadline = AbortSignal.timeout(timeoutMs);
+  return {
+    signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
+    timedOut: () => deadline.aborted && !signal?.aborted,
+  };
+}
+
+function timeoutFailure(provider: Provider, timeoutMs: number): LLMDriverError {
+  return cliError(provider, "process_failed", `CLI command timed out after ${timeoutMs} ms`, {
+    providerCode: "timeout",
+  });
+}
+
+/**
  * Runs a CLI command and normalizes process-level failures. Rejects only when
- * the caller aborts — every other failure is returned as {@link CliOutcome}
- * `failure` so a backend can still mine stdout for a provider diagnostic.
+ * the caller aborts — every other failure, including a `timeoutMs` deadline, is
+ * returned as {@link CliOutcome} `failure` so a backend can still mine stdout
+ * for a provider diagnostic.
  */
 export async function executeCli(
   provider: Provider,
   command: Command,
   runner: CommandRunner,
   signal?: AbortSignal,
+  timeoutMs?: number,
 ): Promise<CliOutcome> {
+  const deadline = withDeadline(signal, timeoutMs);
   let result: CommandResult;
   try {
-    result = await runner(command, signal);
+    result = await runner(command, deadline.signal);
   } catch (error) {
+    if (timeoutMs !== undefined && deadline.timedOut()) {
+      return { stdout: "", failure: timeoutFailure(provider, timeoutMs) };
+    }
     if (signal?.aborted) throw error;
     return { stdout: "", failure: launchFailure(provider, command, error) };
   }
@@ -100,14 +130,17 @@ export async function* streamCli(
   command: Command,
   runner: StreamingCommandRunner,
   signal?: AbortSignal,
+  timeoutMs?: number,
 ): AsyncGenerator<string> {
+  const deadline = withDeadline(signal, timeoutMs);
   let exit: { exitCode: number; stderr: string } | undefined;
   try {
-    for await (const chunk of runner(command, signal)) {
+    for await (const chunk of runner(command, deadline.signal)) {
       if (chunk.type === "line") yield chunk.line;
       else exit = chunk;
     }
   } catch (error) {
+    if (timeoutMs !== undefined && deadline.timedOut()) throw timeoutFailure(provider, timeoutMs);
     if (signal?.aborted) throw error;
     throw launchFailure(provider, command, error);
   }

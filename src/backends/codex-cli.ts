@@ -53,7 +53,13 @@ export function createCodexCliBackend(
 
   const generate = async (request: Request, signal?: AbortSignal): Promise<Response> => {
     const command = buildCommand(request);
-    const { stdout, failure } = await executeCli("openai", command, runner, signal);
+    const { stdout, failure } = await executeCli(
+      "openai",
+      command,
+      runner,
+      signal,
+      config.timeoutMs,
+    );
     if (failure) throw preferReportedFailure(failure, stdout, config.model);
     return parseCodexOutput(stdout, config.model);
   };

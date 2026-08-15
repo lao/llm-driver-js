@@ -59,7 +59,13 @@ export function createClaudeCliBackend(
   return {
     async generate(request, signal) {
       const command = buildCommand(request, JSON_MODE);
-      const { stdout, failure } = await executeCli("claude", command, runner, signal);
+      const { stdout, failure } = await executeCli(
+        "claude",
+        command,
+        runner,
+        signal,
+        config.timeoutMs,
+      );
       if (failure) throw failure;
       return toResponse(
         parseJsonObject("claude", "decode Claude CLI output", stdout),
@@ -72,7 +78,13 @@ export function createClaudeCliBackend(
       let result: Record<string, unknown> | undefined;
       let index = 0;
 
-      for await (const line of streamCli("claude", command, streamRunner, signal)) {
+      for await (const line of streamCli(
+        "claude",
+        command,
+        streamRunner,
+        signal,
+        config.timeoutMs,
+      )) {
         index += 1;
         if (line.trim() === "") continue;
         const event = parseJsonObject("claude", `decode Claude CLI event ${index}`, line);

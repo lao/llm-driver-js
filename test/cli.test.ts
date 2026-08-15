@@ -31,6 +31,18 @@ function resultRunner(result: Partial<Awaited<ReturnType<CommandRunner>>>): Comm
   return async () => ({ stdout: "", stderr: "", exitCode: 0, ...result });
 }
 
+/** A run that only ever settles when its signal aborts — models a hung process. */
+const hungRunner: CommandRunner = (_command, signal) =>
+  new Promise((_resolve, reject) => {
+    signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+
+const hungStreamRunner: StreamingCommandRunner = async function* (_command, signal) {
+  await new Promise<void>((_resolve, reject) => {
+    signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+};
+
 function enoent(): NodeJS.ErrnoException {
   return Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" });
 }
@@ -235,6 +247,51 @@ describe("executeCli", () => {
 
     await expect(executeCli("claude", command, runner, controller.signal)).rejects.toBe(reason);
   });
+
+  it("kills a run that exceeds timeoutMs and returns process_failed", async () => {
+    const { stdout, failure } = await executeCli("claude", command, hungRunner, undefined, 20);
+
+    expect(stdout).toBe("");
+    expect(failure?.code).toBe("process_failed");
+    expect(failure?.message).toContain("timed out");
+    expect(failure?.providerCode).toBe("timeout");
+  });
+
+  it("lets a caller abort win a race with the timeout, rejecting the raw reason", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+
+    const pending = executeCli("claude", command, hungRunner, controller.signal, 10_000);
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "kills the process group when a real spawn exceeds timeoutMs",
+    async () => {
+      const pidFile = join(tempDir(), "timeout-grandchild.pid");
+      const grandchild = "setInterval(()=>{},1000)";
+      // Spawns a grandchild — like `claude`/`codex` do — records its pid, stays alive.
+      const script =
+        "const {spawn}=require('node:child_process');" +
+        `const g=spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],{stdio:'ignore'});` +
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(g.pid));` +
+        "setInterval(()=>{},1000)";
+
+      const { failure } = await executeCli(
+        "claude",
+        { executable: process.execPath, args: ["-e", script], stdin: "" },
+        spawnRunner,
+        undefined,
+        500,
+      );
+
+      expect(failure?.code).toBe("process_failed");
+      expect(failure?.message).toContain("timed out");
+      await expectReaped(readPid(pidFile));
+    },
+  );
 });
 
 describe("spawnRunner", () => {
@@ -394,6 +451,12 @@ describe("streamCli", () => {
       "second",
     ]);
     expect(seen).toEqual([{ command, signal }]);
+  });
+
+  it("throws process_failed when a stream exceeds timeoutMs", async () => {
+    await expect(
+      collect(streamCli("claude", command, hungStreamRunner, undefined, 20)),
+    ).rejects.toMatchObject({ code: "process_failed", providerCode: "timeout" });
   });
 
   it("maps a missing executable to executable_not_found", async () => {
