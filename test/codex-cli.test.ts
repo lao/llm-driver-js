@@ -3,7 +3,14 @@ import { describe, expect, it } from "vitest";
 import type { Command, CommandResult, CommandRunner } from "../src/backends/cli.js";
 import { createCodexCliBackend } from "../src/backends/codex-cli.js";
 import { type ErrorCode, LLMDriverError } from "../src/errors.js";
-import { assistant, type Config, type Request, type StreamEvent, user } from "../src/types.js";
+import {
+  assistant,
+  type Config,
+  type ContentBlock,
+  type Request,
+  type StreamEvent,
+  user,
+} from "../src/types.js";
 
 const config: Config = { provider: "openai", flavor: "cli", model: "gpt-test" };
 const request: Request = { maxTokens: 32, messages: [user("Hello")] };
@@ -405,6 +412,169 @@ describe("codex cli failures", () => {
     await expect(
       createCodexCliBackend(config, runner).generate(request, controller.signal),
     ).rejects.toBe(reason);
+  });
+});
+
+/** Pulls the `-i <path>` arguments out of a built command, in order. */
+function imagePaths(command: Command): string[] {
+  const paths: string[] = [];
+  command.args.forEach((arg, index) => {
+    if (arg === "-i") paths.push(command.args[index + 1] as string);
+  });
+  return paths;
+}
+
+/**
+ * Fake runner that records, at spawn time, the `-i` paths and whether each temp
+ * file existed and what it held — the window in which the files must be live.
+ */
+function stagingRunner(result: Partial<CommandResult>, error?: unknown) {
+  const seen = {
+    command: undefined as Command | undefined,
+    paths: [] as string[],
+    existedDuringRun: [] as boolean[],
+    contents: [] as string[],
+  };
+  const runner: CommandRunner = async (command) => {
+    seen.command = command;
+    seen.paths = imagePaths(command);
+    seen.existedDuringRun = seen.paths.map((path) => existsSync(path));
+    seen.contents = seen.paths.map((path) => (existsSync(path) ? readFileSync(path, "utf8") : ""));
+    if (error !== undefined) throw error;
+    return { stdout: successStdout, stderr: "", exitCode: 0, ...result };
+  };
+  return { runner, seen };
+}
+
+function imageBlock(base64: string, mediaType: string): ContentBlock {
+  return { type: "image", source: { base64, mediaType: mediaType as never } };
+}
+
+describe("codex cli image input", () => {
+  const pngB64 = Buffer.from("fake-png-bytes").toString("base64");
+  const jpgB64 = Buffer.from("fake-jpg-bytes").toString("base64");
+
+  it("writes one temp file per image and passes each via -i, then cleans up", async () => {
+    const { runner, seen } = stagingRunner({});
+    const request: Request = {
+      maxTokens: 32,
+      messages: [
+        user([
+          imageBlock(pngB64, "image/png"),
+          imageBlock(jpgB64, "image/jpeg"),
+          { type: "text", text: "describe" },
+        ]),
+      ],
+    };
+
+    await createCodexCliBackend(config, runner).generate(request);
+
+    expect(seen.paths).toHaveLength(2);
+    expect(seen.paths[0]).toMatch(/image-0\.png$/);
+    expect(seen.paths[1]).toMatch(/image-1\.jpg$/);
+    expect(seen.command?.args).toEqual([
+      ...baseArgs,
+      "--model",
+      "gpt-test",
+      "-i",
+      seen.paths[0],
+      "-i",
+      seen.paths[1],
+      "-",
+    ]);
+    // Files were live during the run with the decoded bytes...
+    expect(seen.existedDuringRun).toEqual([true, true]);
+    expect(seen.contents).toEqual(["fake-png-bytes", "fake-jpg-bytes"]);
+    // ...and gone once generate resolved.
+    for (const path of seen.paths) expect(existsSync(path)).toBe(false);
+  });
+
+  it("cleans up temp files after a process failure", async () => {
+    const { runner, seen } = stagingRunner({ stdout: "", stderr: "boom", exitCode: 9 });
+    const request: Request = {
+      maxTokens: 32,
+      messages: [user([imageBlock(pngB64, "image/png")])],
+    };
+
+    await expect(createCodexCliBackend(config, runner).generate(request)).rejects.toBeInstanceOf(
+      LLMDriverError,
+    );
+
+    expect(seen.existedDuringRun).toEqual([true]);
+    for (const path of seen.paths) expect(existsSync(path)).toBe(false);
+  });
+
+  it("cleans up temp files after a caller abort", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    let sawPath = "";
+    let existedDuringRun = false;
+    const runner: CommandRunner = async (command, signal) => {
+      sawPath = imagePaths(command)[0] as string;
+      existedDuringRun = existsSync(sawPath);
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+    const request: Request = {
+      maxTokens: 32,
+      messages: [user([imageBlock(pngB64, "image/png")])],
+    };
+
+    await expect(
+      createCodexCliBackend(config, runner).generate(request, controller.signal),
+    ).rejects.toBe(reason);
+
+    expect(existedDuringRun).toBe(true);
+    expect(existsSync(sawPath)).toBe(false);
+  });
+
+  it("streams images through the same staging path", async () => {
+    const { runner, seen } = stagingRunner({});
+    const request: Request = {
+      maxTokens: 32,
+      messages: [user([imageBlock(pngB64, "image/png"), { type: "text", text: "describe" }])],
+    };
+
+    await collect(createCodexCliBackend(config, runner).generateStream(request));
+
+    expect(seen.paths).toHaveLength(1);
+    expect(seen.command?.args).toContain("-i");
+    for (const path of seen.paths) expect(existsSync(path)).toBe(false);
+  });
+
+  it("rejects a URL-source image as unsupported_feature without spawning", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+    const request: Request = {
+      maxTokens: 32,
+      messages: [user([{ type: "image", source: { url: "https://example.test/cat.png" } }])],
+    };
+
+    const error = await createCodexCliBackend(config, runner)
+      .generate(request)
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect((error as LLMDriverError).code).toBe("unsupported_feature");
+    expect((error as LLMDriverError).message).toContain("URL-source images");
+    expect((error as LLMDriverError).message).toContain("openai/cli");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects an image outside the final user message as unsupported_feature", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+    const request: Request = {
+      maxTokens: 32,
+      messages: [user([imageBlock(pngB64, "image/png")]), assistant("ack"), user("and now?")],
+    };
+
+    const error = await createCodexCliBackend(config, runner)
+      .generate(request)
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect((error as LLMDriverError).code).toBe("unsupported_feature");
+    expect((error as LLMDriverError).message).toContain("final user message");
+    expect(calls).toHaveLength(0);
   });
 });
 

@@ -481,9 +481,9 @@ describe("contract across all four targets", () => {
     }
   });
 
-  // Images are honored on both API targets and claude/cli (stream-json stdin,
-  // T8); codex/cli flips later (T9). One neutral image fixture proves both
-  // halves of the matrix.
+  // A base64 image in the final user turn is honored on all four targets: API
+  // flavors natively, claude/cli via stream-json stdin (T8), codex/cli via temp
+  // files + `-i` (T9). One neutral image fixture proves the whole matrix row.
   const IMAGE_PROMPT: GenerateRequest = {
     maxTokens: 64,
     messages: [
@@ -494,7 +494,8 @@ describe("contract across all four targets", () => {
     ],
   };
 
-  const imageSupported = (t: Target) => t.flavor === "api" || t.provider === "claude";
+  // All four targets honor image input (API flavors, claude/cli T8, codex/cli T9).
+  const imageSupported = (_t: Target) => true;
 
   for (const target of targets.filter(imageSupported)) {
     it(`${target.provider}/${target.flavor} accepts an image request`, async () => {

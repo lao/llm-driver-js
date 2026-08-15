@@ -170,8 +170,13 @@ describe("image and document gate", () => {
     expect(() => assertSupported(request(IMAGE), CONFIGS["claude/cli"])).not.toThrow();
   });
 
+  it("does not throw for image input on openai/cli (codex temp files + -i)", () => {
+    // The gate permits it; the codex-cli adapter enforces the URL / non-final
+    // constraints and is covered in codex-cli.test.ts.
+    expect(() => assertSupported(request(IMAGE), CONFIGS["openai/cli"])).not.toThrow();
+  });
+
   it.each([
-    ["image input", IMAGE, "openai/cli"],
     ["document input", DOCUMENT, "claude/cli"],
     ["document input", DOCUMENT, "openai/cli"],
   ] as const)("throws unsupported_feature for %s on %s", (feature, block, target) => {

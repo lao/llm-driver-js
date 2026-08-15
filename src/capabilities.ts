@@ -59,10 +59,13 @@ export const CAPABILITIES: readonly Capability[] = [
     supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
   },
   {
-    // claude/cli honors images via stream-json stdin (T8); codex/cli lands in T9.
+    // Images honored on all four targets: API flavors natively, claude/cli via
+    // stream-json stdin (T8), codex/cli via temp files + `-i` (T9). codex/cli's
+    // URL-source and non-final-turn constraints are enforced in the codex-cli
+    // adapter, which throws `unsupported_feature` naming the constraint.
     feature: "image input",
     used: (request) => hasBlock(request, "image"),
-    supported: ["claude/api", "openai/api", "claude/cli"],
+    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
   },
   {
     feature: "document input",

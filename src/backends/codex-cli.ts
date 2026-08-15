@@ -1,6 +1,10 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LLMDriverError } from "../errors.js";
 import type {
   Config,
+  ImageMediaType,
   JsonSchema,
   Request,
   Response,
@@ -41,7 +45,12 @@ export function createCodexCliBackend(
   const executable = config.cliPath ?? "codex";
   const extraArgs = config.cliArgs ?? [];
 
-  const buildCommand = (request: Request, bridge?: McpBridge, schemaPath?: string): Command => {
+  const buildCommand = (
+    request: Request,
+    bridge?: McpBridge,
+    schemaPath?: string,
+    imageArgs: string[] = [],
+  ): Command => {
     const args = [
       "exec",
       "--json",
@@ -72,7 +81,7 @@ export function createCodexCliBackend(
     if (schemaPath) {
       args.push("--output-schema", schemaPath);
     }
-    args.push(...extraArgs, "-");
+    args.push(...imageArgs, ...extraArgs, "-");
     return { executable, args, stdin: renderTranscript(request.messages) };
   };
 
@@ -93,17 +102,22 @@ export function createCodexCliBackend(
     onCall?: (record: ToolCallRecord) => void,
   ): Promise<{ response: Response; reasoning: string[] }> => {
     const bridge = await openBridge(request, signal, onCall);
-    // Codex takes its schema as a file path, so it is written to a private temp
-    // dir and removed in `finally` — on resolve, reject, and abort alike.
-    let cleanup: (() => Promise<void>) | undefined;
+    // Codex takes both its schema and its images as file paths, each written to
+    // a private temp dir and removed in `finally` — on resolve, reject, and
+    // abort alike. Image staging runs inside the try so a rejected image
+    // (URL-source or non-final-turn) still tears the bridge down.
+    let cleanupSchema: (() => Promise<void>) | undefined;
+    let cleanupImages: (() => Promise<void>) | undefined;
     try {
+      const staged = await stageImages(request);
+      cleanupImages = staged.cleanup;
       let schemaPath: string | undefined;
       if (request.outputSchema) {
         const tmp = await withTempFile("schema.json", JSON.stringify(request.outputSchema));
         schemaPath = tmp.path;
-        cleanup = tmp.cleanup;
+        cleanupSchema = tmp.cleanup;
       }
-      const command = buildCommand(request, bridge, schemaPath);
+      const command = buildCommand(request, bridge, schemaPath, staged.imageArgs);
       const { stdout, failure } = await executeCli(
         "openai",
         command,
@@ -114,7 +128,8 @@ export function createCodexCliBackend(
       if (failure) throw preferReportedFailure(failure, stdout, config.model);
       return parseCodexOutput(stdout, config.model, bridge?.records ?? [], request.outputSchema);
     } finally {
-      await cleanup?.();
+      await cleanupSchema?.();
+      await cleanupImages?.();
       await bridge?.close();
     }
   };
@@ -150,6 +165,80 @@ export function createCodexCliBackend(
       yield { type: "done", response };
     },
   };
+}
+
+/** File extension `codex -i` infers the format from, keyed by media type. */
+const IMAGE_EXTENSION: Record<ImageMediaType, string> = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+};
+
+/**
+ * Writes each base64 image in the final user turn to a scratch temp file and
+ * returns the matching `-i <path>` argv plus a cleanup that removes the temp
+ * directory. Cleanup is idempotent and always runs in `generate`'s `finally`
+ * (resolve, reject, or abort). `codex -i` attaches images to the initial prompt
+ * only and has no URL flag, so URL-source images and images outside the final
+ * user message are rejected as `unsupported_feature` before any file is written.
+ */
+async function stageImages(
+  request: Request,
+): Promise<{ imageArgs: string[]; cleanup: () => Promise<void> }> {
+  const images = collectImages(request);
+  if (images.length === 0) return { imageArgs: [], cleanup: async () => {} };
+
+  const dir = await mkdtemp(join(tmpdir(), "llm-driver-codex-"));
+  const paths = images.map((image, index) => join(dir, `image-${index}${image.extension}`));
+  try {
+    await Promise.all(
+      images.map((image, index) =>
+        writeFile(paths[index] as string, Buffer.from(image.base64, "base64")),
+      ),
+    );
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    imageArgs: paths.flatMap((path) => ["-i", path]),
+    cleanup: () => rm(dir, { recursive: true, force: true }),
+  };
+}
+
+/**
+ * Collects the base64 images destined for `-i`, enforcing codex's two
+ * constraints. An image with a URL source, or any image outside the final user
+ * message, throws `unsupported_feature` naming the constraint.
+ */
+function collectImages(request: Request): Array<{ base64: string; extension: string }> {
+  const lastIndex = request.messages.length - 1;
+  const images: Array<{ base64: string; extension: string }> = [];
+  request.messages.forEach((message, index) => {
+    for (const block of message.content ?? []) {
+      if (block.type !== "image") continue;
+      if ("url" in block.source) {
+        throw unsupported("URL-source images");
+      }
+      if (index !== lastIndex || message.role !== "user") {
+        throw unsupported("images outside the final user message");
+      }
+      images.push({
+        base64: block.source.base64,
+        extension: IMAGE_EXTENSION[block.source.mediaType],
+      });
+    }
+  });
+  return images;
+}
+
+function unsupported(constraint: string): LLMDriverError {
+  return new LLMDriverError(
+    "unsupported_feature",
+    `${constraint} are not supported on openai/cli`,
+    { provider: "openai", flavor: "cli", operation: "generate" },
+  );
 }
 
 /**
