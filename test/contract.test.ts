@@ -12,6 +12,7 @@ import {
   type Response as GenerateResponse,
   type Provider,
   type StreamEvent,
+  type Tool,
   user,
 } from "../src/types.js";
 
@@ -37,6 +38,18 @@ function stubFetch(body: unknown): typeof fetch {
       status: 200,
       headers: { "content-type": "application/json" },
     });
+}
+
+/** Serves canned JSON payloads in order, one per request; never touches the network. */
+function sequencedFetch(bodies: unknown[]): typeof fetch {
+  let call = 0;
+  return async () => {
+    const body = bodies[Math.min(call++, bodies.length - 1)];
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
 }
 
 /** Replies with canned process output; never spawns a process. */
@@ -433,6 +446,103 @@ describe("contract across all four targets", () => {
       expect((error as LLMDriverError).code).toBe("unsupported_feature");
     });
   }
+
+  it("runs the tool loop to the same toolCalls and text on both api targets", async () => {
+    // One neutral tool request, sent to both api flavors. Provider wire shapes
+    // differ (Messages tool_use vs Responses function_call) but the normalized
+    // toolCalls records and final text must be identical. Shared call id + input
+    // make the records comparable across providers.
+    const request: GenerateRequest = {
+      maxTokens: 64,
+      messages: [user("look it up")],
+      tools: [
+        {
+          name: "lookup",
+          description: "looks up a value",
+          inputSchema: { type: "object", properties: { q: { type: "string" } } },
+          execute: () => "42",
+        } satisfies Tool,
+      ],
+    };
+
+    const claude = createClient({
+      provider: "claude",
+      flavor: "api",
+      model: "claude-api-test",
+      apiKey: "test-key",
+      baseUrl: "https://anthropic.test",
+      fetch: sequencedFetch([
+        {
+          id: "msg_tool",
+          type: "message",
+          role: "assistant",
+          model: "claude-api-test",
+          content: [{ type: "tool_use", id: "tc_1", name: "lookup", input: { q: "x" } }],
+          stop_reason: "tool_use",
+          usage: CLAUDE_API_BODY.usage,
+        },
+        { ...CLAUDE_API_BODY, content: [{ type: "text", text: "the value is 42" }] },
+      ]),
+    });
+
+    const openai = createClient({
+      provider: "openai",
+      flavor: "api",
+      model: "gpt-api-test",
+      apiKey: "test-key",
+      baseUrl: "https://openai.test",
+      fetch: sequencedFetch([
+        {
+          id: "resp_tool",
+          object: "response",
+          status: "completed",
+          model: "gpt-api-test",
+          output: [
+            {
+              type: "function_call",
+              status: "completed",
+              call_id: "tc_1",
+              name: "lookup",
+              arguments: JSON.stringify({ q: "x" }),
+            },
+          ],
+          usage: OPENAI_API_BODY.usage,
+        },
+        {
+          ...OPENAI_API_BODY,
+          output: [
+            {
+              id: "msg_1",
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: "the value is 42", annotations: [] }],
+            },
+          ],
+        },
+      ]),
+    });
+
+    const [claudeResponse, openaiResponse] = await Promise.all([
+      claude.generate(request),
+      openai.generate(request),
+    ]);
+
+    const expectedToolCalls = [
+      {
+        id: "tc_1",
+        name: "lookup",
+        input: { q: "x" },
+        output: { text: "42", isError: false },
+        isError: false,
+      },
+    ];
+    expect(claudeResponse.toolCalls).toEqual(expectedToolCalls);
+    expect(openaiResponse.toolCalls).toEqual(expectedToolCalls);
+    expect(claudeResponse.toolCalls).toEqual(openaiResponse.toolCalls);
+    expect(claudeResponse.text).toBe("the value is 42");
+    expect(openaiResponse.text).toBe("the value is 42");
+  });
 
   it("returns the same field set from every target", async () => {
     const responses = await Promise.all(targets.map((target) => target.generate(PROMPT)));
