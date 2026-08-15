@@ -114,6 +114,45 @@ describe("client.generateStream done-event stamping", () => {
     );
   });
 
+  it("passes reasoning events through unchanged, interleaved with text", async () => {
+    const client = createClientWithBackend(
+      config,
+      stubBackend([
+        { type: "reasoning", text: "Think" },
+        { type: "text", text: "Hello, " },
+        { type: "reasoning", text: "ing" },
+        { type: "text", text: "world" },
+        doneEvent({ text: "Hello, world" }),
+      ]),
+    );
+
+    const events = await collect(client.generateStream(REQUEST));
+
+    // Reasoning is relayed verbatim; only the done event is restamped.
+    expect(events.slice(0, 4)).toEqual([
+      { type: "reasoning", text: "Think" },
+      { type: "text", text: "Hello, " },
+      { type: "reasoning", text: "ing" },
+      { type: "text", text: "world" },
+    ]);
+    const text = events
+      .filter((event) => event.type === "text")
+      .map((event) => event.text)
+      .join("");
+    expect(text).toBe("Hello, world");
+  });
+
+  it("emits no reasoning events when the backend reports none", async () => {
+    const client = createClientWithBackend(
+      config,
+      stubBackend([{ type: "text", text: "Hello, world" }, doneEvent({ text: "Hello, world" })]),
+    );
+
+    const events = await collect(client.generateStream(REQUEST));
+
+    expect(events.some((event) => event.type === "reasoning")).toBe(false);
+  });
+
   it("keeps a model reported by the backend", async () => {
     const client = createClientWithBackend(
       config,

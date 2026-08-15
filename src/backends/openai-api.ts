@@ -53,6 +53,9 @@ export function createOpenAiApiBackend(config: Config): Backend {
             event.type === "response.refusal.delta"
           ) {
             yield { type: "text", text: event.delta };
+          } else if (event.type === "response.reasoning_summary_text.delta") {
+            // Reasoning is surfaced but never folded into `text`.
+            yield { type: "reasoning", text: event.delta };
           } else if (event.type === "error") {
             throw new LLMDriverError("api_error", event.message, {
               ...CONTEXT,

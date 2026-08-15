@@ -51,7 +51,10 @@ export function createCodexCliBackend(
     return { executable, args, stdin: renderTranscript(request.messages) };
   };
 
-  const generate = async (request: Request, signal?: AbortSignal): Promise<Response> => {
+  const run = async (
+    request: Request,
+    signal?: AbortSignal,
+  ): Promise<{ response: Response; reasoning: string[] }> => {
     const command = buildCommand(request);
     const { stdout, failure } = await executeCli(
       "openai",
@@ -65,16 +68,19 @@ export function createCodexCliBackend(
   };
 
   return {
-    generate,
+    generate: async (request, signal) => (await run(request, signal)).response,
 
     /**
      * Coarse by design: `codex exec --json` reports completed items only — no
-     * text deltas — so nothing can be emitted before the turn ends anyway, and
-     * delegating to `generate` keeps one parse and one abort contract.
+     * text deltas — so text arrives as one event after the turn ends. Reasoning
+     * items, when the JSONL exposes them, are surfaced (in source order, before
+     * the final text) and never fold into `response.text`; codex reports none on
+     * many turns, in which case none are emitted (matrix ⚠️).
      * TODO: switch to real deltas if `codex exec --json` ever documents them.
      */
     async *generateStream(request, signal) {
-      const response = await generate(request, signal);
+      const { response, reasoning } = await run(request, signal);
+      for (const text of reasoning) yield { type: "reasoning", text };
       if (response.text !== "") yield { type: "text", text: response.text };
       yield { type: "done", response };
     },
@@ -108,9 +114,13 @@ function preferReportedFailure(
   return failure;
 }
 
-function parseCodexOutput(stdout: string, model: string): Response {
+function parseCodexOutput(
+  stdout: string,
+  model: string,
+): { response: Response; reasoning: string[] } {
   let id = "";
   let text: string | undefined;
+  const reasoning: string[] = [];
   // Set by `turn.completed`, so its presence is what marks the turn complete.
   let usage: Usage | undefined;
 
@@ -126,6 +136,9 @@ function parseCodexOutput(stdout: string, model: string): Response {
         const item = asRecord(event.item);
         if (readString(item, "type") === "agent_message") {
           text = readString(item, "text");
+        } else if (readString(item, "type") === "reasoning") {
+          const reasoningText = readString(item, "text");
+          if (reasoningText !== "") reasoning.push(reasoningText);
         }
         break;
       }
@@ -164,7 +177,16 @@ function parseCodexOutput(stdout: string, model: string): Response {
       { providerCode: "missing_final_message" },
     );
   }
-  return { id, model, text, usage, completionReason: "", provider: "openai", flavor: "cli" };
+  const response: Response = {
+    id,
+    model,
+    text,
+    usage,
+    completionReason: "",
+    provider: "openai",
+    flavor: "cli",
+  };
+  return { response, reasoning };
 }
 
 function reportedFailure(providerCode: string, message: string, fallback: string): LLMDriverError {

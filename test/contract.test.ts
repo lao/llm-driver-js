@@ -25,6 +25,10 @@ const PROMPT: GenerateRequest = {
 const DELTAS = ["Hello, ", "world"];
 const TEXT = DELTAS.join("");
 
+/** Reasoning chunks, interleaved with text in each streaming fixture. */
+const REASONING_DELTAS = ["Think", "ing"];
+const REASONING_TEXT = REASONING_DELTAS.join("");
+
 /** Replies with a canned payload; never touches the network. */
 function stubFetch(body: unknown): typeof fetch {
   return async () =>
@@ -118,23 +122,39 @@ const CLAUDE_CLI_STDOUT = JSON.stringify({
 
 const CODEX_CLI_STDOUT = [
   '{"type":"thread.started","thread_id":"thread-1"}',
+  ...REASONING_DELTAS.map(
+    (text) =>
+      `{"type":"item.completed","item":{"type":"reasoning","text":${JSON.stringify(text)}}}`,
+  ),
   `{"type":"item.completed","item":{"type":"agent_message","text":${JSON.stringify(TEXT)}}}`,
   '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5,' +
     '"cached_input_tokens":3,"cache_write_input_tokens":2,"reasoning_output_tokens":1}}',
   "",
 ].join("\n");
 
+/** Pairs each reasoning chunk with the text chunk that follows it, in source order. */
+function interleave<T>(reasoning: (chunk: string) => T, text: (chunk: string) => T): T[] {
+  return REASONING_DELTAS.flatMap((chunk, i) => [reasoning(chunk), text(DELTAS[i] as string)]);
+}
+
 const CLAUDE_API_STREAM = [
   sse("message_start", {
     type: "message_start",
     message: { ...CLAUDE_API_BODY, content: [], stop_reason: null, stop_sequence: null },
   }),
-  ...DELTAS.map((text) =>
-    sse("content_block_delta", {
-      type: "content_block_delta",
-      index: 0,
-      delta: { type: "text_delta", text },
-    }),
+  ...interleave(
+    (thinking) =>
+      sse("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking },
+      }),
+    (text) =>
+      sse("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text },
+      }),
   ),
   sse("message_delta", {
     type: "message_delta",
@@ -145,25 +165,45 @@ const CLAUDE_API_STREAM = [
 ];
 
 const OPENAI_API_STREAM = [
-  ...DELTAS.map((delta) =>
-    sse("response.output_text.delta", {
-      type: "response.output_text.delta",
-      delta,
-      item_id: "msg_123",
-      output_index: 0,
-      content_index: 0,
-      sequence_number: 1,
-    }),
+  ...interleave(
+    (delta) =>
+      sse("response.reasoning_summary_text.delta", {
+        type: "response.reasoning_summary_text.delta",
+        delta,
+        item_id: "rs_123",
+        output_index: 0,
+        summary_index: 0,
+        sequence_number: 1,
+      }),
+    (delta) =>
+      sse("response.output_text.delta", {
+        type: "response.output_text.delta",
+        delta,
+        item_id: "msg_123",
+        output_index: 0,
+        content_index: 0,
+        sequence_number: 1,
+      }),
   ),
   sse("response.completed", { type: "response.completed", response: OPENAI_API_BODY }),
 ];
 
 const CLAUDE_CLI_STREAM = [
-  ...DELTAS.map((text) =>
-    JSON.stringify({
-      type: "stream_event",
-      event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
-    }),
+  ...interleave(
+    (thinking) =>
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "thinking_delta", thinking },
+        },
+      }),
+    (text) =>
+      JSON.stringify({
+        type: "stream_event",
+        event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+      }),
   ),
   CLAUDE_CLI_STDOUT,
 ];
@@ -322,6 +362,29 @@ describe("contract across all four targets", () => {
       expect(done.response.provider).toBe(target.provider);
       expect(done.response.flavor).toBe(target.flavor);
       expect(done.response.model).toBe(target.model);
+    });
+  }
+
+  for (const target of targets) {
+    it(`${target.provider}/${target.flavor} streams reasoning without polluting the text`, async () => {
+      const events: StreamEvent[] = [];
+      for await (const event of target.stream(PROMPT)) events.push(event);
+
+      const reasoning = events
+        .filter((event) => event.type === "reasoning")
+        .map((event) => event.text)
+        .join("");
+      const text = events
+        .filter((event) => event.type === "text")
+        .map((event) => event.text)
+        .join("");
+      const done = events.at(-1);
+      if (done?.type !== "done") throw new Error("unreachable");
+
+      // Reasoning is surfaced in source order and never folds into the text.
+      expect(reasoning).toBe(REASONING_TEXT);
+      expect(text).toBe(done.response.text);
+      expect(done.response.text).not.toContain(REASONING_TEXT);
     });
   }
 

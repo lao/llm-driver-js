@@ -352,6 +352,39 @@ describe("codex cli streaming", () => {
     ]);
   });
 
+  it("maps reasoning items to reasoning events, in source order before the text", async () => {
+    const { runner } = fakeRunner({
+      stdout: [
+        '{"type":"thread.started","thread_id":"thread-123"}',
+        '{"type":"item.completed","item":{"type":"reasoning","text":"Think"}}',
+        '{"type":"item.completed","item":{"type":"reasoning","text":"ing"}}',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"Final answer"}}',
+        '{"type":"turn.completed","usage":{}}',
+      ].join("\n"),
+    });
+
+    const events = await collect(createCodexCliBackend(config, runner).generateStream(request));
+
+    // Coarse turn: reasoning items surface first, then the one text event, then done.
+    expect(events.slice(0, 3)).toEqual([
+      { type: "reasoning", text: "Think" },
+      { type: "reasoning", text: "ing" },
+      { type: "text", text: "Final answer" },
+    ]);
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event");
+    expect(done.response.text).toBe("Final answer");
+  });
+
+  it("emits no reasoning events when the JSONL exposes none", async () => {
+    const { runner } = fakeRunner({ stdout: successStream });
+
+    const events = await collect(createCodexCliBackend(config, runner).generateStream(request));
+
+    // codex reports no reasoning on this turn (matrix ⚠️) — no placeholder events.
+    expect(events.some((event) => event.type === "reasoning")).toBe(false);
+  });
+
   it("emits only the done event when the agent message is empty", async () => {
     const { runner } = fakeRunner({
       stdout: [

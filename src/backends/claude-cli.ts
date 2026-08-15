@@ -92,7 +92,13 @@ export function createClaudeCliBackend(
           result = event;
           continue;
         }
-        const text = partialText(event);
+        const reasoning = partialDelta(event, "thinking_delta", "thinking");
+        if (reasoning !== "") {
+          // Reasoning is surfaced but never folded into `text`.
+          yield { type: "reasoning", text: reasoning };
+          continue;
+        }
+        const text = partialDelta(event, "text_delta", "text");
         if (text !== "") yield { type: "text", text };
       }
 
@@ -106,13 +112,17 @@ export function createClaudeCliBackend(
   };
 }
 
-/** Text carried by a `--include-partial-messages` chunk; `""` for anything else. */
-function partialText(event: Record<string, unknown>): string {
+/**
+ * Text carried by a `--include-partial-messages` content_block_delta chunk of
+ * the given delta type (`text_delta`/`thinking_delta`), reading its `field`
+ * (`text`/`thinking`); `""` for anything else.
+ */
+function partialDelta(event: Record<string, unknown>, deltaType: string, field: string): string {
   if (readString(event, "type") !== "stream_event") return "";
   const inner = asRecord(event.event);
   if (readString(inner, "type") !== "content_block_delta") return "";
   const delta = asRecord(inner.delta);
-  return readString(delta, "type") === "text_delta" ? readString(delta, "text") : "";
+  return readString(delta, "type") === deltaType ? readString(delta, field) : "";
 }
 
 function toResponse(result: Record<string, unknown>, model: string): Response {
