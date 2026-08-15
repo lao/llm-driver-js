@@ -7,6 +7,13 @@ export type Flavor = "api" | "cli";
 /** Author of a {@link Message}. */
 export type Role = "user" | "assistant";
 
+/**
+ * Neutral reasoning-effort level. Mapped per target (see the capability matrix);
+ * levels a provider does not accept are passed through and surface the provider's
+ * own error rather than being rejected by the library.
+ */
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
+
 /** Why generation ended; `""` when the target does not report a reason. */
 export type CompletionReason = "stop" | "max_tokens" | "refusal" | "";
 
@@ -74,6 +81,11 @@ export interface Request {
     /** Stable end-user identifier for abuse monitoring. */
     userId?: string;
   };
+  /**
+   * Reasoning effort, mapped per target. Supported on all four targets; unknown-
+   * to-provider levels surface the provider's error (`api_error`/`process_failed`).
+   */
+  reasoning?: { effort: ReasoningEffort };
 }
 
 /** Token counts reported by a target; unreported counts are `0`. */

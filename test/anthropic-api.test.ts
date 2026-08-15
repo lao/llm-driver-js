@@ -121,6 +121,22 @@ describe("anthropic api backend", () => {
     });
   });
 
+  it("maps reasoning.effort onto output_config", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate({ ...PROMPT, reasoning: { effort: "high" } });
+
+    expect(await (stub.calls[0] as Request).json()).toMatchObject({
+      output_config: { effort: "high" },
+    });
+  });
+
+  it("omits output_config when the request has no reasoning", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate(PROMPT);
+
+    expect(await (stub.calls[0] as Request).json()).not.toHaveProperty("output_config");
+  });
+
   it("omits system when the request has none", async () => {
     const stub = stubFetch(200, MESSAGE);
     await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });

@@ -131,6 +131,14 @@ function toParams(model: string, request: Request): Anthropic.MessageCreateParam
   if (request.metadata?.userId !== undefined) {
     params.metadata = { user_id: request.metadata.userId };
   }
+  if (request.reasoning !== undefined) {
+    // Neutral enum passes through verbatim; the SDK's effort type omits some
+    // neutral levels ("minimal"), so we cast rather than gate — the provider
+    // validates the value (SPEC "Reasoning").
+    params.output_config = {
+      effort: request.reasoning.effort as Anthropic.OutputConfig["effort"],
+    };
+  }
   return params;
 }
 

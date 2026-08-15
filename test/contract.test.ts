@@ -325,6 +325,21 @@ describe("contract across all four targets", () => {
     });
   }
 
+  it("accepts a neutral reasoning request on every target with the same shape", async () => {
+    // reasoning.effort is ✅ on all four targets, so one request runs unmodified
+    // everywhere and normalizes to the identical shape (matrix single source).
+    const reasoningPrompt: GenerateRequest = { ...PROMPT, reasoning: { effort: "medium" } };
+    const responses = await Promise.all(targets.map((target) => target.generate(reasoningPrompt)));
+
+    const shapes = responses.map((response) => ({
+      keys: Object.keys(response).sort(),
+      usageKeys: Object.keys(response.usage).sort(),
+    }));
+    for (const shape of shapes) {
+      expect(shape).toEqual(shapes[0]);
+    }
+  });
+
   it("returns the same field set from every target", async () => {
     const responses = await Promise.all(targets.map((target) => target.generate(PROMPT)));
     const shapes = responses.map((response) => ({

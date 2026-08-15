@@ -129,6 +129,22 @@ describe("openai api backend", () => {
     expect((body.input as Record<string, unknown>[])[0]).not.toHaveProperty("phase");
   });
 
+  it("maps reasoning.effort onto reasoning", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate({ ...PROMPT, reasoning: { effort: "minimal" } });
+
+    expect(await (stub.calls[0] as Request).json()).toMatchObject({
+      reasoning: { effort: "minimal" },
+    });
+  });
+
+  it("omits reasoning when the request has none", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate(PROMPT);
+
+    expect(await (stub.calls[0] as Request).json()).not.toHaveProperty("reasoning");
+  });
+
   it("omits instructions when the request has no system prompt", async () => {
     const stub = stubFetch(200, RESPONSE);
     await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });

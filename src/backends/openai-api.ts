@@ -116,6 +116,9 @@ function toParams(
   if (request.metadata?.userId !== undefined) {
     params.safety_identifier = request.metadata.userId;
   }
+  if (request.reasoning !== undefined) {
+    params.reasoning = { effort: request.reasoning.effort };
+  }
   return params;
 }
 

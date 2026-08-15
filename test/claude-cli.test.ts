@@ -60,6 +60,30 @@ describe("claude cli command", () => {
     expect(calls[0]?.signal).toBe(signal);
   });
 
+  it("passes reasoning.effort as --effort before extra cli args", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+    const backend = createClaudeCliBackend({ ...config, cliArgs: ["--foo"] }, runner);
+
+    await backend.generate({ ...request, reasoning: { effort: "high" } });
+
+    expect(calls[0]?.command.args).toEqual([
+      ...baseArgs,
+      "--model",
+      "claude-test",
+      "--effort",
+      "high",
+      "--foo",
+    ]);
+  });
+
+  it("omits --effort when the request has no reasoning (byte-identical to v1)", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate(request);
+
+    expect(calls[0]?.command.args).toEqual([...baseArgs, "--model", "claude-test"]);
+  });
+
   it("appends the system prompt and extra cli args, and renders the transcript", async () => {
     const { runner, calls } = fakeRunner({ stdout: okStdout });
     const backend = createClaudeCliBackend(

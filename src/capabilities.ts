@@ -46,6 +46,11 @@ export const CAPABILITIES: readonly Capability[] = [
     used: (request) => request.metadata?.userId !== undefined,
     supported: ["claude/api", "openai/api"],
   },
+  {
+    feature: "reasoning.effort",
+    used: (request) => request.reasoning !== undefined,
+    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
+  },
 ];
 
 /**

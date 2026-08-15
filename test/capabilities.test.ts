@@ -93,6 +93,7 @@ const FEATURE_REQUESTS: Record<string, GenerateRequest> = {
   topK: { maxTokens: 8, messages: [user("hi")], topK: 40 },
   stopSequences: { maxTokens: 8, messages: [user("hi")], stopSequences: ["STOP"] },
   "metadata.userId": { maxTokens: 8, messages: [user("hi")], metadata: { userId: "u1" } },
+  "reasoning.effort": { maxTokens: 8, messages: [user("hi")], reasoning: { effort: "low" } },
 };
 
 describe("matrix gate covers every feature × target cell", () => {
@@ -240,6 +241,54 @@ describe("temperature passthrough on api flavors", () => {
 
     expect(await (stub.calls[0] as Request).json()).not.toHaveProperty("temperature");
   });
+});
+
+describe("reasoning.effort validation", () => {
+  const config: Config = { provider: "claude", flavor: "api", model: "m" };
+
+  it.each(["extreme", "", undefined])(
+    "rejects invalid effort %s with invalid_request",
+    async (effort) => {
+      const stub = stubFetch({});
+      const withFetch: Config = { ...config, apiKey: "k", fetch: stub.impl };
+      const client = createClientWithBackend(withFetch, createAnthropicApiBackend(withFetch));
+
+      const error = await client
+        .generate({
+          maxTokens: 8,
+          messages: [user("hi")],
+          reasoning: { effort: effort as never },
+        })
+        .catch((caught) => caught);
+
+      expect(error).toBeInstanceOf(LLMDriverError);
+      expect((error as LLMDriverError).code).toBe("invalid_request");
+      expect(stub.calls).toHaveLength(0);
+    },
+  );
+
+  it.each(["minimal", "low", "medium", "high"] as const)(
+    "accepts the neutral level %s",
+    async (effort) => {
+      const stub = stubFetch({
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        model: "m",
+        content: [{ type: "text", text: "ok" }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      });
+      const withFetch: Config = { ...config, apiKey: "k", fetch: stub.impl };
+      const client = createClientWithBackend(withFetch, createAnthropicApiBackend(withFetch));
+
+      await client.generate({ maxTokens: 8, messages: [user("hi")], reasoning: { effort } });
+
+      expect(await (stub.calls[0] as Request).json()).toMatchObject({
+        output_config: { effort },
+      });
+    },
+  );
 });
 
 describe("sampling param validation", () => {

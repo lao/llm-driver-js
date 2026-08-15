@@ -43,6 +43,26 @@ for (const { provider, envVar } of targets) {
     );
 
     it(
+      "accepts a reasoning.effort request through the real CLI",
+      async () => {
+        // Proves the real binary accepts the mapped flag (claude `--effort`,
+        // codex `-c model_reasoning_effort=`) — the truth fixtures cannot show.
+        const client = createClient({ provider, flavor: "cli", model: model as string });
+
+        const response = await client.generate({
+          system: "Reply with a single word.",
+          messages: [user("Reply with the word: pong")],
+          maxTokens: 64,
+          reasoning: { effort: "low" },
+        });
+
+        expect(response.text.trim()).not.toBe("");
+        expect(response.provider).toBe(provider);
+      },
+      TIMEOUT_MS,
+    );
+
+    it(
       "streams text through the real CLI",
       async () => {
         const client = createClient({ provider, flavor: "cli", model: model as string });

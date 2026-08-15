@@ -8,6 +8,7 @@ export {
   type Flavor,
   type Message,
   type Provider,
+  type ReasoningEffort,
   type Request,
   type Response,
   type Role,
