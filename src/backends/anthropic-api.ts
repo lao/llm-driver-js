@@ -1,6 +1,6 @@
 import Anthropic, { AnthropicError, APIConnectionError, APIError } from "@anthropic-ai/sdk";
 import { LLMDriverError } from "../errors.js";
-import type { CompletionReason, Config, JsonSchema, Request, Response } from "../types.js";
+import type { CompletionReason, Config, JsonSchema, Message, Request, Response } from "../types.js";
 import type { Backend } from "./backend.js";
 
 const CONTEXT = { provider: "claude", flavor: "api", operation: "generate" } as const;
@@ -122,7 +122,7 @@ function toParams(model: string, request: Request): Anthropic.MessageCreateParam
     max_tokens: request.maxTokens,
     messages: request.messages.map((message) => ({
       role: message.role,
-      content: [{ type: "text", text: message.text }],
+      content: toContent(message),
     })),
   };
   if (request.system) {
@@ -159,6 +159,34 @@ function toParams(model: string, request: Request): Anthropic.MessageCreateParam
     };
   }
   return params;
+}
+
+/**
+ * Maps a message onto Anthropic content blocks. Text-only messages keep their
+ * v1 single-text-block shape byte-for-byte.
+ */
+function toContent(message: Message): Anthropic.ContentBlockParam[] {
+  if (message.content === undefined) {
+    return [{ type: "text", text: message.text ?? "" }];
+  }
+  return message.content.map((block): Anthropic.ContentBlockParam => {
+    if (block.type === "text") {
+      return { type: "text", text: block.text };
+    }
+    if (block.type === "document") {
+      return {
+        type: "document",
+        source: { type: "base64", media_type: "application/pdf", data: block.source.base64 },
+      };
+    }
+    if ("url" in block.source) {
+      return { type: "image", source: { type: "url", url: block.source.url } };
+    }
+    return {
+      type: "image",
+      source: { type: "base64", media_type: block.source.mediaType, data: block.source.base64 },
+    };
+  });
 }
 
 function toResponse(message: Anthropic.Message, outputSchema?: JsonSchema): Response {

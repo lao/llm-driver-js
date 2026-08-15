@@ -7,7 +7,7 @@ import { createOpenAiApiBackend } from "../src/backends/openai-api.js";
 import { assertSupported, CAPABILITIES, type Target } from "../src/capabilities.js";
 import { createClientWithBackend } from "../src/client.js";
 import { LLMDriverError } from "../src/errors.js";
-import type { Config, Request as GenerateRequest } from "../src/types.js";
+import type { Config, ContentBlock, Request as GenerateRequest } from "../src/types.js";
 import { user } from "../src/types.js";
 
 const REQUEST: GenerateRequest = { maxTokens: 32, messages: [user("Hello")], temperature: 0.7 };
@@ -95,6 +95,14 @@ const FEATURE_REQUESTS: Record<string, GenerateRequest> = {
   "metadata.userId": { maxTokens: 8, messages: [user("hi")], metadata: { userId: "u1" } },
   "reasoning.effort": { maxTokens: 8, messages: [user("hi")], reasoning: { effort: "low" } },
   outputSchema: { maxTokens: 8, messages: [user("hi")], outputSchema: { type: "object" } },
+  "image input": {
+    maxTokens: 8,
+    messages: [user([{ type: "image", source: { base64: "x", mediaType: "image/png" } }])],
+  },
+  "document input": {
+    maxTokens: 8,
+    messages: [user([{ type: "document", source: { base64: "x", mediaType: "application/pdf" } }])],
+  },
 };
 
 describe("matrix gate covers every feature × target cell", () => {
@@ -127,6 +135,46 @@ describe("matrix gate covers every feature × target cell", () => {
     const err = error as LLMDriverError;
     expect(err.code).toBe("unsupported_feature");
     expect(err.message).toContain(capability.feature);
+    expect(err.message).toContain(target);
+  });
+});
+
+describe("image and document gate", () => {
+  const IMAGE: ContentBlock = { type: "image", source: { base64: "x", mediaType: "image/png" } };
+  const DOCUMENT: ContentBlock = {
+    type: "document",
+    source: { base64: "x", mediaType: "application/pdf" },
+  };
+  const request = (block: ContentBlock): GenerateRequest => ({
+    maxTokens: 32,
+    messages: [user([block])],
+  });
+
+  it.each([
+    ["image input", IMAGE],
+    ["document input", DOCUMENT],
+  ] as const)("does not throw for %s on either api target", (_feature, block) => {
+    expect(() => assertSupported(request(block), CONFIGS["claude/api"])).not.toThrow();
+    expect(() => assertSupported(request(block), CONFIGS["openai/api"])).not.toThrow();
+  });
+
+  it.each([
+    ["image input", IMAGE, "claude/cli"],
+    ["image input", IMAGE, "openai/cli"],
+    ["document input", DOCUMENT, "claude/cli"],
+    ["document input", DOCUMENT, "openai/cli"],
+  ] as const)("throws unsupported_feature for %s on %s", (feature, block, target) => {
+    const error = (() => {
+      try {
+        assertSupported(request(block), CONFIGS[target]);
+      } catch (caught) {
+        return caught;
+      }
+    })();
+    expect(error).toBeInstanceOf(LLMDriverError);
+    const err = error as LLMDriverError;
+    expect(err.code).toBe("unsupported_feature");
+    expect(err.message).toContain(feature);
     expect(err.message).toContain(target);
   });
 });

@@ -6,7 +6,7 @@ import { createOpenAiApiBackend } from "./backends/openai-api.js";
 import { assertSupported } from "./capabilities.js";
 import { validateConfig } from "./config.js";
 import { LLMDriverError } from "./errors.js";
-import type { Client, Config, ReasoningEffort, Request, Response } from "./types.js";
+import type { Client, Config, Message, ReasoningEffort, Request, Response } from "./types.js";
 
 /** Neutral reasoning-effort levels; validated here, mapped per target in adapters. */
 const REASONING_EFFORTS: readonly ReasoningEffort[] = ["minimal", "low", "medium", "high"];
@@ -122,12 +122,66 @@ export function validateRequest(request: Request, config: Config): void {
     if (message?.role !== "user" && message?.role !== "assistant") {
       throw invalid(config, `message ${index} has invalid role "${message?.role}"`);
     }
-    if (typeof message.text !== "string" || message.text.trim() === "") {
-      throw invalid(config, `message ${index} text is required`);
-    }
+    validateContent(message, index, config);
   }
   // Strict portability gate: reject any feature this target cannot honor.
   assertSupported(request, config);
+}
+
+const IMAGE_MEDIA_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/** Enforces the `text` XOR `content` invariant and every block's well-formedness. */
+function validateContent(message: Message, index: number, config: Config): void {
+  const hasText = message.text !== undefined;
+  const hasContent = message.content !== undefined;
+  if (hasText === hasContent) {
+    throw invalid(config, `message ${index} must have exactly one of text or content`);
+  }
+  if (hasText) {
+    if (typeof message.text !== "string" || message.text.trim() === "") {
+      throw invalid(config, `message ${index} text is required`);
+    }
+    return;
+  }
+  if (!Array.isArray(message.content) || message.content.length === 0) {
+    throw invalid(config, `message ${index} content must be a non-empty array`);
+  }
+  for (const [blockIndex, block] of message.content.entries()) {
+    validateBlock(block, index, blockIndex, config);
+  }
+}
+
+/** Rejects a malformed content block, naming the message and block index. */
+function validateBlock(block: unknown, index: number, blockIndex: number, config: Config): void {
+  const bad = (why: string): never => {
+    throw invalid(config, `message ${index} content block ${blockIndex} ${why}`);
+  };
+  if (typeof block !== "object" || block === null) bad("must be an object");
+  const { type, text, source } = block as {
+    type?: unknown;
+    text?: unknown;
+    source?: Record<string, unknown>;
+  };
+  if (type === "text") {
+    if (typeof text !== "string" || text === "") bad("text must be a non-empty string");
+    return;
+  }
+  if (type === "image") {
+    if (typeof source !== "object" || source === null) bad("image source must be an object");
+    const s = source as Record<string, unknown>;
+    if (typeof s.url === "string") return;
+    if (typeof s.base64 !== "string" || s.base64 === "") bad("image source needs base64 or url");
+    if (!IMAGE_MEDIA_TYPES.includes(s.mediaType as string)) bad("image mediaType is invalid");
+    return;
+  }
+  if (type === "document") {
+    if (typeof source !== "object" || source === null) bad("document source must be an object");
+    const s = source as Record<string, unknown>;
+    if (typeof s.base64 !== "string" || s.base64 === "") bad("document source needs base64");
+    if (s.mediaType !== "application/pdf") bad("document mediaType must be application/pdf");
+    return;
+  }
+  bad(`has unknown type "${String(type)}"`);
 }
 
 function invalid(config: Config, message: string): LLMDriverError {

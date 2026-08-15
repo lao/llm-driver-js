@@ -50,10 +50,17 @@ export interface Config {
   maxRetries?: number;
 }
 
-/** One text turn in a generation request. */
+/**
+ * One turn in a generation request. Carries either plain `text` or a `content`
+ * block array — exactly one, enforced at validation time. String-only messages
+ * (`{ role, text }`) are unchanged from v1.
+ */
 export interface Message {
   role: Role;
-  text: string;
+  /** Plain text turn. Mutually exclusive with {@link Message.content}. */
+  text?: string;
+  /** Structured content blocks. Mutually exclusive with {@link Message.text}. */
+  content?: ContentBlock[];
 }
 
 /**
@@ -74,6 +81,22 @@ export interface ToolCallRecord {
   output: ToolOutput;
   isError: boolean;
 }
+
+/** Media types accepted for an image content block. */
+export type ImageMediaType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+
+/**
+ * One block of a {@link Message}'s content. `document` blocks are honored on API
+ * flavors only; `image` blocks are honored on API flavors (CLI support lands
+ * later). Unsupported blocks throw `unsupported_feature` before any transport.
+ */
+export type ContentBlock =
+  | { type: "text"; text: string }
+  | {
+      type: "image";
+      source: { base64: string; mediaType: ImageMediaType } | { url: string };
+    }
+  | { type: "document"; source: { base64: string; mediaType: "application/pdf" } };
 
 /** Provider-neutral text generation request. */
 export interface Request {
@@ -178,12 +201,20 @@ export interface Client {
   generateStream(request: Request, options?: { signal?: AbortSignal }): AsyncIterable<StreamEvent>;
 }
 
-/** Builds a user-role text message. */
-export function user(text: string): Message {
-  return { role: "user", text };
+/** Builds a user-role message from plain text or content blocks. */
+export function user(text: string): Message;
+export function user(content: ContentBlock[]): Message;
+export function user(input: string | ContentBlock[]): Message {
+  return typeof input === "string"
+    ? { role: "user", text: input }
+    : { role: "user", content: input };
 }
 
-/** Builds an assistant-role text message. */
-export function assistant(text: string): Message {
-  return { role: "assistant", text };
+/** Builds an assistant-role message from plain text or content blocks. */
+export function assistant(text: string): Message;
+export function assistant(content: ContentBlock[]): Message;
+export function assistant(input: string | ContentBlock[]): Message {
+  return typeof input === "string"
+    ? { role: "assistant", text: input }
+    : { role: "assistant", content: input };
 }

@@ -57,7 +57,23 @@ export const CAPABILITIES: readonly Capability[] = [
     used: (request) => request.outputSchema !== undefined,
     supported: ["claude/api", "openai/api"],
   },
+  {
+    // CLI image support lands in later tasks; ❌ on both CLI targets for now.
+    feature: "image input",
+    used: (request) => hasBlock(request, "image"),
+    supported: ["claude/api", "openai/api"],
+  },
+  {
+    feature: "document input",
+    used: (request) => hasBlock(request, "document"),
+    supported: ["claude/api", "openai/api"],
+  },
 ];
+
+/** True when any message carries a content block of the given type. */
+function hasBlock(request: Request, type: string): boolean {
+  return request.messages.some((message) => message.content?.some((block) => block.type === type));
+}
 
 /**
  * Throws `unsupported_feature` for any request feature the selected target cannot

@@ -3,6 +3,7 @@ import { createClaudeCliBackend } from "../src/backends/claude-cli.js";
 import type { CommandResult, CommandRunner, StreamingCommandRunner } from "../src/backends/cli.js";
 import { createCodexCliBackend } from "../src/backends/codex-cli.js";
 import { createClient, createClientWithBackend } from "../src/client.js";
+import { LLMDriverError } from "../src/errors.js";
 import {
   assistant,
   type Config,
@@ -403,6 +404,35 @@ describe("contract across all four targets", () => {
       expect(shape).toEqual(shapes[0]);
     }
   });
+
+  // Images are honored on the API targets only in this task; CLI cells flip
+  // later (T8/T9). One neutral image fixture proves both halves of the matrix.
+  const IMAGE_PROMPT: GenerateRequest = {
+    maxTokens: 64,
+    messages: [
+      user([
+        { type: "text", text: "describe" },
+        { type: "image", source: { base64: "aGVsbG8=", mediaType: "image/png" } },
+      ]),
+    ],
+  };
+
+  for (const target of targets.filter((t) => t.flavor === "api")) {
+    it(`${target.provider}/${target.flavor} accepts an image request`, async () => {
+      const response = await target.generate(IMAGE_PROMPT);
+      expect(response.text).toBe(TEXT);
+      expect(response.provider).toBe(target.provider);
+      expect(response.flavor).toBe(target.flavor);
+    });
+  }
+
+  for (const target of targets.filter((t) => t.flavor === "cli")) {
+    it(`${target.provider}/${target.flavor} rejects an image request as unsupported`, async () => {
+      const error = await target.generate(IMAGE_PROMPT).catch((caught) => caught);
+      expect(error).toBeInstanceOf(LLMDriverError);
+      expect((error as LLMDriverError).code).toBe("unsupported_feature");
+    });
+  }
 
   it("returns the same field set from every target", async () => {
     const responses = await Promise.all(targets.map((target) => target.generate(PROMPT)));
