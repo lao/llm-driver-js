@@ -105,18 +105,29 @@ function stubStreamRunner(lines: string[]): StreamingCommandRunner {
   };
 }
 
-/** Plays the claude CLI: calls the live MCP bridge named in the argv over HTTP. */
+/** Reads the loopback bridge URL out of either CLI's argv (claude or codex). */
+function bridgeUrl(command: Command): string {
+  const configIndex = command.args.indexOf("--mcp-config");
+  if (configIndex >= 0) {
+    const { mcpServers } = JSON.parse(command.args[configIndex + 1] as string) as {
+      mcpServers: { llmdriver: { url: string } };
+    };
+    return mcpServers.llmdriver.url;
+  }
+  // codex: `-c mcp_servers.llmdriver.url="http://..."`
+  const cIndex = command.args.indexOf("-c");
+  const override = command.args[cIndex + 1] as string;
+  return JSON.parse(override.slice(override.indexOf("=") + 1)) as string;
+}
+
+/** Plays a CLI: calls the live MCP bridge named in the argv over HTTP. */
 async function bridgeCall(
   command: Command,
   id: string,
   name: string,
   args: unknown,
 ): Promise<void> {
-  const configIndex = command.args.indexOf("--mcp-config");
-  const { mcpServers } = JSON.parse(command.args[configIndex + 1] as string) as {
-    mcpServers: { llmdriver: { url: string } };
-  };
-  await fetch(mcpServers.llmdriver.url, {
+  await fetch(bridgeUrl(command), {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json" },
     body: JSON.stringify({
@@ -499,11 +510,12 @@ describe("contract across all four targets", () => {
     });
   }
 
-  it("runs the tool loop to the same toolCalls and text on both api targets", async () => {
-    // One neutral tool request, sent to both api flavors. Provider wire shapes
-    // differ (Messages tool_use vs Responses function_call) but the normalized
-    // toolCalls records and final text must be identical. Shared call id + input
-    // make the records comparable across providers.
+  it("runs the tool loop to the same toolCalls and text on all four targets", async () => {
+    // One neutral tool request, sent to every target. Provider wire shapes differ
+    // (Messages tool_use vs Responses function_call vs the CLI MCP bridge) but the
+    // normalized toolCalls records and final text must be identical. Shared call id
+    // + input make the records comparable across providers. This is the plan's
+    // headline success criterion.
     const request: GenerateRequest = {
       maxTokens: 64,
       messages: [user("look it up")],
@@ -595,10 +607,29 @@ describe("contract across all four targets", () => {
       createClaudeCliBackend(CLAUDE_CLI_CONFIG, cliRunner),
     );
 
-    const [claudeResponse, openaiResponse, cliResponse] = await Promise.all([
+    // codex/cli reaches the identical record through the same MCP bridge: the
+    // fake runner plays codex, calling the live loopback bridge over HTTP with
+    // the shared call id, then returns the final JSONL turn.
+    const codexResult = [
+      '{"type":"thread.started","thread_id":"thread-1"}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"the value is 42"}}',
+      '{"type":"turn.completed","usage":{}}',
+      "",
+    ].join("\n");
+    const codexRunner: CommandRunner = async (command) => {
+      await bridgeCall(command, "tc_1", "lookup", { q: "x" });
+      return { stdout: codexResult, stderr: "", exitCode: 0 };
+    };
+    const codex = createClientWithBackend(
+      CODEX_CLI_CONFIG,
+      createCodexCliBackend(CODEX_CLI_CONFIG, codexRunner),
+    );
+
+    const [claudeResponse, openaiResponse, cliResponse, codexResponse] = await Promise.all([
       claude.generate(request),
       openai.generate(request),
       cli.generate(request),
+      codex.generate(request),
     ]);
 
     const expectedToolCalls = [
@@ -610,14 +641,10 @@ describe("contract across all four targets", () => {
         isError: false,
       },
     ];
-    expect(claudeResponse.toolCalls).toEqual(expectedToolCalls);
-    expect(openaiResponse.toolCalls).toEqual(expectedToolCalls);
-    expect(cliResponse.toolCalls).toEqual(expectedToolCalls);
-    expect(claudeResponse.toolCalls).toEqual(openaiResponse.toolCalls);
-    expect(cliResponse.toolCalls).toEqual(openaiResponse.toolCalls);
-    expect(claudeResponse.text).toBe("the value is 42");
-    expect(openaiResponse.text).toBe("the value is 42");
-    expect(cliResponse.text).toBe("the value is 42");
+    for (const response of [claudeResponse, openaiResponse, cliResponse, codexResponse]) {
+      expect(response.toolCalls).toEqual(expectedToolCalls);
+      expect(response.text).toBe("the value is 42");
+    }
   });
 
   it("streams the same tool event ordering on both api targets", async () => {

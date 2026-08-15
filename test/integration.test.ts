@@ -143,6 +143,48 @@ describe.skipIf(!process.env.LLMWRAPPER_CLAUDE_CLI_MODEL)("claude cli tools via 
 });
 
 /**
+ * Real `codex exec` running a client tool through the MCP bridge. Also the sole
+ * confirmation of the `-c mcp_servers.llmdriver.url=` streamable-HTTP key syntax
+ * (SPEC-v2 open question 4) against the real codex 0.147 binary: if codex ignores
+ * the override or needs stdio-only MCP, this test fails and the argv needs a fix.
+ */
+describe.skipIf(!process.env.LLMWRAPPER_CODEX_CLI_MODEL)("codex cli tools via bridge", () => {
+  it(
+    "calls a trivial in-process tool and records the call",
+    async () => {
+      const model = process.env.LLMWRAPPER_CODEX_CLI_MODEL as string;
+      const client = createClient({ provider: "openai", flavor: "cli", model });
+
+      let called = false;
+      const response = await client.generate({
+        messages: [
+          user(
+            "Call the secret_number tool with no arguments and reply with exactly the number it returns.",
+          ),
+        ],
+        maxTokens: 512,
+        tools: [
+          {
+            name: "secret_number",
+            description: "Returns the secret number. Call it to learn the secret.",
+            inputSchema: { type: "object", properties: {} },
+            execute: () => {
+              called = true;
+              return "1729";
+            },
+          },
+        ],
+      });
+
+      expect(called).toBe(true);
+      expect(response.toolCalls.map((call) => call.name)).toContain("secret_number");
+      expect(response.text).toContain("1729");
+    },
+    TIMEOUT_MS,
+  );
+});
+
+/**
  * Characterization, not a contract assertion: `claude -p` is an agent, so a turn
  * that runs tools streams deltas for every assistant message while
  * `done.response` comes from the final `result` event alone. The concatenation

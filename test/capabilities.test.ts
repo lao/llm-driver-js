@@ -204,15 +204,16 @@ describe("tools + toolChoice gate", () => {
     expect(() => assertSupported(toolChoiceReq, CONFIGS[target])).not.toThrow();
   });
 
-  it("does not throw for tools on claude/cli (MCP bridge)", () => {
-    expect(() => assertSupported(toolsReq, CONFIGS["claude/cli"])).not.toThrow();
-  });
+  it.each(["claude/cli", "openai/cli"] as const)(
+    "does not throw for tools on %s (MCP bridge)",
+    (target) => {
+      expect(() => assertSupported(toolsReq, CONFIGS[target])).not.toThrow();
+    },
+  );
 
-  // `tools` is supported on claude/cli via the bridge; codex/cli lands in T15.
-  it.each([
-    ["tools", toolsReq, ["openai/cli"]],
-    ["toolChoice", toolChoiceReq, ["claude/cli", "openai/cli"]],
-  ] as const)(
+  // `tools` is supported on both cli flavors via the bridge; `toolChoice` is not
+  // (the CLI decides when to call).
+  it.each([["toolChoice", toolChoiceReq, ["claude/cli", "openai/cli"]]] as const)(
     "throws unsupported_feature for %s on its unsupported cli targets",
     (feature, req, unsupported) => {
       for (const target of unsupported) {

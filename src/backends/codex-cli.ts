@@ -1,5 +1,5 @@
 import { LLMDriverError } from "../errors.js";
-import type { Config, Request, Response, Usage } from "../types.js";
+import type { Config, Request, Response, StreamEvent, ToolCallRecord, Usage } from "../types.js";
 import type { Backend } from "./backend.js";
 import {
   asRecord,
@@ -13,6 +13,7 @@ import {
   renderTranscript,
   spawnRunner,
 } from "./cli.js";
+import { type McpBridge, start as startBridge } from "./mcp-bridge.js";
 
 /**
  * Local `codex exec` process backend (`openai`/`cli`).
@@ -30,7 +31,7 @@ export function createCodexCliBackend(
   const executable = config.cliPath ?? "codex";
   const extraArgs = config.cliArgs ?? [];
 
-  const buildCommand = (request: Request): Command => {
+  const buildCommand = (request: Request, bridge?: McpBridge): Command => {
     const args = [
       "exec",
       "--json",
@@ -47,24 +48,52 @@ export function createCodexCliBackend(
       // TOML string value, so the level is quoted (matches the developer_instructions form).
       args.push("-c", `model_reasoning_effort=${JSON.stringify(request.reasoning.effort)}`);
     }
+    if (bridge) {
+      // Inject the caller's tools into codex's own agentic loop as a
+      // streamable-HTTP MCP server (codex 0.147). Codex has no `--strict-mcp-config`
+      // equivalent, and read-only sandbox needs no per-tool pre-allow.
+      //
+      // FLAG (SPEC-v2 open question 4): the exact `-c mcp_servers.*` dotted-key
+      // syntax for a streamable-HTTP transport is only truly confirmable against
+      // the real binary — encoded here per SPEC as best knowledge and
+      // characterized by the env-gated integration test.
+      args.push("-c", `mcp_servers.llmdriver.url=${JSON.stringify(bridge.url)}`);
+    }
     args.push(...extraArgs, "-");
     return { executable, args, stdin: renderTranscript(request.messages) };
   };
 
+  /** Starts the tool bridge when the request has tools, else nothing to run. */
+  const openBridge = (
+    request: Request,
+    signal: AbortSignal | undefined,
+    onCall?: (record: ToolCallRecord) => void,
+  ): Promise<McpBridge> | undefined => {
+    const tools = request.tools ?? [];
+    return tools.length > 0 ? startBridge(tools, { signal, onCall }) : undefined;
+  };
+
+  /** Runs the subprocess with the bridge open, tearing it down on every exit. */
   const run = async (
     request: Request,
     signal?: AbortSignal,
+    onCall?: (record: ToolCallRecord) => void,
   ): Promise<{ response: Response; reasoning: string[] }> => {
-    const command = buildCommand(request);
-    const { stdout, failure } = await executeCli(
-      "openai",
-      command,
-      runner,
-      signal,
-      config.timeoutMs,
-    );
-    if (failure) throw preferReportedFailure(failure, stdout, config.model);
-    return parseCodexOutput(stdout, config.model);
+    const bridge = await openBridge(request, signal, onCall);
+    try {
+      const command = buildCommand(request, bridge);
+      const { stdout, failure } = await executeCli(
+        "openai",
+        command,
+        runner,
+        signal,
+        config.timeoutMs,
+      );
+      if (failure) throw preferReportedFailure(failure, stdout, config.model);
+      return parseCodexOutput(stdout, config.model, bridge?.records ?? []);
+    } finally {
+      await bridge?.close();
+    }
   };
 
   return {
@@ -72,15 +101,28 @@ export function createCodexCliBackend(
 
     /**
      * Coarse by design: `codex exec --json` reports completed items only — no
-     * text deltas — so text arrives as one event after the turn ends. Reasoning
-     * items, when the JSONL exposes them, are surfaced (in source order, before
-     * the final text) and never fold into `response.text`; codex reports none on
-     * many turns, in which case none are emitted (matrix ⚠️).
+     * text deltas — so the whole turn arrives at once. Reasoning items, when the
+     * JSONL exposes them, are surfaced (in source order, before the final text)
+     * and never fold into `response.text`; codex reports none on many turns, in
+     * which case none are emitted (matrix ⚠️). Any tool calls made mid-turn are
+     * buffered via the bridge's `onCall` and flushed as `tool_call`/`tool_result`
+     * events (all before `done`), then the final text.
      * TODO: switch to real deltas if `codex exec --json` ever documents them.
      */
     async *generateStream(request, signal) {
-      const { response, reasoning } = await run(request, signal);
+      const pending: StreamEvent[] = [];
+      const { response, reasoning } = await run(request, signal, (record) => {
+        pending.push({ type: "tool_call", id: record.id, name: record.name, input: record.input });
+        pending.push({
+          type: "tool_result",
+          id: record.id,
+          name: record.name,
+          output: record.output,
+          isError: record.isError,
+        });
+      });
       for (const text of reasoning) yield { type: "reasoning", text };
+      for (const event of pending) yield event;
       if (response.text !== "") yield { type: "text", text: response.text };
       yield { type: "done", response };
     },
@@ -117,6 +159,7 @@ function preferReportedFailure(
 function parseCodexOutput(
   stdout: string,
   model: string,
+  toolCalls: ToolCallRecord[] = [],
 ): { response: Response; reasoning: string[] } {
   let id = "";
   let text: string | undefined;
@@ -185,7 +228,7 @@ function parseCodexOutput(
     completionReason: "",
     provider: "openai",
     flavor: "cli",
-    toolCalls: [],
+    toolCalls,
   };
   return { response, reasoning };
 }

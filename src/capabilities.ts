@@ -69,10 +69,10 @@ export const CAPABILITIES: readonly Capability[] = [
     supported: ["claude/api", "openai/api"],
   },
   {
-    // claude/cli goes through the MCP bridge; codex/cli lands in T15.
+    // Both cli flavors inject caller tools into the CLI's own loop via the MCP bridge.
     feature: "tools",
     used: (request) => Array.isArray(request.tools) && request.tools.length > 0,
-    supported: ["claude/api", "openai/api", "claude/cli"],
+    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
   },
   {
     feature: "toolChoice",
