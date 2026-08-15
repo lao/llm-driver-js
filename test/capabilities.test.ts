@@ -204,23 +204,31 @@ describe("tools + toolChoice gate", () => {
     expect(() => assertSupported(toolChoiceReq, CONFIGS[target])).not.toThrow();
   });
 
-  it.each([
-    ["tools", toolsReq],
-    ["toolChoice", toolChoiceReq],
-  ] as const)("throws unsupported_feature for %s on both cli targets", (feature, req) => {
-    for (const target of ["claude/cli", "openai/cli"] as const) {
-      let error: unknown;
-      try {
-        assertSupported(req, CONFIGS[target]);
-      } catch (caught) {
-        error = caught;
-      }
-      expect(error).toBeInstanceOf(LLMDriverError);
-      expect((error as LLMDriverError).code).toBe("unsupported_feature");
-      expect((error as LLMDriverError).message).toContain(feature);
-      expect((error as LLMDriverError).message).toContain(target);
-    }
+  it("does not throw for tools on claude/cli (MCP bridge)", () => {
+    expect(() => assertSupported(toolsReq, CONFIGS["claude/cli"])).not.toThrow();
   });
+
+  // `tools` is supported on claude/cli via the bridge; codex/cli lands in T15.
+  it.each([
+    ["tools", toolsReq, ["openai/cli"]],
+    ["toolChoice", toolChoiceReq, ["claude/cli", "openai/cli"]],
+  ] as const)(
+    "throws unsupported_feature for %s on its unsupported cli targets",
+    (feature, req, unsupported) => {
+      for (const target of unsupported) {
+        let error: unknown;
+        try {
+          assertSupported(req, CONFIGS[target]);
+        } catch (caught) {
+          error = caught;
+        }
+        expect(error).toBeInstanceOf(LLMDriverError);
+        expect((error as LLMDriverError).code).toBe("unsupported_feature");
+        expect((error as LLMDriverError).message).toContain(feature);
+        expect((error as LLMDriverError).message).toContain(target);
+      }
+    },
+  );
 });
 
 describe("temperature on cli flavors", () => {

@@ -544,3 +544,209 @@ describe("claude cli streaming failures", () => {
     await expect(collect(backend.generateStream(request, controller.signal))).rejects.toBe(reason);
   });
 });
+
+// ── Tools via the MCP bridge (T14) ─────────────────────────────────────────
+// These drive the REAL loopback bridge: the fake runner reads the bridge URL
+// out of the argv it is handed and plays the CLI, calling the bridge over HTTP.
+
+const toolsRequest: Request = {
+  maxTokens: 32,
+  messages: [user("add 1 and 2")],
+  tools: [
+    {
+      name: "add",
+      description: "adds two numbers",
+      inputSchema: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } } },
+      execute: (input) => `sum:${JSON.stringify(input)}`,
+    },
+    {
+      name: "mul",
+      description: "multiplies two numbers",
+      inputSchema: { type: "object" },
+      execute: () => "0",
+    },
+  ],
+};
+
+/** Extracts the bridge URL the adapter wrote into `--mcp-config`. */
+function bridgeUrl(command: Command): string {
+  const index = command.args.indexOf("--mcp-config");
+  const parsed = JSON.parse(command.args[index + 1] as string) as {
+    mcpServers: { llmdriver: { url: string } };
+  };
+  return parsed.mcpServers.llmdriver.url;
+}
+
+/** One JSON-RPC call to the live bridge; rejects if the bridge is closed. */
+async function rpc(url: string, method: string, params?: unknown): Promise<Response> {
+  return fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+}
+
+const okStdout = '{"type":"result","subtype":"success","result":"ok"}';
+
+describe("claude cli tools argv", () => {
+  it("adds --mcp-config (parsed), --strict-mcp-config, and one --allowedTools per tool", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate(toolsRequest);
+
+    const args = calls[0]?.command.args ?? [];
+    expect(args).toContain("--strict-mcp-config");
+
+    const configIndex = args.indexOf("--mcp-config");
+    expect(configIndex).toBeGreaterThanOrEqual(0);
+    const parsed = JSON.parse(args[configIndex + 1] as string);
+    expect(parsed).toEqual({
+      mcpServers: {
+        llmdriver: {
+          type: "http",
+          url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/[0-9a-f-]{36}$/),
+        },
+      },
+    });
+
+    const allowed = args.filter((_arg, i) => args[i - 1] === "--allowedTools");
+    expect(allowed).toEqual(["mcp__llmdriver__add", "mcp__llmdriver__mul"]);
+  });
+
+  it("keeps the v1 argv untouched when the request carries no tools", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate(request);
+
+    const args = calls[0]?.command.args ?? [];
+    expect(args).not.toContain("--mcp-config");
+    expect(args).not.toContain("--strict-mcp-config");
+    expect(args).not.toContain("--allowedTools");
+  });
+});
+
+describe("claude cli tools bridge lifecycle", () => {
+  it("keeps the bridge reachable during the run, then closes it on resolve", async () => {
+    let url = "";
+    let statusDuringRun = 0;
+    const runner: CommandRunner = async (command) => {
+      url = bridgeUrl(command);
+      statusDuringRun = (await rpc(url, "tools/list")).status;
+      return { stdout: okStdout, stderr: "", exitCode: 0 };
+    };
+
+    await createClaudeCliBackend(config, runner).generate(toolsRequest);
+
+    expect(statusDuringRun).toBe(200);
+    await expect(rpc(url, "tools/list")).rejects.toThrow(); // connection refused after close
+  });
+
+  it("closes the bridge when the run fails", async () => {
+    let url = "";
+    const runner: CommandRunner = async (command) => {
+      url = bridgeUrl(command);
+      return { stdout: "", stderr: "boom\n", exitCode: 1 };
+    };
+
+    await expect(
+      createClaudeCliBackend(config, runner).generate(toolsRequest),
+    ).rejects.toBeInstanceOf(LLMDriverError);
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+
+  it("closes the bridge when the run aborts", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    let url = "";
+    const runner: CommandRunner = async (command, signal) => {
+      url = bridgeUrl(command);
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+
+    await expect(
+      createClaudeCliBackend(config, runner).generate(toolsRequest, controller.signal),
+    ).rejects.toBe(reason);
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+
+  it("closes the bridge when the consumer breaks early", async () => {
+    let url = "";
+    const runner: StreamingCommandRunner = async function* (command) {
+      url = bridgeUrl(command);
+      yield { type: "line", line: delta("Hello") };
+      yield { type: "line", line: resultLine };
+      yield { type: "exit", exitCode: 0, stderr: "" };
+    };
+    const backend = createClaudeCliBackend(config, neverSpawn, runner);
+
+    for await (const _event of backend.generateStream(toolsRequest)) break;
+
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+});
+
+describe("claude cli tools round-trip", () => {
+  it("populates response.toolCalls from a mid-turn tool call (generate)", async () => {
+    const runner: CommandRunner = async (command) => {
+      await rpc(bridgeUrl(command), "tools/call", { name: "add", arguments: { a: 1, b: 2 } });
+      return { stdout: okStdout, stderr: "", exitCode: 0 };
+    };
+
+    const response = await createClaudeCliBackend(config, runner).generate(toolsRequest);
+
+    expect(response.toolCalls).toEqual([
+      {
+        id: expect.any(String),
+        name: "add",
+        input: { a: 1, b: 2 },
+        output: { text: 'sum:{"a":1,"b":2}', isError: false },
+        isError: false,
+      },
+    ]);
+  });
+
+  it("emits tool_call before tool_result and lands them in the done response (stream)", async () => {
+    const runner: StreamingCommandRunner = async function* (command) {
+      const url = bridgeUrl(command);
+      yield { type: "line", line: delta("Let me add. ") };
+      await rpc(url, "tools/call", { name: "add", arguments: { a: 1, b: 2 } });
+      yield { type: "line", line: delta("The sum is 3.") };
+      yield { type: "line", line: resultLine };
+      yield { type: "exit", exitCode: 0, stderr: "" };
+    };
+    const backend = createClaudeCliBackend(config, neverSpawn, runner);
+
+    const events = await collect(backend.generateStream(toolsRequest));
+
+    const callAt = events.findIndex((event) => event.type === "tool_call");
+    const resultAt = events.findIndex((event) => event.type === "tool_result");
+    expect(callAt).toBeGreaterThanOrEqual(0);
+    expect(callAt).toBeLessThan(resultAt);
+    const call = events[callAt];
+    const toolResult = events[resultAt];
+    if (call?.type !== "tool_call" || toolResult?.type !== "tool_result") {
+      throw new Error("unreachable");
+    }
+    expect(call).toMatchObject({ name: "add", input: { a: 1, b: 2 } });
+    expect(toolResult).toMatchObject({
+      id: call.id,
+      name: "add",
+      output: { text: 'sum:{"a":1,"b":2}', isError: false },
+      isError: false,
+    });
+
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event last");
+    expect(events.filter((event) => event.type === "done")).toHaveLength(1);
+    expect(done.response.toolCalls).toEqual([
+      {
+        id: call.id,
+        name: "add",
+        input: { a: 1, b: 2 },
+        output: { text: 'sum:{"a":1,"b":2}', isError: false },
+        isError: false,
+      },
+    ]);
+  });
+});
