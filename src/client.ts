@@ -3,6 +3,7 @@ import type { Backend } from "./backends/backend.js";
 import { createClaudeCliBackend } from "./backends/claude-cli.js";
 import { createCodexCliBackend } from "./backends/codex-cli.js";
 import { createOpenAiApiBackend } from "./backends/openai-api.js";
+import { assertSupported } from "./capabilities.js";
 import { validateConfig } from "./config.js";
 import { LLMDriverError } from "./errors.js";
 import type { Client, Config, Request, Response } from "./types.js";
@@ -83,6 +84,9 @@ export function validateRequest(request: Request, config: Config): void {
   if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
     throw invalid(config, "maxTokens must be a positive integer");
   }
+  if (request.temperature !== undefined && !Number.isFinite(request.temperature)) {
+    throw invalid(config, "temperature must be a finite number");
+  }
   if (!Array.isArray(messages) || messages.length === 0) {
     throw invalid(config, "at least one message is required");
   }
@@ -94,6 +98,8 @@ export function validateRequest(request: Request, config: Config): void {
       throw invalid(config, `message ${index} text is required`);
     }
   }
+  // Strict portability gate: reject any feature this target cannot honor.
+  assertSupported(request, config);
 }
 
 function invalid(config: Config, message: string): LLMDriverError {
