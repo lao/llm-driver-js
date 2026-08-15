@@ -481,8 +481,9 @@ describe("contract across all four targets", () => {
     }
   });
 
-  // Images are honored on the API targets only in this task; CLI cells flip
-  // later (T8/T9). One neutral image fixture proves both halves of the matrix.
+  // Images are honored on both API targets and claude/cli (stream-json stdin,
+  // T8); codex/cli flips later (T9). One neutral image fixture proves both
+  // halves of the matrix.
   const IMAGE_PROMPT: GenerateRequest = {
     maxTokens: 64,
     messages: [
@@ -493,7 +494,9 @@ describe("contract across all four targets", () => {
     ],
   };
 
-  for (const target of targets.filter((t) => t.flavor === "api")) {
+  const imageSupported = (t: Target) => t.flavor === "api" || t.provider === "claude";
+
+  for (const target of targets.filter(imageSupported)) {
     it(`${target.provider}/${target.flavor} accepts an image request`, async () => {
       const response = await target.generate(IMAGE_PROMPT);
       expect(response.text).toBe(TEXT);
@@ -502,7 +505,7 @@ describe("contract across all four targets", () => {
     });
   }
 
-  for (const target of targets.filter((t) => t.flavor === "cli")) {
+  for (const target of targets.filter((t) => !imageSupported(t))) {
     it(`${target.provider}/${target.flavor} rejects an image request as unsupported`, async () => {
       const error = await target.generate(IMAGE_PROMPT).catch((caught) => caught);
       expect(error).toBeInstanceOf(LLMDriverError);

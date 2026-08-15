@@ -166,8 +166,11 @@ describe("image and document gate", () => {
     expect(() => assertSupported(request(block), CONFIGS["openai/api"])).not.toThrow();
   });
 
+  it("does not throw for image input on claude/cli (stream-json stdin, T8)", () => {
+    expect(() => assertSupported(request(IMAGE), CONFIGS["claude/cli"])).not.toThrow();
+  });
+
   it.each([
-    ["image input", IMAGE, "claude/cli"],
     ["image input", IMAGE, "openai/cli"],
     ["document input", DOCUMENT, "claude/cli"],
     ["document input", DOCUMENT, "openai/cli"],

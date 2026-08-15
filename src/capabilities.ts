@@ -59,10 +59,10 @@ export const CAPABILITIES: readonly Capability[] = [
     supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
   },
   {
-    // CLI image support lands in later tasks; ❌ on both CLI targets for now.
+    // claude/cli honors images via stream-json stdin (T8); codex/cli lands in T9.
     feature: "image input",
     used: (request) => hasBlock(request, "image"),
-    supported: ["claude/api", "openai/api"],
+    supported: ["claude/api", "openai/api", "claude/cli"],
   },
   {
     feature: "document input",

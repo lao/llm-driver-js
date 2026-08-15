@@ -166,6 +166,165 @@ describe("claude cli structured output", () => {
   });
 });
 
+// A 1x1 PNG — the payload does not matter, only that it survives to stdin.
+const PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+describe("claude cli image input (stream-json stdin)", () => {
+  const okStdout = '{"type":"result","subtype":"success","result":"ok"}';
+
+  it("switches to --input-format stream-json and renders image content blocks", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate({
+      maxTokens: 32,
+      messages: [
+        user([
+          { type: "text", text: "What is in this image?" },
+          { type: "image", source: { base64: PNG_BASE64, mediaType: "image/png" } },
+        ]),
+      ],
+    });
+
+    const command = calls[0]?.command;
+    expect(command?.args).toEqual([
+      "-p",
+      "--output-format",
+      "json",
+      "--input-format",
+      "stream-json",
+      "--permission-mode",
+      "default",
+      "--model",
+      "claude-test",
+    ]);
+    // Exactly one stream-json line, a well-formed Anthropic user message.
+    const lines = (command?.stdin ?? "").split("\n");
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0] as string)).toEqual({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "What is in this image?" },
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: PNG_BASE64 },
+          },
+        ],
+      },
+    });
+  });
+
+  it("renders a mixed multi-turn transcript as one stream-json line per message", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate({
+      maxTokens: 32,
+      messages: [
+        user([{ type: "image", source: { url: "https://example.com/cat.png" } }]),
+        assistant("A cat."),
+        user("And this one?"),
+      ],
+    });
+
+    const lines = (calls[0]?.command.stdin ?? "").split("\n");
+    expect(lines).toHaveLength(3);
+    expect(JSON.parse(lines[0] as string)).toEqual({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "image", source: { type: "url", url: "https://example.com/cat.png" } }],
+      },
+    });
+    // A plain-text turn keeps its string content inside the stream-json envelope.
+    expect(JSON.parse(lines[1] as string)).toEqual({
+      type: "assistant",
+      message: { role: "assistant", content: "A cat." },
+    });
+    expect(JSON.parse(lines[2] as string)).toEqual({
+      type: "user",
+      message: { role: "user", content: "And this one?" },
+    });
+  });
+
+  it("also switches the streaming path to stream-json input", async () => {
+    const fake = fakeStreamRunner([resultLine]);
+    const backend = createClaudeCliBackend(config, neverSpawn, fake.runner);
+
+    await collect(
+      backend.generateStream({
+        maxTokens: 32,
+        messages: [
+          user([{ type: "image", source: { base64: PNG_BASE64, mediaType: "image/png" } }]),
+        ],
+      }),
+    );
+
+    expect(fake.calls[0]?.command.args).toEqual([
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--include-partial-messages",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--permission-mode",
+      "default",
+      "--model",
+      "claude-test",
+    ]);
+  });
+});
+
+/**
+ * v1 REGRESSION — the top risk in the T8 plan. A text-only request MUST keep the
+ * v1 plain-stdin path byte-for-byte: no `--input-format stream-json` in argv, and
+ * stdin identical to the frozen v1 bytes. Frozen literals, not derived, so a
+ * change in the rendering code is caught here rather than silently tracked.
+ */
+describe("claude cli v1 text-only path is byte-identical", () => {
+  const okStdout = '{"type":"result","subtype":"success","result":"ok"}';
+  // Frozen from v1: lone user message goes raw; multi-turn is labelled blocks.
+  const FROZEN_LONE_STDIN = "Hello";
+  const FROZEN_MULTITURN_STDIN = "User: First\n\nAssistant: Second\n\nUser: Third";
+
+  it("sends a lone user message with the frozen v1 argv and stdin", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate({
+      maxTokens: 32,
+      messages: [user("Hello")],
+    });
+
+    const command = calls[0]?.command;
+    expect(command?.args).not.toContain("--input-format");
+    expect(command?.args).not.toContain("stream-json");
+    expect(command).toEqual({
+      executable: "claude",
+      args: [...baseArgs, "--model", "claude-test"],
+      stdin: FROZEN_LONE_STDIN,
+    });
+    // Byte-for-byte, explicitly.
+    expect(Buffer.from(command?.stdin ?? "")).toEqual(Buffer.from(FROZEN_LONE_STDIN));
+  });
+
+  it("renders a text-only multi-turn transcript with the frozen v1 bytes", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate({
+      system: "Be concise.",
+      maxTokens: 32,
+      messages: [user("First"), assistant("Second"), user("Third")],
+    });
+
+    const command = calls[0]?.command;
+    expect(command?.args).not.toContain("--input-format");
+    expect(command?.stdin).toBe(FROZEN_MULTITURN_STDIN);
+    expect(Buffer.from(command?.stdin ?? "")).toEqual(Buffer.from(FROZEN_MULTITURN_STDIN));
+  });
+});
+
 describe("claude cli parsing", () => {
   it("maps a successful result and its usage", async () => {
     const { runner } = fakeRunner({

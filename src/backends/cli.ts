@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { type ErrorCode, LLMDriverError } from "../errors.js";
-import type { Message, Provider } from "../types.js";
+import type { ContentBlock, Message, Provider } from "../types.js";
 
 /** Hard cap on captured stdout and stderr, matching the Go reference. */
 const MAX_OUTPUT_BYTES = 16 << 20;
@@ -103,6 +103,47 @@ function timeoutFailure(provider: Provider, timeoutMs: number): LLMDriverError {
 function messageText(message: Message): string {
   if (message.content === undefined) return message.text ?? "";
   return message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+}
+
+/** True when any message carries content blocks — the stream-json stdin trigger. */
+export function hasContentBlocks(messages: Message[]): boolean {
+  return messages.some((message) => message.content !== undefined);
+}
+
+/**
+ * Renders the transcript as newline-delimited stream-json messages — the input
+ * format `claude -p --input-format stream-json` reads. Each message becomes one
+ * `{type, message:{role, content}}` line whose content mirrors the Anthropic wire
+ * block shape (base64/url image sources), so images survive to the CLI. Used only
+ * when {@link hasContentBlocks} is true; text-only requests keep the plain path.
+ */
+export function renderStreamJson(messages: Message[]): string {
+  return messages
+    .map((message) =>
+      JSON.stringify({
+        type: message.role,
+        message: { role: message.role, content: streamContent(message) },
+      }),
+    )
+    .join("\n");
+}
+
+function streamContent(message: Message): string | ReturnType<typeof toStreamBlock>[] {
+  if (message.content === undefined) return message.text ?? "";
+  return message.content.map(toStreamBlock);
+}
+
+/** Maps one content block to its Anthropic stream-json wire form. */
+function toStreamBlock(block: ContentBlock) {
+  if (block.type === "image") {
+    const source =
+      "url" in block.source
+        ? { type: "url", url: block.source.url }
+        : { type: "base64", media_type: block.source.mediaType, data: block.source.base64 };
+    return { type: "image", source };
+  }
+  // Only text and image reach a CLI target; document blocks are gated out first.
+  return { type: "text", text: block.type === "text" ? block.text : "" };
 }
 
 /**
