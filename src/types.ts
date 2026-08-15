@@ -199,19 +199,27 @@ export interface Response {
 }
 
 /**
- * One event from {@link Client.generateStream}: zero or more `text` deltas whose
- * concatenation equals the final text, then exactly one `done`. Interleaved
- * `reasoning` deltas carry the target's thinking/reasoning-summary text and
- * never contribute to `done.response.text`; a target that reports no reasoning
- * emits none (no placeholder events). Delta granularity is target-dependent and
- * never part of the contract. Exception: on `claude`/`cli` the `text` equality
- * is scoped to single-message turns — when the CLI runs tools, the deltas also
- * carry intermediate assistant text that the final `done.response.text` does
- * not contain (see SPEC "Streaming contract").
+ * One event from {@link Client.generateStream}: zero or more `text` deltas, any
+ * number of `tool_call`/`tool_result` pairs (when `tools` is set), then exactly
+ * one `done`. Concatenated `text` equals `done.response.text` for the final
+ * assistant message; when `tools` runs, text produced before a tool call still
+ * streams but is not part of `response.text`. Interleaved `reasoning` deltas
+ * carry the target's thinking/reasoning-summary text and never contribute to
+ * `done.response.text`; a target that reports no reasoning emits none (no
+ * placeholder events). Delta granularity is target-dependent and never part of
+ * the contract. Exception: on `claude`/`cli` the `text` equality is scoped to
+ * single-message turns — when the CLI runs tools, the deltas also carry
+ * intermediate assistant text that the final `done.response.text` does not
+ * contain (see SPEC "Streaming contract").
+ *
+ * `tool_call` is emitted once a call’s input is complete and before its handler
+ * runs; the matching `tool_result` (same `id`) follows once `execute` returns.
  */
 export type StreamEvent =
   | { type: "text"; text: string }
   | { type: "reasoning"; text: string }
+  | { type: "tool_call"; id: string; name: string; input: unknown }
+  | { type: "tool_result"; id: string; name: string; output: ToolOutput; isError: boolean }
   | { type: "done"; response: Response };
 
 /** Sends generation requests through one configured provider and flavor. */

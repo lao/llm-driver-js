@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { createClient } from "../src/client.js";
 import { LLMDriverError } from "../src/errors.js";
-import { type Request as GenerateRequest, type Tool, user } from "../src/types.js";
+import {
+  type Request as GenerateRequest,
+  type StreamEvent,
+  type Tool,
+  user,
+} from "../src/types.js";
 
 const BASE_URL = "https://openai.test";
 
@@ -366,23 +371,184 @@ describe("tool loop on openai/api", () => {
     expect(stub.calls).toHaveLength(1);
     expect((await stub.calls[0]?.json()) as Record<string, unknown>).not.toHaveProperty("tools");
   });
+});
 
-  it("rejects unsupported_feature for tools in generateStream", async () => {
-    const stub = toolStub([finalResponse("unused")]);
-    const stream = clientWith(stub.impl).generateStream({
-      maxTokens: 8,
-      messages: [user("hi")],
-      tools: [echoTool("add", "3")],
-    });
+function sse(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
 
-    const error = await rejection(
-      (async () => {
-        for await (const _event of stream) {
-          // first next() should throw
+const textDelta = (delta: string) =>
+  sse("response.output_text.delta", {
+    type: "response.output_text.delta",
+    delta,
+    item_id: "msg_1",
+    output_index: 0,
+    content_index: 0,
+    sequence_number: 1,
+  });
+const completed = (response: unknown) =>
+  sse("response.completed", { type: "response.completed", response });
+
+/**
+ * Serves one canned SSE body per request (one round each) and records the abort
+ * signal it saw. `keepOpen` leaves that round's stream unfinished so a break can
+ * observe the transport being torn down.
+ */
+function sequencedSse(rounds: string[][], options: { keepOpen?: boolean } = {}) {
+  const signals: (AbortSignal | undefined)[] = [];
+  const impl: typeof fetch = async (_input, init) => {
+    const round = rounds[Math.min(signals.length, rounds.length - 1)] ?? [];
+    const signal = init?.signal ?? undefined;
+    signals.push(signal);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of round) controller.enqueue(new TextEncoder().encode(chunk));
+        if (options.keepOpen) {
+          signal?.addEventListener("abort", () => controller.error(signal.reason));
+        } else {
+          controller.close();
         }
-      })(),
-    );
-    expect(error.code).toBe("unsupported_feature");
-    expect(stub.calls).toHaveLength(0);
+      },
+    });
+    return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+  return { impl, signals };
+}
+
+describe("tool loop streaming on openai/api", () => {
+  it("orders text → tool_call → tool_result → text → done, one done last", async () => {
+    const stub = sequencedSse([
+      [
+        textDelta("checking"),
+        completed(
+          functionCallResponse([
+            { call_id: "call_1", name: "add", arguments: JSON.stringify({ a: 1, b: 2 }) },
+          ]),
+        ),
+      ],
+      [textDelta("the answer is 3"), completed(finalResponse("the answer is 3"))],
+    ]);
+
+    const events: StreamEvent[] = [];
+    for await (const event of clientWith(stub.impl).generateStream({
+      maxTokens: 64,
+      messages: [user("add")],
+      tools: [echoTool("add", "3")],
+    })) {
+      events.push(event);
+    }
+
+    expect(events.map((event) => event.type)).toEqual([
+      "text",
+      "tool_call",
+      "tool_result",
+      "text",
+      "done",
+    ]);
+    expect(events[0]).toEqual({ type: "text", text: "checking" });
+    expect(events[1]).toEqual({
+      type: "tool_call",
+      id: "call_1",
+      name: "add",
+      input: { a: 1, b: 2 },
+    });
+    expect(events[2]).toEqual({
+      type: "tool_result",
+      id: "call_1",
+      name: "add",
+      output: { text: "3", isError: false },
+      isError: false,
+    });
+    expect(events[3]).toEqual({ type: "text", text: "the answer is 3" });
+
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event last");
+    expect(events.filter((event) => event.type === "done")).toHaveLength(1);
+    // Narrowed contract: with tools, response.text is the FINAL message only —
+    // the pre-tool "checking" delta streamed but is not part of it.
+    expect(done.response.text).toBe("the answer is 3");
+    expect(done.response.completionReason).toBe("stop");
+    expect(done.response.toolCalls).toEqual([
+      {
+        id: "call_1",
+        name: "add",
+        input: { a: 1, b: 2 },
+        output: { text: "3", isError: false },
+        isError: false,
+      },
+    ]);
+  });
+
+  it("break at a tool_result aborts the in-flight sibling execute", async () => {
+    let siblingAborted = false;
+    const stub = sequencedSse([
+      [
+        completed(
+          functionCallResponse([
+            { call_id: "fast", name: "fast", arguments: "{}" },
+            { call_id: "slow", name: "slow", arguments: "{}" },
+          ]),
+        ),
+      ],
+    ]);
+
+    const tools: Tool[] = [
+      echoTool("fast", "1"),
+      {
+        name: "slow",
+        description: "never resolves until aborted",
+        inputSchema: { type: "object" },
+        execute: (_input, ctx) =>
+          new Promise((_resolve, reject) => {
+            ctx.signal?.addEventListener("abort", () => {
+              siblingAborted = true;
+              reject(new Error("handler saw abort"));
+            });
+          }),
+      },
+    ];
+
+    for await (const event of clientWith(stub.impl).generateStream({
+      maxTokens: 8,
+      messages: [user("go")],
+      tools,
+    })) {
+      if (event.type === "tool_result") break;
+    }
+
+    expect(siblingAborted).toBe(true);
+  });
+
+  it("tears the transport down when the consumer breaks during a text delta", async () => {
+    const stub = sequencedSse([[textDelta("streaming")]], { keepOpen: true });
+
+    for await (const event of clientWith(stub.impl).generateStream({
+      maxTokens: 8,
+      messages: [user("go")],
+      tools: [echoTool("add", "3")],
+    })) {
+      expect(event).toEqual({ type: "text", text: "streaming" });
+      break;
+    }
+
+    expect(stub.signals[0]?.aborted).toBe(true);
+  });
+
+  it("surfaces the raw abort reason when the request signal fires mid-stream", async () => {
+    const stub = sequencedSse([[textDelta("hi")]], { keepOpen: true });
+    const controller = new AbortController();
+    const reason = new Error("my-timeout");
+
+    const drain = (async () => {
+      for await (const event of clientWith(stub.impl).generateStream(
+        { maxTokens: 8, messages: [user("go")], tools: [echoTool("add", "3")] },
+        { signal: controller.signal },
+      )) {
+        expect(event).toEqual({ type: "text", text: "hi" });
+        controller.abort(reason);
+      }
+    })();
+
+    await expect(drain).rejects.toBe(reason);
   });
 });
