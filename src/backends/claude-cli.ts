@@ -155,6 +155,7 @@ function toResponse(result: Record<string, unknown>, model: string): Response {
     completionReason: "",
     provider: "claude",
     flavor: "cli",
+    toolCalls: [],
   };
 }
 

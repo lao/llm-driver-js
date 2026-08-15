@@ -1,6 +1,6 @@
 import Anthropic, { AnthropicError, APIConnectionError, APIError } from "@anthropic-ai/sdk";
 import { LLMDriverError } from "../errors.js";
-import type { CompletionReason, Config, Request, Response } from "../types.js";
+import type { CompletionReason, Config, JsonSchema, Request, Response } from "../types.js";
 import type { Backend } from "./backend.js";
 
 const CONTEXT = { provider: "claude", flavor: "api", operation: "generate" } as const;
@@ -33,6 +33,7 @@ export function createAnthropicApiBackend(config: Config): Backend {
       try {
         return toResponse(
           await ensureClient().messages.create(toParams(config.model, request), { signal }),
+          request.outputSchema,
         );
       } catch (error) {
         // An abort surfaces the signal's own reason, like the CLI flavors —
@@ -88,7 +89,10 @@ export function createAnthropicApiBackend(config: Config): Backend {
         }
         yield {
           type: "done",
-          response: toResponse({ ...message, content: [{ type: "text", text, citations: null }] }),
+          response: toResponse(
+            { ...message, content: [{ type: "text", text, citations: null }] },
+            request.outputSchema,
+          ),
         };
       } catch (error) {
         if (signal?.aborted) throw signal.reason;
@@ -144,13 +148,20 @@ function toParams(model: string, request: Request): Anthropic.MessageCreateParam
     // neutral levels ("minimal"), so we cast rather than gate — the provider
     // validates the value (SPEC "Reasoning").
     params.output_config = {
+      ...params.output_config,
       effort: request.reasoning.effort as Anthropic.OutputConfig["effort"],
+    };
+  }
+  if (request.outputSchema) {
+    params.output_config = {
+      ...params.output_config,
+      format: { type: "json_schema", schema: request.outputSchema },
     };
   }
   return params;
 }
 
-function toResponse(message: Anthropic.Message): Response {
+function toResponse(message: Anthropic.Message, outputSchema?: JsonSchema): Response {
   if (!Array.isArray(message?.content)) {
     throw new LLMDriverError(
       "parse_failed",
@@ -159,10 +170,11 @@ function toResponse(message: Anthropic.Message): Response {
     );
   }
   const usage = message.usage;
-  return {
+  const text = message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+  const response: Response = {
     id: message.id ?? "",
     model: message.model ?? "",
-    text: message.content.map((block) => (block.type === "text" ? block.text : "")).join(""),
+    text,
     completionReason: toCompletionReason(message.stop_reason),
     usage: {
       inputTokens: usage?.input_tokens ?? 0,
@@ -173,7 +185,24 @@ function toResponse(message: Anthropic.Message): Response {
     },
     provider: "claude",
     flavor: "api",
+    toolCalls: [],
   };
+  if (outputSchema !== undefined) {
+    response.structured = parseStructured(text);
+  }
+  return response;
+}
+
+/** Parses structured-output text as JSON; unparseable output is `parse_failed`. */
+function parseStructured(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new LLMDriverError("parse_failed", "Anthropic structured output was not valid JSON", {
+      ...CONTEXT,
+      cause: error,
+    });
+  }
 }
 
 function toCompletionReason(reason: Anthropic.StopReason | null): CompletionReason {

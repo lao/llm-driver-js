@@ -56,6 +56,25 @@ export interface Message {
   text: string;
 }
 
+/**
+ * A JSON Schema object (the draft the providers accept) constraining structured
+ * output. Kept as a plain object so callers stay free of a schema library.
+ */
+export type JsonSchema = Record<string, unknown>;
+
+/** Result a tool `execute()` handler returns; normalized to object form in records. */
+export type ToolOutput = string | { text: string; isError?: boolean };
+
+/** Audit record of one tool invocation during a `generate()` tool loop. */
+export interface ToolCallRecord {
+  /** Provider call id, or bridge-generated on CLI flavors. */
+  id: string;
+  name: string;
+  input: unknown;
+  output: ToolOutput;
+  isError: boolean;
+}
+
 /** Provider-neutral text generation request. */
 export interface Request {
   system?: string;
@@ -99,6 +118,13 @@ export interface Request {
    * to-provider levels surface the provider's error (`api_error`/`process_failed`).
    */
   reasoning?: { effort: ReasoningEffort };
+  /**
+   * JSON Schema constraining the model's output. When set, the adapter parses the
+   * final text into {@link Response.structured}; unparseable output is
+   * `parse_failed`. API flavors only for now — throws `unsupported_feature` on
+   * CLI flavors.
+   */
+  outputSchema?: JsonSchema;
 }
 
 /** Token counts reported by a target; unreported counts are `0`. */
@@ -120,6 +146,10 @@ export interface Response {
   completionReason: CompletionReason;
   provider: Provider;
   flavor: Flavor;
+  /** Parsed JSON when {@link Request.outputSchema} was set; otherwise absent. */
+  structured?: unknown;
+  /** Audit trail of tools run during generation; `[]` when none ran. */
+  toolCalls: ToolCallRecord[];
 }
 
 /**

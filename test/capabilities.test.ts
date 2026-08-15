@@ -94,6 +94,7 @@ const FEATURE_REQUESTS: Record<string, GenerateRequest> = {
   stopSequences: { maxTokens: 8, messages: [user("hi")], stopSequences: ["STOP"] },
   "metadata.userId": { maxTokens: 8, messages: [user("hi")], metadata: { userId: "u1" } },
   "reasoning.effort": { maxTokens: 8, messages: [user("hi")], reasoning: { effort: "low" } },
+  outputSchema: { maxTokens: 8, messages: [user("hi")], outputSchema: { type: "object" } },
 };
 
 describe("matrix gate covers every feature × target cell", () => {
@@ -156,6 +157,31 @@ describe("temperature on cli flavors", () => {
 
       expect(error).toBeInstanceOf(LLMDriverError);
       expect((error as LLMDriverError).code).toBe("unsupported_feature");
+      expect(calls).toHaveLength(0);
+    },
+  );
+});
+
+describe("outputSchema on cli flavors", () => {
+  const schemaRequest: GenerateRequest = {
+    maxTokens: 32,
+    messages: [user("Hello")],
+    outputSchema: { type: "object" },
+  };
+
+  it.each(["claude/cli", "openai/cli"] as const)(
+    "generate() rejects unsupported_feature before any spawn on %s",
+    async (target) => {
+      const { runner, calls } = neverRun();
+      const client = cliClient(target, runner);
+
+      const error = await client.generate(schemaRequest).catch((caught) => caught);
+
+      expect(error).toBeInstanceOf(LLMDriverError);
+      const err = error as LLMDriverError;
+      expect(err.code).toBe("unsupported_feature");
+      expect(err.message).toContain("outputSchema");
+      expect(err.message).toContain(target);
       expect(calls).toHaveLength(0);
     },
   );

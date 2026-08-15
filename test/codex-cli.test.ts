@@ -141,6 +141,7 @@ describe("codex cli parsing", () => {
       completionReason: "",
       provider: "openai",
       flavor: "cli",
+      toolCalls: [],
     });
   });
 });
@@ -347,6 +348,7 @@ describe("codex cli streaming", () => {
           completionReason: "",
           provider: "openai",
           flavor: "cli",
+          toolCalls: [],
         },
       },
     ]);

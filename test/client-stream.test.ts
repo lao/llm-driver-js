@@ -33,6 +33,7 @@ function doneEvent(response: Partial<Response>): StreamEvent {
         reasoningTokens: 0,
       },
       completionReason: "",
+      toolCalls: [],
       // Deliberately wrong: the client must overwrite these.
       provider: "openai",
       flavor: "cli",

@@ -188,6 +188,7 @@ describe("openai api backend", () => {
       completionReason: "stop",
       provider: "openai",
       flavor: "api",
+      toolCalls: [],
       usage: {
         inputTokens: 10,
         outputTokens: 7,
@@ -196,6 +197,53 @@ describe("openai api backend", () => {
         reasoningTokens: 2,
       },
     });
+  });
+
+  it("maps outputSchema onto text.format and parses the result", async () => {
+    const schema = { type: "object", properties: { answer: { type: "number" } } };
+    const stub = stubFetch(200, {
+      ...RESPONSE,
+      output: [
+        {
+          id: "msg_123",
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: '{"answer":42}', annotations: [] }],
+        },
+      ],
+    });
+
+    const response = await clientWith(stub.impl).generate({ ...PROMPT, outputSchema: schema });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.text).toEqual({
+      format: { type: "json_schema", name: "output", schema, strict: true },
+    });
+    expect(response.structured).toEqual({ answer: 42 });
+    expect(response.text).toBe('{"answer":42}');
+  });
+
+  it("rejects unparseable structured output with parse_failed", async () => {
+    const stub = stubFetch(200, RESPONSE); // text is "Hello, world", not JSON
+
+    const error = await rejection(
+      clientWith(stub.impl).generate({ ...PROMPT, outputSchema: { type: "object" } }),
+    );
+
+    expect(error.code).toBe("parse_failed");
+    expect(error.provider).toBe("openai");
+    expect(error.flavor).toBe("api");
+    expect(error.operation).toBe("generate");
+  });
+
+  it("leaves structured undefined and text absent without outputSchema", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    const response = await clientWith(stub.impl).generate(PROMPT);
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("text");
+    expect(response).not.toHaveProperty("structured");
   });
 
   it("keeps truncated text and reports max_tokens", async () => {
@@ -458,6 +506,7 @@ describe("openai api backend streaming", () => {
           completionReason: "stop",
           provider: "openai",
           flavor: "api",
+          toolCalls: [],
           usage: {
             inputTokens: 10,
             outputTokens: 7,

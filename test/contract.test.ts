@@ -330,6 +330,7 @@ describe("contract across all four targets", () => {
         completionReason: target.completionReason,
         provider: target.provider,
         flavor: target.flavor,
+        toolCalls: [],
         usage: {
           inputTokens: 10,
           outputTokens: 5,
@@ -414,4 +415,73 @@ describe("contract across all four targets", () => {
       expect(shape).toEqual(shapes[0]);
     }
   });
+
+  it("stamps toolCalls on every target", async () => {
+    for (const target of targets) {
+      const response = await target.generate(PROMPT);
+      expect(response.toolCalls).toEqual([]);
+    }
+  });
+});
+
+/** A schema and a matching JSON payload the structured targets echo back. */
+const SCHEMA = { type: "object", properties: { answer: { type: "number" } } };
+const STRUCTURED = { answer: 42 };
+const STRUCTURED_TEXT = JSON.stringify(STRUCTURED);
+
+/** Structured output is api-only in T5; both api targets parse the final text. */
+const structuredTargets: {
+  provider: Provider;
+  generate: (request: GenerateRequest) => Promise<GenerateResponse>;
+}[] = [
+  {
+    provider: "claude",
+    generate: (request) =>
+      createClient({
+        provider: "claude",
+        flavor: "api",
+        model: "claude-api-test",
+        apiKey: "test-key",
+        baseUrl: "https://anthropic.test",
+        fetch: stubFetch({
+          ...CLAUDE_API_BODY,
+          content: [{ type: "text", text: STRUCTURED_TEXT }],
+        }),
+      }).generate(request),
+  },
+  {
+    provider: "openai",
+    generate: (request) =>
+      createClient({
+        provider: "openai",
+        flavor: "api",
+        model: "gpt-api-test",
+        apiKey: "test-key",
+        baseUrl: "https://openai.test",
+        fetch: stubFetch({
+          ...OPENAI_API_BODY,
+          output: [
+            {
+              id: "msg_123",
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: STRUCTURED_TEXT, annotations: [] }],
+            },
+          ],
+        }),
+      }).generate(request),
+  },
+];
+
+describe("structured output across api targets", () => {
+  for (const target of structuredTargets) {
+    it(`${target.provider}/api parses the final text into structured`, async () => {
+      const response = await target.generate({ ...PROMPT, outputSchema: SCHEMA });
+
+      expect(response.structured).toEqual(STRUCTURED);
+      expect(response.text).toBe(STRUCTURED_TEXT);
+      expect(response.toolCalls).toEqual([]);
+    });
+  }
 });

@@ -151,6 +151,7 @@ describe("claude cli parsing", () => {
       completionReason: "",
       provider: "claude",
       flavor: "cli",
+      toolCalls: [],
     });
   });
 
@@ -451,6 +452,7 @@ describe("claude cli streaming events", () => {
         completionReason: "",
         provider: "claude",
         flavor: "cli",
+        toolCalls: [],
       },
     });
     const text = events

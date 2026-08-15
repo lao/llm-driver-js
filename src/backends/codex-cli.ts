@@ -185,6 +185,7 @@ function parseCodexOutput(
     completionReason: "",
     provider: "openai",
     flavor: "cli",
+    toolCalls: [],
   };
   return { response, reasoning };
 }
