@@ -102,9 +102,10 @@ export interface ToolCallRecord {
 export type ImageMediaType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
 
 /**
- * One block of a {@link Message}'s content. `document` blocks are honored on API
- * flavors only; `image` blocks are honored on API flavors (CLI support lands
- * later). Unsupported blocks throw `unsupported_feature` before any transport.
+ * One block of a {@link Message}'s content. `image` blocks are honored on all
+ * four targets (CLI flavors via stream-json stdin / temp files); `document`
+ * blocks are honored on API flavors only. Unsupported blocks throw
+ * `unsupported_feature` before any transport.
  */
 export type ContentBlock =
   | { type: "text"; text: string }
@@ -160,8 +161,8 @@ export interface Request {
   /**
    * JSON Schema constraining the model's output. When set, the adapter parses the
    * final text into {@link Response.structured}; unparseable output is
-   * `parse_failed`. API flavors only for now — throws `unsupported_feature` on
-   * CLI flavors.
+   * `parse_failed`. Supported on all four targets (CLI flavors via
+   * `--json-schema` / `--output-schema`).
    */
   outputSchema?: JsonSchema;
   /**

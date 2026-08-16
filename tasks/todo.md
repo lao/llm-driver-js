@@ -1,6 +1,6 @@
 # TODO: llm-driver v2 — SDK generation parity
 
-Details per task: `tasks/plan.md`. Spec: `SPEC-v2.md`. Every task ends with all
+Details per task: `tasks/plan.md`. Spec: `SPEC.md`. Every task ends with all
 five gates green (`build`, `test`, `lint`, `typecheck`, `test:coverage`).
 
 ## Phase 1 — Foundation
@@ -38,9 +38,9 @@ five gates green (`build`, `test`, `lint`, `typecheck`, `test:coverage`).
 
 ## Phase 7 — Polish + ship
 - [ ] T16 `timeoutMs` (all) + `maxRetries` (api) (M)
-- [ ] T17 Docs: SPEC merge, README matrix, example flags, CLAUDE.md (M)
+- [x] T17 Docs: SPEC merge, README matrix, example flags, CLAUDE.md (M)
 - [ ] Final checkpoint: every matrix cell tested, review + simplify, bump 0.2.0
 
 ## Pre-start vetoes (answer before the task starts)
-- [ ] `tool_loop_exceeded` dedicated error code? (before T10; plan assumes yes)
-- [ ] `Message.text` XOR `content` design? (before T7; plan assumes yes)
+- [x] `tool_loop_exceeded` dedicated error code? (before T10; plan assumes yes) — YES, dedicated code, cap 16
+- [x] `Message.text` XOR `content` design? (before T7; plan assumes yes) — YES, text XOR content
