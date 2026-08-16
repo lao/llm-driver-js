@@ -1,0 +1,110 @@
+import { LLMDriverError } from "./errors.js";
+import type { Config, Flavor, Provider, Request } from "./types.js";
+
+/** A `provider/flavor` pair, e.g. `"claude/api"`. */
+export type Target = `${Provider}/${Flavor}`;
+
+/**
+ * One gated request feature and the targets that can honor it. This table is the
+ * SINGLE source of truth for portability (SPEC-v2 feature matrix): adapters map
+ * a feature onto the wire but never decide whether it is supported. Adding a
+ * feature is one row here plus its adapter mapping — the gate below stays generic.
+ */
+interface Capability {
+  /** Feature name as it appears to callers and in error messages. */
+  feature: string;
+  /** True when the request exercises this feature. */
+  used: (request: Request) => boolean;
+  /** Targets that honor it; every other target throws `unsupported_feature`. */
+  supported: readonly Target[];
+}
+
+/** Feature × target support matrix (SPEC-v2, normative). One row per gated field. */
+export const CAPABILITIES: readonly Capability[] = [
+  {
+    feature: "temperature",
+    used: (request) => request.temperature !== undefined,
+    supported: ["claude/api", "openai/api"],
+  },
+  {
+    feature: "topP",
+    used: (request) => request.topP !== undefined,
+    supported: ["claude/api", "openai/api"],
+  },
+  {
+    feature: "topK",
+    used: (request) => request.topK !== undefined,
+    supported: ["claude/api"],
+  },
+  {
+    feature: "stopSequences",
+    used: (request) => request.stopSequences !== undefined,
+    supported: ["claude/api"],
+  },
+  {
+    feature: "metadata.userId",
+    used: (request) => request.metadata?.userId !== undefined,
+    supported: ["claude/api", "openai/api"],
+  },
+  {
+    feature: "reasoning.effort",
+    used: (request) => request.reasoning !== undefined,
+    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
+  },
+  {
+    // Structured output on all four targets: API flavors via the provider's
+    // json_schema format, CLI flavors via --json-schema / --output-schema.
+    feature: "outputSchema",
+    used: (request) => request.outputSchema !== undefined,
+    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
+  },
+  {
+    // Images honored on all four targets: API flavors natively, claude/cli via
+    // stream-json stdin (T8), codex/cli via temp files + `-i` (T9). codex/cli's
+    // URL-source and non-final-turn constraints are enforced in the codex-cli
+    // adapter, which throws `unsupported_feature` naming the constraint.
+    feature: "image input",
+    used: (request) => hasBlock(request, "image"),
+    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
+  },
+  {
+    feature: "document input",
+    used: (request) => hasBlock(request, "document"),
+    supported: ["claude/api", "openai/api"],
+  },
+  {
+    // Both cli flavors inject caller tools into the CLI's own loop via the MCP bridge.
+    feature: "tools",
+    used: (request) => Array.isArray(request.tools) && request.tools.length > 0,
+    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
+  },
+  {
+    feature: "toolChoice",
+    used: (request) => request.toolChoice !== undefined,
+    supported: ["claude/api", "openai/api"],
+  },
+];
+
+/** True when any message carries a content block of the given type. */
+function hasBlock(request: Request, type: string): boolean {
+  return request.messages.some((message) => message.content?.some((block) => block.type === type));
+}
+
+/**
+ * Throws `unsupported_feature` for any request feature the selected target cannot
+ * honor. Strict portability policy: a feature is honored or rejected, never
+ * silently dropped. Called from `validateRequest`, so it runs before any
+ * transport work (and, for streams, from the first `next()`).
+ */
+export function assertSupported(request: Request, config: Config): void {
+  const target: Target = `${config.provider}/${config.flavor}`;
+  for (const capability of CAPABILITIES) {
+    if (capability.used(request) && !capability.supported.includes(target)) {
+      throw new LLMDriverError(
+        "unsupported_feature",
+        `${capability.feature} is not supported on ${target}`,
+        { provider: config.provider, flavor: config.flavor, operation: "generate" },
+      );
+    }
+  }
+}

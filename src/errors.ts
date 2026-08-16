@@ -8,7 +8,10 @@ export type ErrorCode =
   | "process_failed"
   | "parse_failed"
   | "api_error"
-  | "transport_failed";
+  | "transport_failed"
+  | "unsupported_feature"
+  | "tool_failed"
+  | "tool_loop_exceeded";
 
 /** Optional target and failure context attached to an {@link LLMDriverError}. */
 export interface LLMDriverErrorOptions {

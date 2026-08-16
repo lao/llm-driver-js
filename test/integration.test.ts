@@ -43,6 +43,26 @@ for (const { provider, envVar } of targets) {
     );
 
     it(
+      "accepts a reasoning.effort request through the real CLI",
+      async () => {
+        // Proves the real binary accepts the mapped flag (claude `--effort`,
+        // codex `-c model_reasoning_effort=`) — the truth fixtures cannot show.
+        const client = createClient({ provider, flavor: "cli", model: model as string });
+
+        const response = await client.generate({
+          system: "Reply with a single word.",
+          messages: [user("Reply with the word: pong")],
+          maxTokens: 64,
+          reasoning: { effort: "low" },
+        });
+
+        expect(response.text.trim()).not.toBe("");
+        expect(response.provider).toBe(provider);
+      },
+      TIMEOUT_MS,
+    );
+
+    it(
       "streams text through the real CLI",
       async () => {
         const client = createClient({ provider, flavor: "cli", model: model as string });
@@ -75,6 +95,193 @@ for (const { provider, envVar } of targets) {
               .join(""),
           ).toBe(done.response.text);
         }
+      },
+      TIMEOUT_MS,
+    );
+  });
+}
+
+/**
+ * Real `claude -p` running a client tool through the MCP bridge: the CLI drives
+ * its own loop, calls our in-process handler over loopback HTTP, and the record
+ * lands in `response.toolCalls`.
+ */
+describe.skipIf(!process.env.LLMWRAPPER_CLAUDE_CLI_MODEL)("claude cli tools via bridge", () => {
+  it(
+    "calls a trivial in-process tool and records the call",
+    async () => {
+      const model = process.env.LLMWRAPPER_CLAUDE_CLI_MODEL as string;
+      const client = createClient({ provider: "claude", flavor: "cli", model });
+
+      let called = false;
+      const response = await client.generate({
+        messages: [
+          user(
+            "Call the secret_number tool with no arguments and reply with exactly the number it returns.",
+          ),
+        ],
+        maxTokens: 512,
+        tools: [
+          {
+            name: "secret_number",
+            description: "Returns the secret number. Call it to learn the secret.",
+            inputSchema: { type: "object", properties: {} },
+            execute: () => {
+              called = true;
+              return "1729";
+            },
+          },
+        ],
+      });
+
+      expect(called).toBe(true);
+      expect(response.toolCalls.map((call) => call.name)).toContain("secret_number");
+      expect(response.text).toContain("1729");
+    },
+    TIMEOUT_MS,
+  );
+});
+
+/**
+ * Real `claude -p` image input over stream-json stdin (T8). An 8x8 solid-blue
+ * PNG the model should be able to describe; proves the stream-json switch and
+ * base64 image block survive to the CLI. Skips unless the model env var is set.
+ */
+describe.skipIf(!process.env.LLMWRAPPER_CLAUDE_CLI_MODEL)("claude cli image input", () => {
+  // 8x8 solid-blue PNG.
+  const BLUE_PNG =
+    "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEElEQVR4nGNgYPiPAw0pCQCpcD/BFMrqcwAAAABJRU5ErkJggg==";
+
+  it(
+    "describes a PNG passed as a base64 image block",
+    async () => {
+      const model = process.env.LLMWRAPPER_CLAUDE_CLI_MODEL as string;
+      const client = createClient({ provider: "claude", flavor: "cli", model });
+
+      const response = await client.generate({
+        system: "Reply with a single word: the dominant color of the image.",
+        messages: [
+          user([
+            { type: "text", text: "What color is this image?" },
+            { type: "image", source: { base64: BLUE_PNG, mediaType: "image/png" } },
+          ]),
+        ],
+        maxTokens: 64,
+      });
+
+      expect(response.text.toLowerCase()).toContain("blue");
+    },
+    TIMEOUT_MS,
+  );
+});
+
+/**
+ * codex `-i` image input against the real binary. A 1x1 PNG is staged to a temp
+ * file and attached to the final user turn; we only assert the turn completes,
+ * since the model's description of a single pixel is not deterministic.
+ */
+describe.skipIf(!process.env.LLMWRAPPER_CODEX_CLI_MODEL)("codex cli image input", () => {
+  // 1x1 transparent PNG.
+  const PNG_B64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+  it(
+    "describes a base64 PNG through the real CLI",
+    async () => {
+      const model = process.env.LLMWRAPPER_CODEX_CLI_MODEL as string;
+      const client = createClient({ provider: "openai", flavor: "cli", model });
+
+      const response = await client.generate({
+        messages: [
+          user([
+            { type: "image", source: { base64: PNG_B64, mediaType: "image/png" } },
+            { type: "text", text: "Reply with the word: seen" },
+          ]),
+        ],
+        maxTokens: 64,
+      });
+
+      expect(response.text.trim()).not.toBe("");
+      expect(response.provider).toBe("openai");
+      expect(response.flavor).toBe("cli");
+    },
+    TIMEOUT_MS,
+  );
+});
+
+/**
+ * Real `codex exec` running a client tool through the MCP bridge. Also the sole
+ * confirmation of the `-c mcp_servers.llmdriver.url=` streamable-HTTP key syntax
+ * (SPEC-v2 open question 4) against the real codex 0.147 binary: if codex ignores
+ * the override or needs stdio-only MCP, this test fails and the argv needs a fix.
+ */
+describe.skipIf(!process.env.LLMWRAPPER_CODEX_CLI_MODEL)("codex cli tools via bridge", () => {
+  it(
+    "calls a trivial in-process tool and records the call",
+    async () => {
+      const model = process.env.LLMWRAPPER_CODEX_CLI_MODEL as string;
+      const client = createClient({ provider: "openai", flavor: "cli", model });
+
+      let called = false;
+      const response = await client.generate({
+        messages: [
+          user(
+            "Call the secret_number tool with no arguments and reply with exactly the number it returns.",
+          ),
+        ],
+        maxTokens: 512,
+        tools: [
+          {
+            name: "secret_number",
+            description: "Returns the secret number. Call it to learn the secret.",
+            inputSchema: { type: "object", properties: {} },
+            execute: () => {
+              called = true;
+              return "1729";
+            },
+          },
+        ],
+      });
+
+      expect(called).toBe(true);
+      expect(response.toolCalls.map((call) => call.name)).toContain("secret_number");
+      expect(response.text).toContain("1729");
+    },
+    TIMEOUT_MS,
+  );
+});
+
+/**
+ * The truth the fixtures cannot prove: that `--json-schema` (claude) and
+ * `--output-schema` (codex) really make the CLI emit JSON we can parse into
+ * `structured`. Env-gated, skipped by default; run before checkpoint sign-off.
+ */
+for (const { provider, envVar } of targets) {
+  const model = process.env[envVar];
+
+  describe.skipIf(!model)(`${provider} cli structured output`, () => {
+    it(
+      "returns parseable structured output for a schema",
+      async () => {
+        const client = createClient({ provider, flavor: "cli", model: model as string });
+
+        const response = await client.generate({
+          system: "Reply only with JSON that satisfies the schema.",
+          messages: [user("The answer to life, the universe, and everything is 42.")],
+          maxTokens: 256,
+          outputSchema: {
+            type: "object",
+            properties: { answer: { type: "number" } },
+            required: ["answer"],
+            additionalProperties: false,
+          },
+        });
+
+        // Parse succeeded (the adapter throws parse_failed otherwise), and the
+        // schema shape came back.
+        expect(response.structured).toBeTypeOf("object");
+        expect(response.structured).not.toBeNull();
+        expect(JSON.parse(response.text)).toEqual(response.structured);
       },
       TIMEOUT_MS,
     );

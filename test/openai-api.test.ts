@@ -129,12 +129,99 @@ describe("openai api backend", () => {
     expect((body.input as Record<string, unknown>[])[0]).not.toHaveProperty("phase");
   });
 
+  it("maps reasoning.effort onto reasoning", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate({ ...PROMPT, reasoning: { effort: "minimal" } });
+
+    expect(await (stub.calls[0] as Request).json()).toMatchObject({
+      reasoning: { effort: "minimal" },
+    });
+  });
+
+  it("omits reasoning when the request has none", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate(PROMPT);
+
+    expect(await (stub.calls[0] as Request).json()).not.toHaveProperty("reasoning");
+  });
+
   it("omits instructions when the request has no system prompt", async () => {
     const stub = stubFetch(200, RESPONSE);
     await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
 
     const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
     expect(body).not.toHaveProperty("instructions");
+  });
+
+  it("maps topP and metadata.userId onto the Responses API", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate({
+      maxTokens: 8,
+      messages: [user("hello")],
+      topP: 0.9,
+      metadata: { userId: "user-42" },
+    });
+
+    expect(await (stub.calls[0] as Request).json()).toMatchObject({
+      top_p: 0.9,
+      safety_identifier: "user-42",
+    });
+  });
+
+  it("maps content blocks onto input_image and input_file", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate({
+      maxTokens: 8,
+      messages: [
+        user([
+          { type: "text", text: "describe these" },
+          { type: "image", source: { base64: "aGVsbG8=", mediaType: "image/png" } },
+          { type: "image", source: { url: "https://example.test/a.jpg" } },
+          { type: "document", source: { base64: "cGRm", mediaType: "application/pdf" } },
+        ]),
+      ],
+    });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.input).toEqual([
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "describe these" },
+          {
+            type: "input_image",
+            image_url: "data:image/png;base64,aGVsbG8=",
+            detail: "auto",
+          },
+          { type: "input_image", image_url: "https://example.test/a.jpg", detail: "auto" },
+          {
+            type: "input_file",
+            filename: "document.pdf",
+            file_data: "data:application/pdf;base64,cGRm",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("omits topP and safety_identifier when the request has none", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("top_p");
+    expect(body).not.toHaveProperty("safety_identifier");
+  });
+
+  it("keeps the v1 single-input_text shape for text-only messages", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.input).toEqual([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+    ]);
   });
 
   it("maps the response and usage", async () => {
@@ -148,6 +235,7 @@ describe("openai api backend", () => {
       completionReason: "stop",
       provider: "openai",
       flavor: "api",
+      toolCalls: [],
       usage: {
         inputTokens: 10,
         outputTokens: 7,
@@ -156,6 +244,53 @@ describe("openai api backend", () => {
         reasoningTokens: 2,
       },
     });
+  });
+
+  it("maps outputSchema onto text.format and parses the result", async () => {
+    const schema = { type: "object", properties: { answer: { type: "number" } } };
+    const stub = stubFetch(200, {
+      ...RESPONSE,
+      output: [
+        {
+          id: "msg_123",
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: '{"answer":42}', annotations: [] }],
+        },
+      ],
+    });
+
+    const response = await clientWith(stub.impl).generate({ ...PROMPT, outputSchema: schema });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.text).toEqual({
+      format: { type: "json_schema", name: "output", schema, strict: true },
+    });
+    expect(response.structured).toEqual({ answer: 42 });
+    expect(response.text).toBe('{"answer":42}');
+  });
+
+  it("rejects unparseable structured output with parse_failed", async () => {
+    const stub = stubFetch(200, RESPONSE); // text is "Hello, world", not JSON
+
+    const error = await rejection(
+      clientWith(stub.impl).generate({ ...PROMPT, outputSchema: { type: "object" } }),
+    );
+
+    expect(error.code).toBe("parse_failed");
+    expect(error.provider).toBe("openai");
+    expect(error.flavor).toBe("api");
+    expect(error.operation).toBe("generate");
+  });
+
+  it("leaves structured undefined and text absent without outputSchema", async () => {
+    const stub = stubFetch(200, RESPONSE);
+    const response = await clientWith(stub.impl).generate(PROMPT);
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("text");
+    expect(response).not.toHaveProperty("structured");
   });
 
   it("keeps truncated text and reports max_tokens", async () => {
@@ -291,6 +426,53 @@ describe("openai api backend", () => {
 
     await expect(pending).rejects.toBe(reason);
   });
+
+  it("hands maxRetries to the SDK, retrying a retryable failure", async () => {
+    let calls = 0;
+    const impl: typeof fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ error: { type: "api_error", message: "boom" } }), {
+        // retry-after-ms:0 keeps the retries instant rather than backing off.
+        status: 500,
+        headers: { "content-type": "application/json", "retry-after-ms": "0" },
+      });
+    };
+    const client = createClient({
+      provider: "openai",
+      flavor: "api",
+      model: "gpt-test",
+      apiKey: "test-key",
+      baseUrl: BASE_URL,
+      fetch: impl,
+      maxRetries: 2,
+    });
+
+    await rejection(client.generate(PROMPT));
+
+    expect(calls).toBe(3); // initial attempt + two retries
+  });
+
+  it("hands timeoutMs to the SDK, which aborts a slow request", async () => {
+    const client = createClient({
+      provider: "openai",
+      flavor: "api",
+      model: "gpt-test",
+      apiKey: "test-key",
+      baseUrl: BASE_URL,
+      // Never resolves until the SDK's own timeout aborts it.
+      fetch: (_input, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        }),
+      timeoutMs: 20,
+    });
+
+    const error = await rejection(client.generate(PROMPT));
+
+    expect(error.code).toBe("transport_failed");
+  });
 });
 
 function outputTextDelta(delta: string) {
@@ -371,6 +553,7 @@ describe("openai api backend streaming", () => {
           completionReason: "stop",
           provider: "openai",
           flavor: "api",
+          toolCalls: [],
           usage: {
             inputTokens: 10,
             outputTokens: 7,
@@ -381,6 +564,36 @@ describe("openai api backend streaming", () => {
         },
       },
     ]);
+  });
+
+  it("maps reasoning summary deltas to interleaved reasoning without polluting the text", async () => {
+    const reasoningDelta = (delta: string) => ({
+      type: "response.reasoning_summary_text.delta",
+      delta,
+      item_id: "rs_123",
+      output_index: 0,
+      summary_index: 0,
+      sequence_number: 1,
+    });
+    const stub = stubSse([
+      sse("response.reasoning_summary_text.delta", reasoningDelta("Think")),
+      sse("response.output_text.delta", outputTextDelta("Hello, ")),
+      sse("response.reasoning_summary_text.delta", reasoningDelta("ing")),
+      sse("response.output_text.delta", outputTextDelta("world")),
+      sse("response.completed", { type: "response.completed", response: RESPONSE }),
+    ]);
+
+    const events = await collect(clientWith(stub.impl).generateStream(PROMPT));
+
+    expect(events.slice(0, 4)).toEqual([
+      { type: "reasoning", text: "Think" },
+      { type: "text", text: "Hello, " },
+      { type: "reasoning", text: "ing" },
+      { type: "text", text: "world" },
+    ]);
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event");
+    expect(done.response.text).toBe("Hello, world");
   });
 
   it("yields only a done event when the stream carries no text", async () => {
@@ -396,6 +609,8 @@ describe("openai api backend streaming", () => {
     expect(events).toEqual([
       { type: "done", response: expect.objectContaining({ text: "", completionReason: "stop" }) },
     ]);
+    // No reasoning summary deltas in the stream, so no reasoning events.
+    expect(events.some((event) => event.type === "reasoning")).toBe(false);
   });
 
   it("keeps truncated text and reports max_tokens", async () => {

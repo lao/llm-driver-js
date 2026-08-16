@@ -1,7 +1,10 @@
 import { type ChildProcess, type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { type ErrorCode, LLMDriverError } from "../errors.js";
-import type { Message, Provider } from "../types.js";
+import type { ContentBlock, Message, Provider } from "../types.js";
 
 /** Hard cap on captured stdout and stderr, matching the Go reference. */
 const MAX_OUTPUT_BYTES = 16 << 20;
@@ -58,28 +61,112 @@ export interface CliOutcome {
 export function renderTranscript(messages: Message[]): string {
   const [first] = messages;
   if (messages.length === 1 && first?.role === "user") {
-    return first.text;
+    return messageText(first);
   }
   return messages
-    .map((message) => `${message.role === "assistant" ? "Assistant: " : "User: "}${message.text}`)
+    .map(
+      (message) =>
+        `${message.role === "assistant" ? "Assistant: " : "User: "}${messageText(message)}`,
+    )
     .join("\n\n");
 }
 
 /**
+ * Combines the caller's signal with an optional deadline. The returned signal
+ * aborts on either; `timedOut()` tells a fired deadline (→ `process_failed`)
+ * apart from a caller abort (→ raw `signal.reason`), the caller always winning a
+ * race. Reuses the runners' existing abort path, so a deadline kills the group.
+ */
+function withDeadline(
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): { signal: AbortSignal | undefined; timedOut: () => boolean } {
+  if (timeoutMs === undefined) return { signal, timedOut: () => false };
+  const deadline = AbortSignal.timeout(timeoutMs);
+  return {
+    signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
+    timedOut: () => deadline.aborted && !signal?.aborted,
+  };
+}
+
+function timeoutFailure(provider: Provider, timeoutMs: number): LLMDriverError {
+  return cliError(provider, "process_failed", `CLI command timed out after ${timeoutMs} ms`, {
+    providerCode: "timeout",
+  });
+}
+
+/**
+ * Flattens a message to plain text for CLI stdin. Content blocks reaching here
+ * are text-only — image and document blocks are rejected on CLI flavors by the
+ * capability gate before any transport.
+ */
+function messageText(message: Message): string {
+  if (message.content === undefined) return message.text ?? "";
+  return message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+}
+
+/** True when any message carries content blocks — the stream-json stdin trigger. */
+export function hasContentBlocks(messages: Message[]): boolean {
+  return messages.some((message) => message.content !== undefined);
+}
+
+/**
+ * Renders the transcript as newline-delimited stream-json messages — the input
+ * format `claude -p --input-format stream-json` reads. Each message becomes one
+ * `{type, message:{role, content}}` line whose content mirrors the Anthropic wire
+ * block shape (base64/url image sources), so images survive to the CLI. Used only
+ * when {@link hasContentBlocks} is true; text-only requests keep the plain path.
+ */
+export function renderStreamJson(messages: Message[]): string {
+  return messages
+    .map((message) =>
+      JSON.stringify({
+        type: message.role,
+        message: { role: message.role, content: streamContent(message) },
+      }),
+    )
+    .join("\n");
+}
+
+function streamContent(message: Message): string | ReturnType<typeof toStreamBlock>[] {
+  if (message.content === undefined) return message.text ?? "";
+  return message.content.map(toStreamBlock);
+}
+
+/** Maps one content block to its Anthropic stream-json wire form. */
+function toStreamBlock(block: ContentBlock) {
+  if (block.type === "image") {
+    const source =
+      "url" in block.source
+        ? { type: "url", url: block.source.url }
+        : { type: "base64", media_type: block.source.mediaType, data: block.source.base64 };
+    return { type: "image", source };
+  }
+  // Only text and image reach a CLI target; document blocks are gated out first.
+  return { type: "text", text: block.type === "text" ? block.text : "" };
+}
+
+/**
  * Runs a CLI command and normalizes process-level failures. Rejects only when
- * the caller aborts — every other failure is returned as {@link CliOutcome}
- * `failure` so a backend can still mine stdout for a provider diagnostic.
+ * the caller aborts — every other failure, including a `timeoutMs` deadline, is
+ * returned as {@link CliOutcome} `failure` so a backend can still mine stdout
+ * for a provider diagnostic.
  */
 export async function executeCli(
   provider: Provider,
   command: Command,
   runner: CommandRunner,
   signal?: AbortSignal,
+  timeoutMs?: number,
 ): Promise<CliOutcome> {
+  const deadline = withDeadline(signal, timeoutMs);
   let result: CommandResult;
   try {
-    result = await runner(command, signal);
+    result = await runner(command, deadline.signal);
   } catch (error) {
+    if (timeoutMs !== undefined && deadline.timedOut()) {
+      return { stdout: "", failure: timeoutFailure(provider, timeoutMs) };
+    }
     if (signal?.aborted) throw error;
     return { stdout: "", failure: launchFailure(provider, command, error) };
   }
@@ -100,14 +187,17 @@ export async function* streamCli(
   command: Command,
   runner: StreamingCommandRunner,
   signal?: AbortSignal,
+  timeoutMs?: number,
 ): AsyncGenerator<string> {
+  const deadline = withDeadline(signal, timeoutMs);
   let exit: { exitCode: number; stderr: string } | undefined;
   try {
-    for await (const chunk of runner(command, signal)) {
+    for await (const chunk of runner(command, deadline.signal)) {
       if (chunk.type === "line") yield chunk.line;
       else exit = chunk;
     }
   } catch (error) {
+    if (timeoutMs !== undefined && deadline.timedOut()) throw timeoutFailure(provider, timeoutMs);
     if (signal?.aborted) throw error;
     throw launchFailure(provider, command, error);
   }
@@ -159,6 +249,44 @@ export function parseJsonObject(
     throw cliError(provider, "parse_failed", `${description}: expected a JSON object`);
   }
   return parsed as Record<string, unknown>;
+}
+
+/**
+ * Parses a CLI's final text as JSON for structured output, mirroring the api
+ * flavors: the result payload is the model's JSON and unparseable output is
+ * `parse_failed`. Callers gate this on `request.outputSchema` being set.
+ */
+export function parseStructuredText(provider: Provider, text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch (cause) {
+    const name = provider === "claude" ? "Claude" : "Codex";
+    throw cliError(provider, "parse_failed", `${name} CLI structured output was not valid JSON`, {
+      cause,
+    });
+  }
+}
+
+/**
+ * Writes `contents` to a fresh private temp dir and hands back the file path plus
+ * an idempotent cleanup. Codex takes its output schema as a file path, so the
+ * caller passes `path` on argv and calls `cleanup()` in a `finally` — the dir is
+ * removed on resolve, reject, and abort alike.
+ */
+export async function withTempFile(
+  name: string,
+  contents: string,
+): Promise<{ path: string; cleanup: () => Promise<void> }> {
+  const dir = await mkdtemp(join(tmpdir(), "llmdriver-"));
+  const cleanup = () => rm(dir, { recursive: true, force: true });
+  const path = join(dir, name);
+  try {
+    await writeFile(path, contents);
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+  return { path, cleanup };
 }
 
 /** Reads a nested object, treating anything else as absent. */

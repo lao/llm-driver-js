@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { createClaudeCliBackend } from "../src/backends/claude-cli.js";
-import type { CommandResult, CommandRunner, StreamingCommandRunner } from "../src/backends/cli.js";
+import type {
+  Command,
+  CommandResult,
+  CommandRunner,
+  StreamingCommandRunner,
+} from "../src/backends/cli.js";
 import { createCodexCliBackend } from "../src/backends/codex-cli.js";
 import { createClient, createClientWithBackend } from "../src/client.js";
+import { LLMDriverError } from "../src/errors.js";
 import {
   assistant,
   type Config,
@@ -11,6 +17,7 @@ import {
   type Response as GenerateResponse,
   type Provider,
   type StreamEvent,
+  type Tool,
   user,
 } from "../src/types.js";
 
@@ -25,6 +32,10 @@ const PROMPT: GenerateRequest = {
 const DELTAS = ["Hello, ", "world"];
 const TEXT = DELTAS.join("");
 
+/** Reasoning chunks, interleaved with text in each streaming fixture. */
+const REASONING_DELTAS = ["Think", "ing"];
+const REASONING_TEXT = REASONING_DELTAS.join("");
+
 /** Replies with a canned payload; never touches the network. */
 function stubFetch(body: unknown): typeof fetch {
   return async () =>
@@ -32,6 +43,18 @@ function stubFetch(body: unknown): typeof fetch {
       status: 200,
       headers: { "content-type": "application/json" },
     });
+}
+
+/** Serves canned JSON payloads in order, one per request; never touches the network. */
+function sequencedFetch(bodies: unknown[]): typeof fetch {
+  let call = 0;
+  return async () => {
+    const body = bodies[Math.min(call++, bodies.length - 1)];
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
 }
 
 /** Replies with canned process output; never spawns a process. */
@@ -53,6 +76,23 @@ function stubSseFetch(chunks: string[]): typeof fetch {
     );
 }
 
+/** Serves one canned SSE body per request (one tool round each); never touches the network. */
+function sequencedSseFetch(rounds: string[][]): typeof fetch {
+  let call = 0;
+  return async () => {
+    const round = rounds[Math.min(call++, rounds.length - 1)] ?? [];
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of round) controller.enqueue(new TextEncoder().encode(chunk));
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+  };
+}
+
 function sse(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
@@ -64,6 +104,47 @@ function stubStreamRunner(lines: string[]): StreamingCommandRunner {
     yield { type: "exit", exitCode: 0, stderr: "" };
   };
 }
+
+/** Reads the loopback bridge URL out of either CLI's argv (claude or codex). */
+function bridgeUrl(command: Command): string {
+  const configIndex = command.args.indexOf("--mcp-config");
+  if (configIndex >= 0) {
+    const { mcpServers } = JSON.parse(command.args[configIndex + 1] as string) as {
+      mcpServers: { llmdriver: { url: string } };
+    };
+    return mcpServers.llmdriver.url;
+  }
+  // codex: `-c mcp_servers.llmdriver.url="http://..."`
+  const cIndex = command.args.indexOf("-c");
+  const override = command.args[cIndex + 1] as string;
+  return JSON.parse(override.slice(override.indexOf("=") + 1)) as string;
+}
+
+/** Plays a CLI: calls the live MCP bridge named in the argv over HTTP. */
+async function bridgeCall(
+  command: Command,
+  id: string,
+  name: string,
+  args: unknown,
+): Promise<void> {
+  await fetch(bridgeUrl(command), {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name, arguments: args },
+    }),
+  });
+}
+
+const CLAUDE_CLI_STDOUT_USAGE = {
+  input_tokens: 10,
+  output_tokens: 5,
+  cache_read_input_tokens: 3,
+  cache_creation_input_tokens: 2,
+};
 
 const CLAUDE_API_BODY = {
   id: "msg_123",
@@ -118,23 +199,39 @@ const CLAUDE_CLI_STDOUT = JSON.stringify({
 
 const CODEX_CLI_STDOUT = [
   '{"type":"thread.started","thread_id":"thread-1"}',
+  ...REASONING_DELTAS.map(
+    (text) =>
+      `{"type":"item.completed","item":{"type":"reasoning","text":${JSON.stringify(text)}}}`,
+  ),
   `{"type":"item.completed","item":{"type":"agent_message","text":${JSON.stringify(TEXT)}}}`,
   '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5,' +
     '"cached_input_tokens":3,"cache_write_input_tokens":2,"reasoning_output_tokens":1}}',
   "",
 ].join("\n");
 
+/** Pairs each reasoning chunk with the text chunk that follows it, in source order. */
+function interleave<T>(reasoning: (chunk: string) => T, text: (chunk: string) => T): T[] {
+  return REASONING_DELTAS.flatMap((chunk, i) => [reasoning(chunk), text(DELTAS[i] as string)]);
+}
+
 const CLAUDE_API_STREAM = [
   sse("message_start", {
     type: "message_start",
     message: { ...CLAUDE_API_BODY, content: [], stop_reason: null, stop_sequence: null },
   }),
-  ...DELTAS.map((text) =>
-    sse("content_block_delta", {
-      type: "content_block_delta",
-      index: 0,
-      delta: { type: "text_delta", text },
-    }),
+  ...interleave(
+    (thinking) =>
+      sse("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking },
+      }),
+    (text) =>
+      sse("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text },
+      }),
   ),
   sse("message_delta", {
     type: "message_delta",
@@ -145,25 +242,45 @@ const CLAUDE_API_STREAM = [
 ];
 
 const OPENAI_API_STREAM = [
-  ...DELTAS.map((delta) =>
-    sse("response.output_text.delta", {
-      type: "response.output_text.delta",
-      delta,
-      item_id: "msg_123",
-      output_index: 0,
-      content_index: 0,
-      sequence_number: 1,
-    }),
+  ...interleave(
+    (delta) =>
+      sse("response.reasoning_summary_text.delta", {
+        type: "response.reasoning_summary_text.delta",
+        delta,
+        item_id: "rs_123",
+        output_index: 0,
+        summary_index: 0,
+        sequence_number: 1,
+      }),
+    (delta) =>
+      sse("response.output_text.delta", {
+        type: "response.output_text.delta",
+        delta,
+        item_id: "msg_123",
+        output_index: 0,
+        content_index: 0,
+        sequence_number: 1,
+      }),
   ),
   sse("response.completed", { type: "response.completed", response: OPENAI_API_BODY }),
 ];
 
 const CLAUDE_CLI_STREAM = [
-  ...DELTAS.map((text) =>
-    JSON.stringify({
-      type: "stream_event",
-      event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
-    }),
+  ...interleave(
+    (thinking) =>
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "thinking_delta", thinking },
+        },
+      }),
+    (text) =>
+      JSON.stringify({
+        type: "stream_event",
+        event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+      }),
   ),
   CLAUDE_CLI_STDOUT,
 ];
@@ -290,6 +407,7 @@ describe("contract across all four targets", () => {
         completionReason: target.completionReason,
         provider: target.provider,
         flavor: target.flavor,
+        toolCalls: [],
         usage: {
           inputTokens: 10,
           outputTokens: 5,
@@ -325,6 +443,382 @@ describe("contract across all four targets", () => {
     });
   }
 
+  for (const target of targets) {
+    it(`${target.provider}/${target.flavor} streams reasoning without polluting the text`, async () => {
+      const events: StreamEvent[] = [];
+      for await (const event of target.stream(PROMPT)) events.push(event);
+
+      const reasoning = events
+        .filter((event) => event.type === "reasoning")
+        .map((event) => event.text)
+        .join("");
+      const text = events
+        .filter((event) => event.type === "text")
+        .map((event) => event.text)
+        .join("");
+      const done = events.at(-1);
+      if (done?.type !== "done") throw new Error("unreachable");
+
+      // Reasoning is surfaced in source order and never folds into the text.
+      expect(reasoning).toBe(REASONING_TEXT);
+      expect(text).toBe(done.response.text);
+      expect(done.response.text).not.toContain(REASONING_TEXT);
+    });
+  }
+
+  it("accepts a neutral reasoning request on every target with the same shape", async () => {
+    // reasoning.effort is ✅ on all four targets, so one request runs unmodified
+    // everywhere and normalizes to the identical shape (matrix single source).
+    const reasoningPrompt: GenerateRequest = { ...PROMPT, reasoning: { effort: "medium" } };
+    const responses = await Promise.all(targets.map((target) => target.generate(reasoningPrompt)));
+
+    const shapes = responses.map((response) => ({
+      keys: Object.keys(response).sort(),
+      usageKeys: Object.keys(response.usage).sort(),
+    }));
+    for (const shape of shapes) {
+      expect(shape).toEqual(shapes[0]);
+    }
+  });
+
+  // A base64 image in the final user turn is honored on all four targets: API
+  // flavors natively, claude/cli via stream-json stdin (T8), codex/cli via temp
+  // files + `-i` (T9). One neutral image fixture proves the whole matrix row.
+  const IMAGE_PROMPT: GenerateRequest = {
+    maxTokens: 64,
+    messages: [
+      user([
+        { type: "text", text: "describe" },
+        { type: "image", source: { base64: "aGVsbG8=", mediaType: "image/png" } },
+      ]),
+    ],
+  };
+
+  // All four targets honor image input (API flavors, claude/cli T8, codex/cli T9).
+  const imageSupported = (_t: Target) => true;
+
+  for (const target of targets.filter(imageSupported)) {
+    it(`${target.provider}/${target.flavor} accepts an image request`, async () => {
+      const response = await target.generate(IMAGE_PROMPT);
+      expect(response.text).toBe(TEXT);
+      expect(response.provider).toBe(target.provider);
+      expect(response.flavor).toBe(target.flavor);
+    });
+  }
+
+  for (const target of targets.filter((t) => !imageSupported(t))) {
+    it(`${target.provider}/${target.flavor} rejects an image request as unsupported`, async () => {
+      const error = await target.generate(IMAGE_PROMPT).catch((caught) => caught);
+      expect(error).toBeInstanceOf(LLMDriverError);
+      expect((error as LLMDriverError).code).toBe("unsupported_feature");
+    });
+  }
+
+  it("runs the tool loop to the same toolCalls and text on all four targets", async () => {
+    // One neutral tool request, sent to every target. Provider wire shapes differ
+    // (Messages tool_use vs Responses function_call vs the CLI MCP bridge) but the
+    // normalized toolCalls records and final text must be identical. Shared call id
+    // + input make the records comparable across providers. This is the plan's
+    // headline success criterion.
+    const request: GenerateRequest = {
+      maxTokens: 64,
+      messages: [user("look it up")],
+      tools: [
+        {
+          name: "lookup",
+          description: "looks up a value",
+          inputSchema: { type: "object", properties: { q: { type: "string" } } },
+          execute: () => "42",
+        } satisfies Tool,
+      ],
+    };
+
+    const claude = createClient({
+      provider: "claude",
+      flavor: "api",
+      model: "claude-api-test",
+      apiKey: "test-key",
+      baseUrl: "https://anthropic.test",
+      fetch: sequencedFetch([
+        {
+          id: "msg_tool",
+          type: "message",
+          role: "assistant",
+          model: "claude-api-test",
+          content: [{ type: "tool_use", id: "tc_1", name: "lookup", input: { q: "x" } }],
+          stop_reason: "tool_use",
+          usage: CLAUDE_API_BODY.usage,
+        },
+        { ...CLAUDE_API_BODY, content: [{ type: "text", text: "the value is 42" }] },
+      ]),
+    });
+
+    const openai = createClient({
+      provider: "openai",
+      flavor: "api",
+      model: "gpt-api-test",
+      apiKey: "test-key",
+      baseUrl: "https://openai.test",
+      fetch: sequencedFetch([
+        {
+          id: "resp_tool",
+          object: "response",
+          status: "completed",
+          model: "gpt-api-test",
+          output: [
+            {
+              type: "function_call",
+              status: "completed",
+              call_id: "tc_1",
+              name: "lookup",
+              arguments: JSON.stringify({ q: "x" }),
+            },
+          ],
+          usage: OPENAI_API_BODY.usage,
+        },
+        {
+          ...OPENAI_API_BODY,
+          output: [
+            {
+              id: "msg_1",
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: "the value is 42", annotations: [] }],
+            },
+          ],
+        },
+      ]),
+    });
+
+    // claude/cli reaches the identical record through the MCP bridge: the fake
+    // runner plays the CLI, calling the live loopback bridge over HTTP with the
+    // shared call id, then returns the final result payload.
+    const cliResult = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "the value is 42",
+      session_id: "session-1",
+      usage: CLAUDE_CLI_STDOUT_USAGE,
+    });
+    const cliRunner: CommandRunner = async (command) => {
+      await bridgeCall(command, "tc_1", "lookup", { q: "x" });
+      return { stdout: cliResult, stderr: "", exitCode: 0 };
+    };
+    const cli = createClientWithBackend(
+      CLAUDE_CLI_CONFIG,
+      createClaudeCliBackend(CLAUDE_CLI_CONFIG, cliRunner),
+    );
+
+    // codex/cli reaches the identical record through the same MCP bridge: the
+    // fake runner plays codex, calling the live loopback bridge over HTTP with
+    // the shared call id, then returns the final JSONL turn.
+    const codexResult = [
+      '{"type":"thread.started","thread_id":"thread-1"}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"the value is 42"}}',
+      '{"type":"turn.completed","usage":{}}',
+      "",
+    ].join("\n");
+    const codexRunner: CommandRunner = async (command) => {
+      await bridgeCall(command, "tc_1", "lookup", { q: "x" });
+      return { stdout: codexResult, stderr: "", exitCode: 0 };
+    };
+    const codex = createClientWithBackend(
+      CODEX_CLI_CONFIG,
+      createCodexCliBackend(CODEX_CLI_CONFIG, codexRunner),
+    );
+
+    const [claudeResponse, openaiResponse, cliResponse, codexResponse] = await Promise.all([
+      claude.generate(request),
+      openai.generate(request),
+      cli.generate(request),
+      codex.generate(request),
+    ]);
+
+    const expectedToolCalls = [
+      {
+        id: "tc_1",
+        name: "lookup",
+        input: { q: "x" },
+        output: { text: "42", isError: false },
+        isError: false,
+      },
+    ];
+    for (const response of [claudeResponse, openaiResponse, cliResponse, codexResponse]) {
+      expect(response.toolCalls).toEqual(expectedToolCalls);
+      expect(response.text).toBe("the value is 42");
+    }
+  });
+
+  it("streams the same tool event ordering on both api targets", async () => {
+    // One neutral tool request, streamed through both api flavors. Provider SSE
+    // shapes differ, but the normalized event sequence, ids, and final text must
+    // match: text → tool_call → tool_result → text → done, done last exactly once.
+    const request: GenerateRequest = {
+      maxTokens: 64,
+      messages: [user("look it up")],
+      tools: [
+        {
+          name: "lookup",
+          description: "looks up a value",
+          inputSchema: { type: "object", properties: { q: { type: "string" } } },
+          execute: () => "42",
+        } satisfies Tool,
+      ],
+    };
+
+    const claudeStart = {
+      type: "message_start",
+      message: { ...CLAUDE_API_BODY, content: [], stop_reason: null, stop_sequence: null },
+    };
+    const claude = createClient({
+      provider: "claude",
+      flavor: "api",
+      model: "claude-api-test",
+      apiKey: "test-key",
+      baseUrl: "https://anthropic.test",
+      fetch: sequencedSseFetch([
+        [
+          sse("message_start", claudeStart),
+          sse("content_block_start", {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "tool_use", id: "tc_1", name: "lookup", input: {} },
+          }),
+          sse("content_block_delta", {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "input_json_delta", partial_json: JSON.stringify({ q: "x" }) },
+          }),
+          sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+          sse("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "tool_use", stop_sequence: null },
+            usage: { output_tokens: 5 },
+          }),
+          sse("message_stop", { type: "message_stop" }),
+        ],
+        [
+          sse("message_start", claudeStart),
+          sse("content_block_start", {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          }),
+          sse("content_block_delta", {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "the value is 42" },
+          }),
+          sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+          sse("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: { output_tokens: 5 },
+          }),
+          sse("message_stop", { type: "message_stop" }),
+        ],
+      ]),
+    });
+
+    const openai = createClient({
+      provider: "openai",
+      flavor: "api",
+      model: "gpt-api-test",
+      apiKey: "test-key",
+      baseUrl: "https://openai.test",
+      fetch: sequencedSseFetch([
+        [
+          sse("response.completed", {
+            type: "response.completed",
+            response: {
+              id: "resp_tool",
+              object: "response",
+              status: "completed",
+              model: "gpt-api-test",
+              output: [
+                {
+                  type: "function_call",
+                  status: "completed",
+                  call_id: "tc_1",
+                  name: "lookup",
+                  arguments: JSON.stringify({ q: "x" }),
+                },
+              ],
+              usage: OPENAI_API_BODY.usage,
+            },
+          }),
+        ],
+        [
+          sse("response.output_text.delta", {
+            type: "response.output_text.delta",
+            delta: "the value is 42",
+            item_id: "msg_1",
+            output_index: 0,
+            content_index: 0,
+            sequence_number: 1,
+          }),
+          sse("response.completed", {
+            type: "response.completed",
+            response: {
+              ...OPENAI_API_BODY,
+              output: [
+                {
+                  id: "msg_1",
+                  type: "message",
+                  status: "completed",
+                  role: "assistant",
+                  content: [{ type: "output_text", text: "the value is 42", annotations: [] }],
+                },
+              ],
+            },
+          }),
+        ],
+      ]),
+    });
+
+    const drain = async (stream: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> => {
+      const events: StreamEvent[] = [];
+      for await (const event of stream) events.push(event);
+      return events;
+    };
+    const [claudeEvents, openaiEvents] = await Promise.all([
+      drain(claude.generateStream(request)),
+      drain(openai.generateStream(request)),
+    ]);
+
+    for (const events of [claudeEvents, openaiEvents]) {
+      // A tool_call always precedes its matching tool_result (same id).
+      const callAt = events.findIndex((e) => e.type === "tool_call");
+      const resultAt = events.findIndex((e) => e.type === "tool_result");
+      expect(callAt).toBeGreaterThanOrEqual(0);
+      expect(callAt).toBeLessThan(resultAt);
+      const call = events[callAt];
+      const result = events[resultAt];
+      if (call?.type !== "tool_call" || result?.type !== "tool_result")
+        throw new Error("unreachable");
+      expect(call.id).toBe(result.id);
+
+      const done = events.at(-1);
+      if (done?.type !== "done") throw new Error("expected a done event last");
+      expect(events.filter((e) => e.type === "done")).toHaveLength(1);
+      expect(done.response.text).toBe("the value is 42");
+      expect(done.response.toolCalls).toEqual([
+        {
+          id: "tc_1",
+          name: "lookup",
+          input: { q: "x" },
+          output: { text: "42", isError: false },
+          isError: false,
+        },
+      ]);
+    }
+
+    // Normalized event-type sequences are identical across providers.
+    expect(claudeEvents.map((e) => e.type)).toEqual(openaiEvents.map((e) => e.type));
+  });
+
   it("returns the same field set from every target", async () => {
     const responses = await Promise.all(targets.map((target) => target.generate(PROMPT)));
     const shapes = responses.map((response) => ({
@@ -336,4 +830,110 @@ describe("contract across all four targets", () => {
       expect(shape).toEqual(shapes[0]);
     }
   });
+
+  it("stamps toolCalls on every target", async () => {
+    for (const target of targets) {
+      const response = await target.generate(PROMPT);
+      expect(response.toolCalls).toEqual([]);
+    }
+  });
+});
+
+/** A schema and a matching JSON payload the structured targets echo back. */
+const SCHEMA = { type: "object", properties: { answer: { type: "number" } } };
+const STRUCTURED = { answer: 42 };
+const STRUCTURED_TEXT = JSON.stringify(STRUCTURED);
+
+const CLAUDE_CLI_STRUCTURED_STDOUT = JSON.stringify({
+  type: "result",
+  subtype: "success",
+  is_error: false,
+  result: STRUCTURED_TEXT,
+  session_id: "session-1",
+  usage: { input_tokens: 10, output_tokens: 5 },
+});
+
+const CODEX_CLI_STRUCTURED_STDOUT = [
+  '{"type":"thread.started","thread_id":"thread-1"}',
+  `{"type":"item.completed","item":{"type":"agent_message","text":${JSON.stringify(STRUCTURED_TEXT)}}}`,
+  '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}',
+  "",
+].join("\n");
+
+/** All four targets parse their final text into `structured` identically. */
+const structuredTargets: {
+  provider: Provider;
+  flavor: Flavor;
+  generate: (request: GenerateRequest) => Promise<GenerateResponse>;
+}[] = [
+  {
+    provider: "claude",
+    flavor: "api",
+    generate: (request) =>
+      createClient({
+        provider: "claude",
+        flavor: "api",
+        model: "claude-api-test",
+        apiKey: "test-key",
+        baseUrl: "https://anthropic.test",
+        fetch: stubFetch({
+          ...CLAUDE_API_BODY,
+          content: [{ type: "text", text: STRUCTURED_TEXT }],
+        }),
+      }).generate(request),
+  },
+  {
+    provider: "openai",
+    flavor: "api",
+    generate: (request) =>
+      createClient({
+        provider: "openai",
+        flavor: "api",
+        model: "gpt-api-test",
+        apiKey: "test-key",
+        baseUrl: "https://openai.test",
+        fetch: stubFetch({
+          ...OPENAI_API_BODY,
+          output: [
+            {
+              id: "msg_123",
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: STRUCTURED_TEXT, annotations: [] }],
+            },
+          ],
+        }),
+      }).generate(request),
+  },
+  {
+    provider: "claude",
+    flavor: "cli",
+    generate: (request) =>
+      createClientWithBackend(
+        CLAUDE_CLI_CONFIG,
+        createClaudeCliBackend(CLAUDE_CLI_CONFIG, stubRunner(CLAUDE_CLI_STRUCTURED_STDOUT)),
+      ).generate(request),
+  },
+  {
+    provider: "openai",
+    flavor: "cli",
+    generate: (request) =>
+      createClientWithBackend(
+        CODEX_CLI_CONFIG,
+        createCodexCliBackend(CODEX_CLI_CONFIG, stubRunner(CODEX_CLI_STRUCTURED_STDOUT)),
+      ).generate(request),
+  },
+];
+
+describe("structured output across all four targets", () => {
+  for (const target of structuredTargets) {
+    it(`${target.provider}/${target.flavor} parses the final text into structured`, async () => {
+      const response = await target.generate({ ...PROMPT, outputSchema: SCHEMA });
+
+      expect(response.structured).toEqual(STRUCTURED);
+      expect(response.text).toBe(STRUCTURED_TEXT);
+      expect(response.toolCalls).toEqual([]);
+    });
+  }
 });

@@ -60,6 +60,30 @@ describe("claude cli command", () => {
     expect(calls[0]?.signal).toBe(signal);
   });
 
+  it("passes reasoning.effort as --effort before extra cli args", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+    const backend = createClaudeCliBackend({ ...config, cliArgs: ["--foo"] }, runner);
+
+    await backend.generate({ ...request, reasoning: { effort: "high" } });
+
+    expect(calls[0]?.command.args).toEqual([
+      ...baseArgs,
+      "--model",
+      "claude-test",
+      "--effort",
+      "high",
+      "--foo",
+    ]);
+  });
+
+  it("omits --effort when the request has no reasoning (byte-identical to v1)", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate(request);
+
+    expect(calls[0]?.command.args).toEqual([...baseArgs, "--model", "claude-test"]);
+  });
+
   it("appends the system prompt and extra cli args, and renders the transcript", async () => {
     const { runner, calls } = fakeRunner({ stdout: okStdout });
     const backend = createClaudeCliBackend(
@@ -90,6 +114,214 @@ describe("claude cli command", () => {
       ],
       stdin: "User: First\n\nAssistant: Second\n\nUser: Third",
     });
+  });
+});
+
+describe("claude cli structured output", () => {
+  const schema = { type: "object", properties: { answer: { type: "number" } } };
+
+  it("adds --json-schema and parses the result payload into structured", async () => {
+    const { runner, calls } = fakeRunner({
+      stdout: '{"type":"result","subtype":"success","result":"{\\"answer\\":42}"}',
+    });
+
+    const response = await createClaudeCliBackend(config, runner).generate({
+      ...request,
+      outputSchema: schema,
+    });
+
+    // Characterized by integration: current best knowledge is that the JSON
+    // lands in the same `result` text field as plain output.
+    expect(calls[0]?.command.args).toContain("--json-schema");
+    const flagIndex = calls[0]?.command.args.indexOf("--json-schema") ?? -1;
+    expect(calls[0]?.command.args[flagIndex + 1]).toBe(JSON.stringify(schema));
+    expect(response.structured).toEqual({ answer: 42 });
+    expect(response.text).toBe('{"answer":42}');
+  });
+
+  it("reports parse_failed when the structured result is not valid JSON", async () => {
+    const { runner } = fakeRunner({
+      stdout: '{"type":"result","subtype":"success","result":"not json"}',
+    });
+
+    const error = await createClaudeCliBackend(config, runner)
+      .generate({ ...request, outputSchema: schema })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect(error.code).toBe("parse_failed");
+    expect(error.provider).toBe("claude");
+    expect(error.flavor).toBe("cli");
+  });
+
+  it("omits --json-schema and leaves structured undefined without a schema", async () => {
+    const { runner, calls } = fakeRunner({
+      stdout: '{"type":"result","subtype":"success","result":"ok"}',
+    });
+
+    const response = await createClaudeCliBackend(config, runner).generate(request);
+
+    expect(calls[0]?.command.args).not.toContain("--json-schema");
+    expect(response.structured).toBeUndefined();
+  });
+});
+
+// A 1x1 PNG — the payload does not matter, only that it survives to stdin.
+const PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+describe("claude cli image input (stream-json stdin)", () => {
+  const okStdout = '{"type":"result","subtype":"success","result":"ok"}';
+
+  it("switches to --input-format stream-json and renders image content blocks", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate({
+      maxTokens: 32,
+      messages: [
+        user([
+          { type: "text", text: "What is in this image?" },
+          { type: "image", source: { base64: PNG_BASE64, mediaType: "image/png" } },
+        ]),
+      ],
+    });
+
+    const command = calls[0]?.command;
+    expect(command?.args).toEqual([
+      "-p",
+      "--output-format",
+      "json",
+      "--input-format",
+      "stream-json",
+      "--permission-mode",
+      "default",
+      "--model",
+      "claude-test",
+    ]);
+    // Exactly one stream-json line, a well-formed Anthropic user message.
+    const lines = (command?.stdin ?? "").split("\n");
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0] as string)).toEqual({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "What is in this image?" },
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: PNG_BASE64 },
+          },
+        ],
+      },
+    });
+  });
+
+  it("renders a mixed multi-turn transcript as one stream-json line per message", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate({
+      maxTokens: 32,
+      messages: [
+        user([{ type: "image", source: { url: "https://example.com/cat.png" } }]),
+        assistant("A cat."),
+        user("And this one?"),
+      ],
+    });
+
+    const lines = (calls[0]?.command.stdin ?? "").split("\n");
+    expect(lines).toHaveLength(3);
+    expect(JSON.parse(lines[0] as string)).toEqual({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "image", source: { type: "url", url: "https://example.com/cat.png" } }],
+      },
+    });
+    // A plain-text turn keeps its string content inside the stream-json envelope.
+    expect(JSON.parse(lines[1] as string)).toEqual({
+      type: "assistant",
+      message: { role: "assistant", content: "A cat." },
+    });
+    expect(JSON.parse(lines[2] as string)).toEqual({
+      type: "user",
+      message: { role: "user", content: "And this one?" },
+    });
+  });
+
+  it("also switches the streaming path to stream-json input", async () => {
+    const fake = fakeStreamRunner([resultLine]);
+    const backend = createClaudeCliBackend(config, neverSpawn, fake.runner);
+
+    await collect(
+      backend.generateStream({
+        maxTokens: 32,
+        messages: [
+          user([{ type: "image", source: { base64: PNG_BASE64, mediaType: "image/png" } }]),
+        ],
+      }),
+    );
+
+    expect(fake.calls[0]?.command.args).toEqual([
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--include-partial-messages",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--permission-mode",
+      "default",
+      "--model",
+      "claude-test",
+    ]);
+  });
+});
+
+/**
+ * v1 REGRESSION — the top risk in the T8 plan. A text-only request MUST keep the
+ * v1 plain-stdin path byte-for-byte: no `--input-format stream-json` in argv, and
+ * stdin identical to the frozen v1 bytes. Frozen literals, not derived, so a
+ * change in the rendering code is caught here rather than silently tracked.
+ */
+describe("claude cli v1 text-only path is byte-identical", () => {
+  const okStdout = '{"type":"result","subtype":"success","result":"ok"}';
+  // Frozen from v1: lone user message goes raw; multi-turn is labelled blocks.
+  const FROZEN_LONE_STDIN = "Hello";
+  const FROZEN_MULTITURN_STDIN = "User: First\n\nAssistant: Second\n\nUser: Third";
+
+  it("sends a lone user message with the frozen v1 argv and stdin", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate({
+      maxTokens: 32,
+      messages: [user("Hello")],
+    });
+
+    const command = calls[0]?.command;
+    expect(command?.args).not.toContain("--input-format");
+    expect(command?.args).not.toContain("stream-json");
+    expect(command).toEqual({
+      executable: "claude",
+      args: [...baseArgs, "--model", "claude-test"],
+      stdin: FROZEN_LONE_STDIN,
+    });
+    // Byte-for-byte, explicitly.
+    expect(Buffer.from(command?.stdin ?? "")).toEqual(Buffer.from(FROZEN_LONE_STDIN));
+  });
+
+  it("renders a text-only multi-turn transcript with the frozen v1 bytes", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate({
+      system: "Be concise.",
+      maxTokens: 32,
+      messages: [user("First"), assistant("Second"), user("Third")],
+    });
+
+    const command = calls[0]?.command;
+    expect(command?.args).not.toContain("--input-format");
+    expect(command?.stdin).toBe(FROZEN_MULTITURN_STDIN);
+    expect(Buffer.from(command?.stdin ?? "")).toEqual(Buffer.from(FROZEN_MULTITURN_STDIN));
   });
 });
 
@@ -127,6 +359,7 @@ describe("claude cli parsing", () => {
       completionReason: "",
       provider: "claude",
       flavor: "cli",
+      toolCalls: [],
     });
   });
 
@@ -392,7 +625,7 @@ describe("claude cli streaming command", () => {
 });
 
 describe("claude cli streaming events", () => {
-  it("yields partial text deltas, then the same response generate would return", async () => {
+  it("yields interleaved reasoning and text deltas, then the same response generate would return", async () => {
     const { backend } = streamBackend([
       '{"type":"system","subtype":"init","session_id":"session-123"}',
       delta("Hello, "),
@@ -405,11 +638,13 @@ describe("claude cli streaming events", () => {
 
     const events = await collect(backend.generateStream(request));
 
-    expect(events.slice(0, 2)).toEqual([
+    // Reasoning is interleaved in source order between the two text deltas.
+    expect(events.slice(0, 3)).toEqual([
       { type: "text", text: "Hello, " },
+      { type: "reasoning", text: "hmm" },
       { type: "text", text: "world" },
     ]);
-    expect(events[2]).toEqual({
+    expect(events[3]).toEqual({
       type: "done",
       response: {
         id: "session-123",
@@ -425,6 +660,7 @@ describe("claude cli streaming events", () => {
         completionReason: "",
         provider: "claude",
         flavor: "cli",
+        toolCalls: [],
       },
     });
     const text = events
@@ -514,5 +750,211 @@ describe("claude cli streaming failures", () => {
     const backend = createClaudeCliBackend(config, neverSpawn, runner);
 
     await expect(collect(backend.generateStream(request, controller.signal))).rejects.toBe(reason);
+  });
+});
+
+// ── Tools via the MCP bridge (T14) ─────────────────────────────────────────
+// These drive the REAL loopback bridge: the fake runner reads the bridge URL
+// out of the argv it is handed and plays the CLI, calling the bridge over HTTP.
+
+const toolsRequest: Request = {
+  maxTokens: 32,
+  messages: [user("add 1 and 2")],
+  tools: [
+    {
+      name: "add",
+      description: "adds two numbers",
+      inputSchema: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } } },
+      execute: (input) => `sum:${JSON.stringify(input)}`,
+    },
+    {
+      name: "mul",
+      description: "multiplies two numbers",
+      inputSchema: { type: "object" },
+      execute: () => "0",
+    },
+  ],
+};
+
+/** Extracts the bridge URL the adapter wrote into `--mcp-config`. */
+function bridgeUrl(command: Command): string {
+  const index = command.args.indexOf("--mcp-config");
+  const parsed = JSON.parse(command.args[index + 1] as string) as {
+    mcpServers: { llmdriver: { url: string } };
+  };
+  return parsed.mcpServers.llmdriver.url;
+}
+
+/** One JSON-RPC call to the live bridge; rejects if the bridge is closed. */
+async function rpc(url: string, method: string, params?: unknown): Promise<Response> {
+  return fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+}
+
+const okStdout = '{"type":"result","subtype":"success","result":"ok"}';
+
+describe("claude cli tools argv", () => {
+  it("adds --mcp-config (parsed), --strict-mcp-config, and one --allowedTools per tool", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate(toolsRequest);
+
+    const args = calls[0]?.command.args ?? [];
+    expect(args).toContain("--strict-mcp-config");
+
+    const configIndex = args.indexOf("--mcp-config");
+    expect(configIndex).toBeGreaterThanOrEqual(0);
+    const parsed = JSON.parse(args[configIndex + 1] as string);
+    expect(parsed).toEqual({
+      mcpServers: {
+        llmdriver: {
+          type: "http",
+          url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/[0-9a-f-]{36}$/),
+        },
+      },
+    });
+
+    const allowed = args.filter((_arg, i) => args[i - 1] === "--allowedTools");
+    expect(allowed).toEqual(["mcp__llmdriver__add", "mcp__llmdriver__mul"]);
+  });
+
+  it("keeps the v1 argv untouched when the request carries no tools", async () => {
+    const { runner, calls } = fakeRunner({ stdout: okStdout });
+
+    await createClaudeCliBackend(config, runner).generate(request);
+
+    const args = calls[0]?.command.args ?? [];
+    expect(args).not.toContain("--mcp-config");
+    expect(args).not.toContain("--strict-mcp-config");
+    expect(args).not.toContain("--allowedTools");
+  });
+});
+
+describe("claude cli tools bridge lifecycle", () => {
+  it("keeps the bridge reachable during the run, then closes it on resolve", async () => {
+    let url = "";
+    let statusDuringRun = 0;
+    const runner: CommandRunner = async (command) => {
+      url = bridgeUrl(command);
+      statusDuringRun = (await rpc(url, "tools/list")).status;
+      return { stdout: okStdout, stderr: "", exitCode: 0 };
+    };
+
+    await createClaudeCliBackend(config, runner).generate(toolsRequest);
+
+    expect(statusDuringRun).toBe(200);
+    await expect(rpc(url, "tools/list")).rejects.toThrow(); // connection refused after close
+  });
+
+  it("closes the bridge when the run fails", async () => {
+    let url = "";
+    const runner: CommandRunner = async (command) => {
+      url = bridgeUrl(command);
+      return { stdout: "", stderr: "boom\n", exitCode: 1 };
+    };
+
+    await expect(
+      createClaudeCliBackend(config, runner).generate(toolsRequest),
+    ).rejects.toBeInstanceOf(LLMDriverError);
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+
+  it("closes the bridge when the run aborts", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    let url = "";
+    const runner: CommandRunner = async (command, signal) => {
+      url = bridgeUrl(command);
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+
+    await expect(
+      createClaudeCliBackend(config, runner).generate(toolsRequest, controller.signal),
+    ).rejects.toBe(reason);
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+
+  it("closes the bridge when the consumer breaks early", async () => {
+    let url = "";
+    const runner: StreamingCommandRunner = async function* (command) {
+      url = bridgeUrl(command);
+      yield { type: "line", line: delta("Hello") };
+      yield { type: "line", line: resultLine };
+      yield { type: "exit", exitCode: 0, stderr: "" };
+    };
+    const backend = createClaudeCliBackend(config, neverSpawn, runner);
+
+    for await (const _event of backend.generateStream(toolsRequest)) break;
+
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+});
+
+describe("claude cli tools round-trip", () => {
+  it("populates response.toolCalls from a mid-turn tool call (generate)", async () => {
+    const runner: CommandRunner = async (command) => {
+      await rpc(bridgeUrl(command), "tools/call", { name: "add", arguments: { a: 1, b: 2 } });
+      return { stdout: okStdout, stderr: "", exitCode: 0 };
+    };
+
+    const response = await createClaudeCliBackend(config, runner).generate(toolsRequest);
+
+    expect(response.toolCalls).toEqual([
+      {
+        id: expect.any(String),
+        name: "add",
+        input: { a: 1, b: 2 },
+        output: { text: 'sum:{"a":1,"b":2}', isError: false },
+        isError: false,
+      },
+    ]);
+  });
+
+  it("emits tool_call before tool_result and lands them in the done response (stream)", async () => {
+    const runner: StreamingCommandRunner = async function* (command) {
+      const url = bridgeUrl(command);
+      yield { type: "line", line: delta("Let me add. ") };
+      await rpc(url, "tools/call", { name: "add", arguments: { a: 1, b: 2 } });
+      yield { type: "line", line: delta("The sum is 3.") };
+      yield { type: "line", line: resultLine };
+      yield { type: "exit", exitCode: 0, stderr: "" };
+    };
+    const backend = createClaudeCliBackend(config, neverSpawn, runner);
+
+    const events = await collect(backend.generateStream(toolsRequest));
+
+    const callAt = events.findIndex((event) => event.type === "tool_call");
+    const resultAt = events.findIndex((event) => event.type === "tool_result");
+    expect(callAt).toBeGreaterThanOrEqual(0);
+    expect(callAt).toBeLessThan(resultAt);
+    const call = events[callAt];
+    const toolResult = events[resultAt];
+    if (call?.type !== "tool_call" || toolResult?.type !== "tool_result") {
+      throw new Error("unreachable");
+    }
+    expect(call).toMatchObject({ name: "add", input: { a: 1, b: 2 } });
+    expect(toolResult).toMatchObject({
+      id: call.id,
+      name: "add",
+      output: { text: 'sum:{"a":1,"b":2}', isError: false },
+      isError: false,
+    });
+
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event last");
+    expect(events.filter((event) => event.type === "done")).toHaveLength(1);
+    expect(done.response.toolCalls).toEqual([
+      {
+        id: call.id,
+        name: "add",
+        input: { a: 1, b: 2 },
+        output: { text: 'sum:{"a":1,"b":2}', isError: false },
+        isError: false,
+      },
+    ]);
   });
 });

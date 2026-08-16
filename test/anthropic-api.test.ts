@@ -121,12 +121,97 @@ describe("anthropic api backend", () => {
     });
   });
 
+  it("maps reasoning.effort onto output_config", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate({ ...PROMPT, reasoning: { effort: "high" } });
+
+    expect(await (stub.calls[0] as Request).json()).toMatchObject({
+      output_config: { effort: "high" },
+    });
+  });
+
+  it("omits output_config when the request has no reasoning", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate(PROMPT);
+
+    expect(await (stub.calls[0] as Request).json()).not.toHaveProperty("output_config");
+  });
+
   it("omits system when the request has none", async () => {
     const stub = stubFetch(200, MESSAGE);
     await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
 
     const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
     expect(body).not.toHaveProperty("system");
+  });
+
+  it("maps sampling params and metadata onto the Messages API", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate({
+      maxTokens: 8,
+      messages: [user("hello")],
+      topP: 0.9,
+      topK: 40,
+      stopSequences: ["STOP", "END"],
+      metadata: { userId: "user-42" },
+    });
+
+    expect(await (stub.calls[0] as Request).json()).toMatchObject({
+      top_p: 0.9,
+      top_k: 40,
+      stop_sequences: ["STOP", "END"],
+      metadata: { user_id: "user-42" },
+    });
+  });
+
+  it("maps content blocks onto Anthropic image and document blocks", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate({
+      maxTokens: 8,
+      messages: [
+        user([
+          { type: "text", text: "describe these" },
+          { type: "image", source: { base64: "aGVsbG8=", mediaType: "image/png" } },
+          { type: "image", source: { url: "https://example.test/a.jpg" } },
+          { type: "document", source: { base64: "cGRm", mediaType: "application/pdf" } },
+        ]),
+      ],
+    });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.messages).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "describe these" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" } },
+          { type: "image", source: { type: "url", url: "https://example.test/a.jpg" } },
+          {
+            type: "document",
+            source: { type: "base64", media_type: "application/pdf", data: "cGRm" },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("omits sampling params and metadata when the request has none", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("top_p");
+    expect(body).not.toHaveProperty("top_k");
+    expect(body).not.toHaveProperty("stop_sequences");
+    expect(body).not.toHaveProperty("metadata");
+  });
+
+  it("keeps the v1 single-text-block shape for text-only messages", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    await clientWith(stub.impl).generate({ maxTokens: 8, messages: [user("hello")] });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.messages).toEqual([{ role: "user", content: [{ type: "text", text: "hello" }] }]);
   });
 
   it("maps the response and usage", async () => {
@@ -140,6 +225,7 @@ describe("anthropic api backend", () => {
       completionReason: "stop",
       provider: "claude",
       flavor: "api",
+      toolCalls: [],
       usage: {
         inputTokens: 10,
         outputTokens: 5,
@@ -148,6 +234,43 @@ describe("anthropic api backend", () => {
         reasoningTokens: 0,
       },
     });
+  });
+
+  it("maps outputSchema onto output_config.format and parses the result", async () => {
+    const schema = { type: "object", properties: { answer: { type: "number" } } };
+    const stub = stubFetch(200, {
+      ...MESSAGE,
+      content: [{ type: "text", text: '{"answer":42}' }],
+    });
+
+    const response = await clientWith(stub.impl).generate({ ...PROMPT, outputSchema: schema });
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body.output_config).toEqual({ format: { type: "json_schema", schema } });
+    expect(response.structured).toEqual({ answer: 42 });
+    expect(response.text).toBe('{"answer":42}');
+  });
+
+  it("rejects unparseable structured output with parse_failed", async () => {
+    const stub = stubFetch(200, { ...MESSAGE, content: [{ type: "text", text: "not json" }] });
+
+    const error = await rejection(
+      clientWith(stub.impl).generate({ ...PROMPT, outputSchema: { type: "object" } }),
+    );
+
+    expect(error.code).toBe("parse_failed");
+    expect(error.provider).toBe("claude");
+    expect(error.flavor).toBe("api");
+    expect(error.operation).toBe("generate");
+  });
+
+  it("leaves structured undefined and output_config absent without outputSchema", async () => {
+    const stub = stubFetch(200, MESSAGE);
+    const response = await clientWith(stub.impl).generate(PROMPT);
+
+    const body = (await (stub.calls[0] as Request).json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("output_config");
+    expect(response).not.toHaveProperty("structured");
   });
 
   it("defaults unreported usage counters to zero", async () => {
@@ -231,6 +354,53 @@ describe("anthropic api backend", () => {
     controller.abort(reason);
 
     await expect(pending).rejects.toBe(reason);
+  });
+
+  it("hands maxRetries to the SDK, retrying a retryable failure", async () => {
+    let calls = 0;
+    const impl: typeof fetch = async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify({ type: "error", error: { type: "api_error", message: "boom" } }),
+        // retry-after-ms:0 keeps the retries instant rather than backing off.
+        { status: 500, headers: { "content-type": "application/json", "retry-after-ms": "0" } },
+      );
+    };
+    const client = createClient({
+      provider: "claude",
+      flavor: "api",
+      model: "claude-test",
+      apiKey: "test-key",
+      baseUrl: BASE_URL,
+      fetch: impl,
+      maxRetries: 2,
+    });
+
+    await rejection(client.generate(PROMPT));
+
+    expect(calls).toBe(3); // initial attempt + two retries
+  });
+
+  it("hands timeoutMs to the SDK, which aborts a slow request", async () => {
+    const client = createClient({
+      provider: "claude",
+      flavor: "api",
+      model: "claude-test",
+      apiKey: "test-key",
+      baseUrl: BASE_URL,
+      // Never resolves until the SDK's own timeout aborts it.
+      fetch: (_input, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        }),
+      timeoutMs: 20,
+    });
+
+    const error = await rejection(client.generate(PROMPT));
+
+    expect(error.code).toBe("transport_failed");
   });
 });
 
@@ -345,6 +515,7 @@ describe("anthropic api backend streaming", () => {
           completionReason: "stop",
           provider: "claude",
           flavor: "api",
+          toolCalls: [],
           usage: {
             inputTokens: 10,
             outputTokens: 5,
@@ -355,6 +526,38 @@ describe("anthropic api backend streaming", () => {
         },
       },
     ]);
+  });
+
+  it("maps thinking_delta events to interleaved reasoning without polluting the text", async () => {
+    const stub = stubSse([
+      sse("message_start", MESSAGE_START),
+      sse("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking: "Think" },
+      }),
+      sse("content_block_delta", textDelta("Hello, ")),
+      sse("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking: "ing" },
+      }),
+      sse("content_block_delta", textDelta("world")),
+      sse("message_delta", messageDelta("end_turn")),
+      sse("message_stop", { type: "message_stop" }),
+    ]);
+
+    const events = await collect(clientWith(stub.impl).generateStream(PROMPT));
+
+    expect(events.slice(0, 4)).toEqual([
+      { type: "reasoning", text: "Think" },
+      { type: "text", text: "Hello, " },
+      { type: "reasoning", text: "ing" },
+      { type: "text", text: "world" },
+    ]);
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event");
+    expect(done.response.text).toBe("Hello, world");
   });
 
   it("yields only a done event when the stream carries no text", async () => {
@@ -372,6 +575,8 @@ describe("anthropic api backend streaming", () => {
         response: expect.objectContaining({ text: "", completionReason: "max_tokens" }),
       },
     ]);
+    // No reasoning deltas in the stream, so no reasoning events (no placeholders).
+    expect(events.some((event) => event.type === "reasoning")).toBe(false);
   });
 
   it("reports a refusal from the message_delta stop reason", async () => {

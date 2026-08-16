@@ -33,6 +33,7 @@ function doneEvent(response: Partial<Response>): StreamEvent {
         reasoningTokens: 0,
       },
       completionReason: "",
+      toolCalls: [],
       // Deliberately wrong: the client must overwrite these.
       provider: "openai",
       flavor: "cli",
@@ -112,6 +113,74 @@ describe("client.generateStream done-event stamping", () => {
         flavor: "api",
       }),
     );
+  });
+
+  it("passes reasoning events through unchanged, interleaved with text", async () => {
+    const client = createClientWithBackend(
+      config,
+      stubBackend([
+        { type: "reasoning", text: "Think" },
+        { type: "text", text: "Hello, " },
+        { type: "reasoning", text: "ing" },
+        { type: "text", text: "world" },
+        doneEvent({ text: "Hello, world" }),
+      ]),
+    );
+
+    const events = await collect(client.generateStream(REQUEST));
+
+    // Reasoning is relayed verbatim; only the done event is restamped.
+    expect(events.slice(0, 4)).toEqual([
+      { type: "reasoning", text: "Think" },
+      { type: "text", text: "Hello, " },
+      { type: "reasoning", text: "ing" },
+      { type: "text", text: "world" },
+    ]);
+    const text = events
+      .filter((event) => event.type === "text")
+      .map((event) => event.text)
+      .join("");
+    expect(text).toBe("Hello, world");
+  });
+
+  it("emits no reasoning events when the backend reports none", async () => {
+    const client = createClientWithBackend(
+      config,
+      stubBackend([{ type: "text", text: "Hello, world" }, doneEvent({ text: "Hello, world" })]),
+    );
+
+    const events = await collect(client.generateStream(REQUEST));
+
+    expect(events.some((event) => event.type === "reasoning")).toBe(false);
+  });
+
+  it("passes tool_call and tool_result events through unchanged", async () => {
+    const toolCall: StreamEvent = { type: "tool_call", id: "t1", name: "add", input: { a: 1 } };
+    const toolResult: StreamEvent = {
+      type: "tool_result",
+      id: "t1",
+      name: "add",
+      output: { text: "3", isError: false },
+      isError: false,
+    };
+    const client = createClientWithBackend(
+      config,
+      stubBackend([
+        toolCall,
+        toolResult,
+        { type: "text", text: "done" },
+        doneEvent({ text: "done" }),
+      ]),
+    );
+
+    const events = await collect(client.generateStream(REQUEST));
+
+    expect(events.slice(0, 3)).toEqual([toolCall, toolResult, { type: "text", text: "done" }]);
+    // Only the done event is stamped with the target identity.
+    expect(events[3]).toMatchObject({
+      type: "done",
+      response: { provider: "claude", flavor: "api" },
+    });
   });
 
   it("keeps a model reported by the backend", async () => {

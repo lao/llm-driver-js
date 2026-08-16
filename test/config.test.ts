@@ -131,6 +131,54 @@ describe("validateConfig", () => {
     expectInvalidConfig({ provider: "claude", flavor: "cli", model: "m", cliPath: "  " });
   });
 
+  it("accepts timeoutMs on every flavor", () => {
+    for (const flavor of flavors) {
+      expect(() =>
+        validateConfig({ provider: "claude", flavor, model: "m", timeoutMs: 5000 }),
+      ).not.toThrow();
+    }
+  });
+
+  it("rejects a non-positive or non-finite timeoutMs", () => {
+    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const error = expectInvalidConfig({
+        provider: "claude",
+        flavor: "api",
+        model: "m",
+        timeoutMs,
+      });
+      expect(error.message).toBe("timeoutMs must be a positive number");
+    }
+  });
+
+  it("accepts maxRetries on api flavors", () => {
+    expect(() =>
+      validateConfig({ provider: "openai", flavor: "api", model: "m", maxRetries: 3 }),
+    ).not.toThrow();
+    expect(() =>
+      validateConfig({ provider: "claude", flavor: "api", model: "m", maxRetries: 0 }),
+    ).not.toThrow();
+  });
+
+  it("rejects maxRetries on cli flavors — re-running an agent is not idempotent", () => {
+    for (const provider of providers) {
+      const error = expectInvalidConfig({ provider, flavor: "cli", model: "m", maxRetries: 2 });
+      expect(error.message).toBe("maxRetries is not supported for the cli flavor");
+    }
+  });
+
+  it("rejects a negative or non-integer maxRetries on api flavors", () => {
+    for (const maxRetries of [-1, 1.5]) {
+      const error = expectInvalidConfig({
+        provider: "openai",
+        flavor: "api",
+        model: "m",
+        maxRetries,
+      });
+      expect(error.message).toBe("maxRetries must be a non-negative integer");
+    }
+  });
+
   it("stamps target context on config errors", () => {
     const error = expectInvalidConfig({ provider: "claude", flavor: "cli", model: "" });
     expect(error.provider).toBe("claude");

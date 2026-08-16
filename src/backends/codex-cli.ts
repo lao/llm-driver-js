@@ -1,5 +1,17 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LLMDriverError } from "../errors.js";
-import type { Config, Request, Response, Usage } from "../types.js";
+import type {
+  Config,
+  ImageMediaType,
+  JsonSchema,
+  Request,
+  Response,
+  StreamEvent,
+  ToolCallRecord,
+  Usage,
+} from "../types.js";
 import type { Backend } from "./backend.js";
 import {
   asRecord,
@@ -8,11 +20,14 @@ import {
   cliError,
   executeCli,
   parseJsonObject,
+  parseStructuredText,
   readCount,
   readString,
   renderTranscript,
   spawnRunner,
+  withTempFile,
 } from "./cli.js";
+import { type McpBridge, start as startBridge } from "./mcp-bridge.js";
 
 /**
  * Local `codex exec` process backend (`openai`/`cli`).
@@ -30,7 +45,12 @@ export function createCodexCliBackend(
   const executable = config.cliPath ?? "codex";
   const extraArgs = config.cliArgs ?? [];
 
-  const buildCommand = (request: Request): Command => {
+  const buildCommand = (
+    request: Request,
+    bridge?: McpBridge,
+    schemaPath?: string,
+    imageArgs: string[] = [],
+  ): Command => {
     const args = [
       "exec",
       "--json",
@@ -43,32 +63,182 @@ export function createCodexCliBackend(
     if (request.system) {
       args.push("--config", `developer_instructions=${JSON.stringify(request.system)}`);
     }
-    args.push(...extraArgs, "-");
+    if (request.reasoning) {
+      // TOML string value, so the level is quoted (matches the developer_instructions form).
+      args.push("-c", `model_reasoning_effort=${JSON.stringify(request.reasoning.effort)}`);
+    }
+    if (bridge) {
+      // Inject the caller's tools into codex's own agentic loop as a
+      // streamable-HTTP MCP server (codex 0.147). Codex has no `--strict-mcp-config`
+      // equivalent, and read-only sandbox needs no per-tool pre-allow.
+      //
+      // FLAG (SPEC-v2 open question 4): the exact `-c mcp_servers.*` dotted-key
+      // syntax for a streamable-HTTP transport is only truly confirmable against
+      // the real binary — encoded here per SPEC as best knowledge and
+      // characterized by the env-gated integration test.
+      args.push("-c", `mcp_servers.llmdriver.url=${JSON.stringify(bridge.url)}`);
+    }
+    if (schemaPath) {
+      args.push("--output-schema", schemaPath);
+    }
+    args.push(...imageArgs, ...extraArgs, "-");
     return { executable, args, stdin: renderTranscript(request.messages) };
   };
 
-  const generate = async (request: Request, signal?: AbortSignal): Promise<Response> => {
-    const command = buildCommand(request);
-    const { stdout, failure } = await executeCli("openai", command, runner, signal);
-    if (failure) throw preferReportedFailure(failure, stdout, config.model);
-    return parseCodexOutput(stdout, config.model);
+  /** Starts the tool bridge when the request has tools, else nothing to run. */
+  const openBridge = (
+    request: Request,
+    signal: AbortSignal | undefined,
+    onCall?: (record: ToolCallRecord) => void,
+  ): Promise<McpBridge> | undefined => {
+    const tools = request.tools ?? [];
+    return tools.length > 0 ? startBridge(tools, { signal, onCall }) : undefined;
+  };
+
+  /** Runs the subprocess with the bridge open, tearing it down on every exit. */
+  const run = async (
+    request: Request,
+    signal?: AbortSignal,
+    onCall?: (record: ToolCallRecord) => void,
+  ): Promise<{ response: Response; reasoning: string[] }> => {
+    const bridge = await openBridge(request, signal, onCall);
+    // Codex takes both its schema and its images as file paths, each written to
+    // a private temp dir and removed in `finally` — on resolve, reject, and
+    // abort alike. Image staging runs inside the try so a rejected image
+    // (URL-source or non-final-turn) still tears the bridge down.
+    let cleanupSchema: (() => Promise<void>) | undefined;
+    let cleanupImages: (() => Promise<void>) | undefined;
+    try {
+      const staged = await stageImages(request);
+      cleanupImages = staged.cleanup;
+      let schemaPath: string | undefined;
+      if (request.outputSchema) {
+        const tmp = await withTempFile("schema.json", JSON.stringify(request.outputSchema));
+        schemaPath = tmp.path;
+        cleanupSchema = tmp.cleanup;
+      }
+      const command = buildCommand(request, bridge, schemaPath, staged.imageArgs);
+      const { stdout, failure } = await executeCli(
+        "openai",
+        command,
+        runner,
+        signal,
+        config.timeoutMs,
+      );
+      if (failure) throw preferReportedFailure(failure, stdout, config.model);
+      return parseCodexOutput(stdout, config.model, bridge?.records ?? [], request.outputSchema);
+    } finally {
+      await cleanupSchema?.();
+      await cleanupImages?.();
+      await bridge?.close();
+    }
   };
 
   return {
-    generate,
+    generate: async (request, signal) => (await run(request, signal)).response,
 
     /**
      * Coarse by design: `codex exec --json` reports completed items only — no
-     * text deltas — so nothing can be emitted before the turn ends anyway, and
-     * delegating to `generate` keeps one parse and one abort contract.
+     * text deltas — so the whole turn arrives at once. Reasoning items, when the
+     * JSONL exposes them, are surfaced (in source order, before the final text)
+     * and never fold into `response.text`; codex reports none on many turns, in
+     * which case none are emitted (matrix ⚠️). Any tool calls made mid-turn are
+     * buffered via the bridge's `onCall` and flushed as `tool_call`/`tool_result`
+     * events (all before `done`), then the final text.
      * TODO: switch to real deltas if `codex exec --json` ever documents them.
      */
     async *generateStream(request, signal) {
-      const response = await generate(request, signal);
+      const pending: StreamEvent[] = [];
+      const { response, reasoning } = await run(request, signal, (record) => {
+        pending.push({ type: "tool_call", id: record.id, name: record.name, input: record.input });
+        pending.push({
+          type: "tool_result",
+          id: record.id,
+          name: record.name,
+          output: record.output,
+          isError: record.isError,
+        });
+      });
+      for (const text of reasoning) yield { type: "reasoning", text };
+      for (const event of pending) yield event;
       if (response.text !== "") yield { type: "text", text: response.text };
       yield { type: "done", response };
     },
   };
+}
+
+/** File extension `codex -i` infers the format from, keyed by media type. */
+const IMAGE_EXTENSION: Record<ImageMediaType, string> = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+};
+
+/**
+ * Writes each base64 image in the final user turn to a scratch temp file and
+ * returns the matching `-i <path>` argv plus a cleanup that removes the temp
+ * directory. Cleanup is idempotent and always runs in `generate`'s `finally`
+ * (resolve, reject, or abort). `codex -i` attaches images to the initial prompt
+ * only and has no URL flag, so URL-source images and images outside the final
+ * user message are rejected as `unsupported_feature` before any file is written.
+ */
+async function stageImages(
+  request: Request,
+): Promise<{ imageArgs: string[]; cleanup: () => Promise<void> }> {
+  const images = collectImages(request);
+  if (images.length === 0) return { imageArgs: [], cleanup: async () => {} };
+
+  const dir = await mkdtemp(join(tmpdir(), "llm-driver-codex-"));
+  const paths = images.map((image, index) => join(dir, `image-${index}${image.extension}`));
+  try {
+    await Promise.all(
+      images.map((image, index) =>
+        writeFile(paths[index] as string, Buffer.from(image.base64, "base64")),
+      ),
+    );
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    imageArgs: paths.flatMap((path) => ["-i", path]),
+    cleanup: () => rm(dir, { recursive: true, force: true }),
+  };
+}
+
+/**
+ * Collects the base64 images destined for `-i`, enforcing codex's two
+ * constraints. An image with a URL source, or any image outside the final user
+ * message, throws `unsupported_feature` naming the constraint.
+ */
+function collectImages(request: Request): Array<{ base64: string; extension: string }> {
+  const lastIndex = request.messages.length - 1;
+  const images: Array<{ base64: string; extension: string }> = [];
+  request.messages.forEach((message, index) => {
+    for (const block of message.content ?? []) {
+      if (block.type !== "image") continue;
+      if ("url" in block.source) {
+        throw unsupported("URL-source images");
+      }
+      if (index !== lastIndex || message.role !== "user") {
+        throw unsupported("images outside the final user message");
+      }
+      images.push({
+        base64: block.source.base64,
+        extension: IMAGE_EXTENSION[block.source.mediaType],
+      });
+    }
+  });
+  return images;
+}
+
+function unsupported(constraint: string): LLMDriverError {
+  return new LLMDriverError(
+    "unsupported_feature",
+    `${constraint} are not supported on openai/cli`,
+    { provider: "openai", flavor: "cli", operation: "generate" },
+  );
 }
 
 /**
@@ -98,9 +268,15 @@ function preferReportedFailure(
   return failure;
 }
 
-function parseCodexOutput(stdout: string, model: string): Response {
+function parseCodexOutput(
+  stdout: string,
+  model: string,
+  toolCalls: ToolCallRecord[] = [],
+  outputSchema?: JsonSchema,
+): { response: Response; reasoning: string[] } {
   let id = "";
   let text: string | undefined;
+  const reasoning: string[] = [];
   // Set by `turn.completed`, so its presence is what marks the turn complete.
   let usage: Usage | undefined;
 
@@ -116,6 +292,9 @@ function parseCodexOutput(stdout: string, model: string): Response {
         const item = asRecord(event.item);
         if (readString(item, "type") === "agent_message") {
           text = readString(item, "text");
+        } else if (readString(item, "type") === "reasoning") {
+          const reasoningText = readString(item, "text");
+          if (reasoningText !== "") reasoning.push(reasoningText);
         }
         break;
       }
@@ -154,7 +333,20 @@ function parseCodexOutput(stdout: string, model: string): Response {
       { providerCode: "missing_final_message" },
     );
   }
-  return { id, model, text, usage, completionReason: "", provider: "openai", flavor: "cli" };
+  const response: Response = {
+    id,
+    model,
+    text,
+    usage,
+    completionReason: "",
+    provider: "openai",
+    flavor: "cli",
+    toolCalls,
+  };
+  if (outputSchema !== undefined) {
+    response.structured = parseStructuredText("openai", text);
+  }
+  return { response, reasoning };
 }
 
 function reportedFailure(providerCode: string, message: string, fallback: string): LLMDriverError {

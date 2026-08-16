@@ -1,7 +1,21 @@
 import Anthropic, { AnthropicError, APIConnectionError, APIError } from "@anthropic-ai/sdk";
 import { LLMDriverError } from "../errors.js";
-import type { CompletionReason, Config, Request, Response } from "../types.js";
+import type {
+  CompletionReason,
+  Config,
+  JsonSchema,
+  Message,
+  Request,
+  Response,
+  ToolChoice,
+} from "../types.js";
 import type { Backend } from "./backend.js";
+import {
+  runToolLoop,
+  runToolLoopStream,
+  type ToolCall,
+  type ToolLoopAdapter,
+} from "./tool-loop.js";
 
 const CONTEXT = { provider: "claude", flavor: "api", operation: "generate" } as const;
 
@@ -23,14 +37,132 @@ export function createAnthropicApiBackend(config: Config): Backend {
       apiKey: config.apiKey,
       baseURL: config.baseUrl,
       fetch: fetchImpl,
-      maxRetries: 0, // retries are out of scope: one request per generate()
+      // Default 0 keeps v1's one-request-per-generate() behavior; a caller opts in.
+      maxRetries: config.maxRetries ?? 0,
+      timeout: config.timeoutMs, // undefined leaves the SDK default in place
     }));
+
+  // The tool loop's per-round send, over the Anthropic transcript type.
+  const toolAdapter = (request: Request): ToolLoopAdapter<Anthropic.MessageParam> => ({
+    async send(messages, signal) {
+      const message = await ensureClient().messages.create(
+        toParams(config.model, request, messages),
+        {
+          signal,
+        },
+      );
+      const calls: ToolCall[] = [];
+      for (const block of message.content) {
+        if (block.type === "tool_use") {
+          calls.push({ id: block.id, name: block.name, input: block.input });
+        }
+      }
+      return {
+        response: toResponse(message),
+        calls,
+        assistantMessage: { role: "assistant", content: message.content },
+      };
+    },
+    async *sendStream(messages, signal) {
+      // Own controller so tearing this round's stream down never touches the
+      // loop's signal; the loop's abort still reaches us through `signal`.
+      const controller = new AbortController();
+      try {
+        const stream = await ensureClient().messages.create(
+          { ...toParams(config.model, request, messages), stream: true },
+          { signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal },
+        );
+
+        let message: Anthropic.Message | undefined;
+        const content: Anthropic.ContentBlockParam[] = [];
+        const toolJson = new Map<number, string>();
+        for await (const event of stream) {
+          if (event.type === "message_start") {
+            message = event.message;
+          } else if (event.type === "content_block_start") {
+            content[event.index] = startBlock(event.content_block);
+            if (event.content_block.type === "tool_use") toolJson.set(event.index, "");
+          } else if (event.type === "content_block_delta") {
+            const block = content[event.index];
+            if (event.delta.type === "text_delta" && block?.type === "text") {
+              block.text += event.delta.text;
+              yield { type: "text", text: event.delta.text };
+            } else if (event.delta.type === "input_json_delta") {
+              toolJson.set(
+                event.index,
+                (toolJson.get(event.index) ?? "") + event.delta.partial_json,
+              );
+            }
+          } else if (event.type === "content_block_stop") {
+            const block = content[event.index];
+            if (block?.type === "tool_use") block.input = parseToolInput(toolJson.get(event.index));
+          } else if (event.type === "message_delta" && message) {
+            message = {
+              ...message,
+              stop_reason: event.delta.stop_reason,
+              usage: mergeUsage(message.usage, event.usage),
+            };
+          }
+        }
+
+        if (signal?.aborted) throw signal.reason;
+        if (!message) {
+          throw new LLMDriverError(
+            "parse_failed",
+            "Anthropic stream ended without a message",
+            CONTEXT,
+          );
+        }
+        const blocks = content.filter((block) => block !== undefined);
+        const calls: ToolCall[] = [];
+        for (const block of blocks) {
+          if (block.type === "tool_use") {
+            calls.push({ id: block.id, name: block.name, input: block.input });
+          }
+        }
+        return {
+          response: toResponse({
+            ...message,
+            content: blocks as unknown as Anthropic.ContentBlock[],
+          }),
+          calls,
+          assistantMessage: { role: "assistant", content: blocks },
+        };
+      } finally {
+        controller.abort();
+      }
+    },
+    toolResultMessage(results) {
+      return {
+        role: "user",
+        content: results.map((result) => ({
+          type: "tool_result",
+          tool_use_id: result.id,
+          content: result.output.text,
+          ...(result.output.isError ? { is_error: true } : {}),
+        })),
+      };
+    },
+  });
 
   return {
     async generate(request, signal) {
       try {
+        if (request.tools && request.tools.length > 0) {
+          return await runToolLoop(
+            request.tools,
+            toMessageParams(request),
+            toolAdapter(request),
+            CONTEXT,
+            signal,
+          );
+        }
         return toResponse(
-          await ensureClient().messages.create(toParams(config.model, request), { signal }),
+          await ensureClient().messages.create(
+            toParams(config.model, request, toMessageParams(request)),
+            { signal },
+          ),
+          request.outputSchema,
         );
       } catch (error) {
         // An abort surfaces the signal's own reason, like the CLI flavors —
@@ -41,12 +173,27 @@ export function createAnthropicApiBackend(config: Config): Backend {
     },
 
     async *generateStream(request, signal) {
+      if (request.tools && request.tools.length > 0) {
+        try {
+          yield* runToolLoopStream(
+            request.tools,
+            toMessageParams(request),
+            toolAdapter(request),
+            CONTEXT,
+            signal,
+          );
+        } catch (error) {
+          if (signal?.aborted) throw signal.reason;
+          throw normalizeError(error, reachedTransport);
+        }
+        return;
+      }
       // Aborted in the generator's cleanup so an early consumer break tears the
       // HTTP stream down instead of leaking it.
       const controller = new AbortController();
       try {
         const stream = await ensureClient().messages.create(
-          { ...toParams(config.model, request), stream: true },
+          { ...toParams(config.model, request, toMessageParams(request)), stream: true },
           { signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal },
         );
 
@@ -58,6 +205,12 @@ export function createAnthropicApiBackend(config: Config): Backend {
           } else if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
             text += event.delta.text;
             yield { type: "text", text: event.delta.text };
+          } else if (
+            event.type === "content_block_delta" &&
+            event.delta.type === "thinking_delta"
+          ) {
+            // Reasoning is surfaced but never folded into `text`.
+            yield { type: "reasoning", text: event.delta.thinking };
           } else if (event.type === "message_delta" && message) {
             // Rebuilt rather than mutated: the SDK's own event object is not ours.
             message = {
@@ -80,7 +233,10 @@ export function createAnthropicApiBackend(config: Config): Backend {
         }
         yield {
           type: "done",
-          response: toResponse({ ...message, content: [{ type: "text", text, citations: null }] }),
+          response: toResponse(
+            { ...message, content: [{ type: "text", text, citations: null }] },
+            request.outputSchema,
+          ),
         };
       } catch (error) {
         if (signal?.aborted) throw signal.reason;
@@ -90,6 +246,28 @@ export function createAnthropicApiBackend(config: Config): Backend {
       }
     },
   };
+}
+
+/** Seeds an accumulator block from a content_block_start; only text/tool_use matter here. */
+function startBlock(block: Anthropic.ContentBlock): Anthropic.ContentBlockParam {
+  if (block.type === "tool_use") {
+    return { type: "tool_use", id: block.id, name: block.name, input: {} };
+  }
+  // Every other block type is streamed as text (or ignored); seed an empty text block.
+  return { type: "text", text: block.type === "text" ? block.text : "" };
+}
+
+/** Parses the accumulated input_json_delta string; empty means the model sent no arguments. */
+function parseToolInput(raw: string | undefined): unknown {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch (cause) {
+    throw new LLMDriverError("parse_failed", "Anthropic tool_use input was not valid JSON", {
+      ...CONTEXT,
+      cause,
+    });
+  }
 }
 
 /** message_delta reports cumulative counters, but only the ones it knows. */
@@ -104,22 +282,107 @@ function mergeUsage(usage: Anthropic.Usage, delta: Anthropic.MessageDeltaUsage):
   };
 }
 
-function toParams(model: string, request: Request): Anthropic.MessageCreateParamsNonStreaming {
+/** Maps the request transcript to the initial Anthropic message array. */
+function toMessageParams(request: Request): Anthropic.MessageParam[] {
+  return request.messages.map((message) => ({
+    role: message.role,
+    content: toContent(message),
+  }));
+}
+
+function toParams(
+  model: string,
+  request: Request,
+  messages: Anthropic.MessageParam[],
+): Anthropic.MessageCreateParamsNonStreaming {
   const params: Anthropic.MessageCreateParamsNonStreaming = {
     model,
     max_tokens: request.maxTokens,
-    messages: request.messages.map((message) => ({
-      role: message.role,
-      content: [{ type: "text", text: message.text }],
-    })),
+    messages,
   };
   if (request.system) {
     params.system = [{ type: "text", text: request.system }];
   }
+  if (request.temperature !== undefined) {
+    params.temperature = request.temperature;
+  }
+  if (request.topP !== undefined) {
+    params.top_p = request.topP;
+  }
+  if (request.topK !== undefined) {
+    params.top_k = request.topK;
+  }
+  if (request.stopSequences !== undefined) {
+    params.stop_sequences = request.stopSequences;
+  }
+  if (request.metadata?.userId !== undefined) {
+    params.metadata = { user_id: request.metadata.userId };
+  }
+  if (request.reasoning !== undefined) {
+    // Neutral enum passes through verbatim; the SDK's effort type omits some
+    // neutral levels ("minimal"), so we cast rather than gate — the provider
+    // validates the value (SPEC "Reasoning").
+    params.output_config = {
+      ...params.output_config,
+      effort: request.reasoning.effort as Anthropic.OutputConfig["effort"],
+    };
+  }
+  if (request.outputSchema) {
+    params.output_config = {
+      ...params.output_config,
+      format: { type: "json_schema", schema: request.outputSchema },
+    };
+  }
+  if (request.tools && request.tools.length > 0) {
+    params.tools = request.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.inputSchema as Anthropic.Tool.InputSchema,
+    }));
+  }
+  if (request.toolChoice !== undefined) {
+    params.tool_choice = toToolChoice(request.toolChoice);
+  }
   return params;
 }
 
-function toResponse(message: Anthropic.Message): Response {
+/**
+ * Maps a message onto Anthropic content blocks. Text-only messages keep their
+ * v1 single-text-block shape byte-for-byte.
+ */
+function toContent(message: Message): Anthropic.ContentBlockParam[] {
+  if (message.content === undefined) {
+    return [{ type: "text", text: message.text ?? "" }];
+  }
+  return message.content.map((block): Anthropic.ContentBlockParam => {
+    if (block.type === "text") {
+      return { type: "text", text: block.text };
+    }
+    if (block.type === "document") {
+      return {
+        type: "document",
+        source: { type: "base64", media_type: "application/pdf", data: block.source.base64 },
+      };
+    }
+    if ("url" in block.source) {
+      return { type: "image", source: { type: "url", url: block.source.url } };
+    }
+    return {
+      type: "image",
+      source: { type: "base64", media_type: block.source.mediaType, data: block.source.base64 },
+    };
+  });
+}
+
+/** `required` maps to Anthropic's `any`; a named choice forces that tool. */
+function toToolChoice(choice: ToolChoice): Anthropic.ToolChoice {
+  if (choice === "auto") return { type: "auto" };
+  if (choice === "none") return { type: "none" };
+  if (choice === "required") return { type: "any" };
+  return { type: "tool", name: choice.name };
+}
+
+function toResponse(message: Anthropic.Message, outputSchema?: JsonSchema): Response {
   if (!Array.isArray(message?.content)) {
     throw new LLMDriverError(
       "parse_failed",
@@ -128,10 +391,11 @@ function toResponse(message: Anthropic.Message): Response {
     );
   }
   const usage = message.usage;
-  return {
+  const text = message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+  const response: Response = {
     id: message.id ?? "",
     model: message.model ?? "",
-    text: message.content.map((block) => (block.type === "text" ? block.text : "")).join(""),
+    text,
     completionReason: toCompletionReason(message.stop_reason),
     usage: {
       inputTokens: usage?.input_tokens ?? 0,
@@ -142,7 +406,24 @@ function toResponse(message: Anthropic.Message): Response {
     },
     provider: "claude",
     flavor: "api",
+    toolCalls: [],
   };
+  if (outputSchema !== undefined) {
+    response.structured = parseStructured(text);
+  }
+  return response;
+}
+
+/** Parses structured-output text as JSON; unparseable output is `parse_failed`. */
+function parseStructured(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new LLMDriverError("parse_failed", "Anthropic structured output was not valid JSON", {
+      ...CONTEXT,
+      cause: error,
+    });
+  }
 }
 
 function toCompletionReason(reason: Anthropic.StopReason | null): CompletionReason {

@@ -1,8 +1,16 @@
+import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { Command, CommandResult, CommandRunner } from "../src/backends/cli.js";
 import { createCodexCliBackend } from "../src/backends/codex-cli.js";
 import { type ErrorCode, LLMDriverError } from "../src/errors.js";
-import { assistant, type Config, type Request, type StreamEvent, user } from "../src/types.js";
+import {
+  assistant,
+  type Config,
+  type ContentBlock,
+  type Request,
+  type StreamEvent,
+  user,
+} from "../src/types.js";
 
 const config: Config = { provider: "openai", flavor: "cli", model: "gpt-test" };
 const request: Request = { maxTokens: 32, messages: [user("Hello")] };
@@ -53,6 +61,32 @@ describe("codex cli command", () => {
       stdin: "Hello",
     });
     expect(calls[0]?.signal).toBe(signal);
+  });
+
+  it("passes reasoning.effort as -c model_reasoning_effort before the stdin marker", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+    const backend = createCodexCliBackend({ ...config, cliArgs: ["--color", "never"] }, runner);
+
+    await backend.generate({ ...request, reasoning: { effort: "low" } });
+
+    expect(calls[0]?.command.args).toEqual([
+      ...baseArgs,
+      "--model",
+      "gpt-test",
+      "-c",
+      'model_reasoning_effort="low"',
+      "--color",
+      "never",
+      "-",
+    ]);
+  });
+
+  it("omits the reasoning override when the request has none (byte-identical to v1)", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+
+    await createCodexCliBackend(config, runner).generate(request);
+
+    expect(calls[0]?.command.args).toEqual([...baseArgs, "--model", "gpt-test", "-"]);
   });
 
   it("JSON-encodes developer instructions and keeps the stdin marker last", async () => {
@@ -115,7 +149,122 @@ describe("codex cli parsing", () => {
       completionReason: "",
       provider: "openai",
       flavor: "cli",
+      toolCalls: [],
     });
+  });
+});
+
+describe("codex cli structured output", () => {
+  const schema = { type: "object", properties: { answer: { type: "number" } } };
+  const structuredStdout = [
+    '{"type":"thread.started","thread_id":"thread-1"}',
+    '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"answer\\":42}"}}',
+    '{"type":"turn.completed","usage":{}}',
+    "",
+  ].join("\n");
+
+  /**
+   * Captures the --output-schema path and whether the file existed (and its
+   * contents) at the moment the runner was invoked — the temp file must live for
+   * the whole run and be gone once generate settles.
+   */
+  function schemaProbingRunner(result: Partial<CommandResult>, error?: unknown) {
+    const seen: { path?: string; existedDuringRun: boolean; contents?: string } = {
+      existedDuringRun: false,
+    };
+    const runner: CommandRunner = async (command) => {
+      const index = command.args.indexOf("--output-schema");
+      if (index !== -1) {
+        seen.path = command.args[index + 1];
+        seen.existedDuringRun = seen.path !== undefined && existsSync(seen.path);
+        if (seen.existedDuringRun && seen.path) {
+          seen.contents = readFileSync(seen.path, "utf8");
+        }
+      }
+      if (error !== undefined) throw error;
+      return { stdout: "", stderr: "", exitCode: 0, ...result };
+    };
+    return { runner, seen };
+  }
+
+  it("writes the schema to a temp file, passes --output-schema, and cleans up", async () => {
+    const { runner, seen } = schemaProbingRunner({ stdout: structuredStdout });
+
+    const response = await createCodexCliBackend(config, runner).generate({
+      ...request,
+      outputSchema: schema,
+    });
+
+    expect(seen.existedDuringRun).toBe(true);
+    expect(seen.contents).toBe(JSON.stringify(schema));
+    // Gone after resolve.
+    expect(seen.path && existsSync(seen.path)).toBe(false);
+    expect(response.structured).toEqual({ answer: 42 });
+    expect(response.text).toBe('{"answer":42}');
+  });
+
+  it("deletes the temp file even when the run fails", async () => {
+    const { runner, seen } = schemaProbingRunner({}, new Error("launch failed"));
+
+    await expect(
+      createCodexCliBackend(config, runner).generate({ ...request, outputSchema: schema }),
+    ).rejects.toBeInstanceOf(LLMDriverError);
+
+    expect(seen.existedDuringRun).toBe(true);
+    expect(seen.path && existsSync(seen.path)).toBe(false);
+  });
+
+  it("deletes the temp file when the caller aborts", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    let seenPath: string | undefined;
+    let existedDuringRun = false;
+    const runner: CommandRunner = async (command, signal) => {
+      const index = command.args.indexOf("--output-schema");
+      seenPath = command.args[index + 1];
+      existedDuringRun = seenPath !== undefined && existsSync(seenPath);
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+
+    await expect(
+      createCodexCliBackend(config, runner).generate(
+        { ...request, outputSchema: schema },
+        controller.signal,
+      ),
+    ).rejects.toBe(reason);
+
+    expect(existedDuringRun).toBe(true);
+    expect(seenPath && existsSync(seenPath)).toBe(false);
+  });
+
+  it("reports parse_failed when the structured output is not valid JSON", async () => {
+    const { runner } = schemaProbingRunner({
+      stdout: [
+        '{"type":"thread.started","thread_id":"thread-1"}',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"not json"}}',
+        '{"type":"turn.completed","usage":{}}',
+        "",
+      ].join("\n"),
+    });
+
+    const error = await createCodexCliBackend(config, runner)
+      .generate({ ...request, outputSchema: schema })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect(error.code).toBe("parse_failed");
+    expect(error.provider).toBe("openai");
+    expect(error.flavor).toBe("cli");
+  });
+
+  it("omits --output-schema and leaves structured undefined without a schema", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+
+    const response = await createCodexCliBackend(config, runner).generate(request);
+
+    expect(calls[0]?.command.args).not.toContain("--output-schema");
+    expect(response.structured).toBeUndefined();
   });
 });
 
@@ -266,6 +415,169 @@ describe("codex cli failures", () => {
   });
 });
 
+/** Pulls the `-i <path>` arguments out of a built command, in order. */
+function imagePaths(command: Command): string[] {
+  const paths: string[] = [];
+  command.args.forEach((arg, index) => {
+    if (arg === "-i") paths.push(command.args[index + 1] as string);
+  });
+  return paths;
+}
+
+/**
+ * Fake runner that records, at spawn time, the `-i` paths and whether each temp
+ * file existed and what it held — the window in which the files must be live.
+ */
+function stagingRunner(result: Partial<CommandResult>, error?: unknown) {
+  const seen = {
+    command: undefined as Command | undefined,
+    paths: [] as string[],
+    existedDuringRun: [] as boolean[],
+    contents: [] as string[],
+  };
+  const runner: CommandRunner = async (command) => {
+    seen.command = command;
+    seen.paths = imagePaths(command);
+    seen.existedDuringRun = seen.paths.map((path) => existsSync(path));
+    seen.contents = seen.paths.map((path) => (existsSync(path) ? readFileSync(path, "utf8") : ""));
+    if (error !== undefined) throw error;
+    return { stdout: successStdout, stderr: "", exitCode: 0, ...result };
+  };
+  return { runner, seen };
+}
+
+function imageBlock(base64: string, mediaType: string): ContentBlock {
+  return { type: "image", source: { base64, mediaType: mediaType as never } };
+}
+
+describe("codex cli image input", () => {
+  const pngB64 = Buffer.from("fake-png-bytes").toString("base64");
+  const jpgB64 = Buffer.from("fake-jpg-bytes").toString("base64");
+
+  it("writes one temp file per image and passes each via -i, then cleans up", async () => {
+    const { runner, seen } = stagingRunner({});
+    const request: Request = {
+      maxTokens: 32,
+      messages: [
+        user([
+          imageBlock(pngB64, "image/png"),
+          imageBlock(jpgB64, "image/jpeg"),
+          { type: "text", text: "describe" },
+        ]),
+      ],
+    };
+
+    await createCodexCliBackend(config, runner).generate(request);
+
+    expect(seen.paths).toHaveLength(2);
+    expect(seen.paths[0]).toMatch(/image-0\.png$/);
+    expect(seen.paths[1]).toMatch(/image-1\.jpg$/);
+    expect(seen.command?.args).toEqual([
+      ...baseArgs,
+      "--model",
+      "gpt-test",
+      "-i",
+      seen.paths[0],
+      "-i",
+      seen.paths[1],
+      "-",
+    ]);
+    // Files were live during the run with the decoded bytes...
+    expect(seen.existedDuringRun).toEqual([true, true]);
+    expect(seen.contents).toEqual(["fake-png-bytes", "fake-jpg-bytes"]);
+    // ...and gone once generate resolved.
+    for (const path of seen.paths) expect(existsSync(path)).toBe(false);
+  });
+
+  it("cleans up temp files after a process failure", async () => {
+    const { runner, seen } = stagingRunner({ stdout: "", stderr: "boom", exitCode: 9 });
+    const request: Request = {
+      maxTokens: 32,
+      messages: [user([imageBlock(pngB64, "image/png")])],
+    };
+
+    await expect(createCodexCliBackend(config, runner).generate(request)).rejects.toBeInstanceOf(
+      LLMDriverError,
+    );
+
+    expect(seen.existedDuringRun).toEqual([true]);
+    for (const path of seen.paths) expect(existsSync(path)).toBe(false);
+  });
+
+  it("cleans up temp files after a caller abort", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    let sawPath = "";
+    let existedDuringRun = false;
+    const runner: CommandRunner = async (command, signal) => {
+      sawPath = imagePaths(command)[0] as string;
+      existedDuringRun = existsSync(sawPath);
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+    const request: Request = {
+      maxTokens: 32,
+      messages: [user([imageBlock(pngB64, "image/png")])],
+    };
+
+    await expect(
+      createCodexCliBackend(config, runner).generate(request, controller.signal),
+    ).rejects.toBe(reason);
+
+    expect(existedDuringRun).toBe(true);
+    expect(existsSync(sawPath)).toBe(false);
+  });
+
+  it("streams images through the same staging path", async () => {
+    const { runner, seen } = stagingRunner({});
+    const request: Request = {
+      maxTokens: 32,
+      messages: [user([imageBlock(pngB64, "image/png"), { type: "text", text: "describe" }])],
+    };
+
+    await collect(createCodexCliBackend(config, runner).generateStream(request));
+
+    expect(seen.paths).toHaveLength(1);
+    expect(seen.command?.args).toContain("-i");
+    for (const path of seen.paths) expect(existsSync(path)).toBe(false);
+  });
+
+  it("rejects a URL-source image as unsupported_feature without spawning", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+    const request: Request = {
+      maxTokens: 32,
+      messages: [user([{ type: "image", source: { url: "https://example.test/cat.png" } }])],
+    };
+
+    const error = await createCodexCliBackend(config, runner)
+      .generate(request)
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect((error as LLMDriverError).code).toBe("unsupported_feature");
+    expect((error as LLMDriverError).message).toContain("URL-source images");
+    expect((error as LLMDriverError).message).toContain("openai/cli");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects an image outside the final user message as unsupported_feature", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+    const request: Request = {
+      maxTokens: 32,
+      messages: [user([imageBlock(pngB64, "image/png")]), assistant("ack"), user("and now?")],
+    };
+
+    const error = await createCodexCliBackend(config, runner)
+      .generate(request)
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect((error as LLMDriverError).code).toBe("unsupported_feature");
+    expect((error as LLMDriverError).message).toContain("final user message");
+    expect(calls).toHaveLength(0);
+  });
+});
+
 async function collect(events: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> {
   const seen: StreamEvent[] = [];
   for await (const event of events) seen.push(event);
@@ -321,9 +633,43 @@ describe("codex cli streaming", () => {
           completionReason: "",
           provider: "openai",
           flavor: "cli",
+          toolCalls: [],
         },
       },
     ]);
+  });
+
+  it("maps reasoning items to reasoning events, in source order before the text", async () => {
+    const { runner } = fakeRunner({
+      stdout: [
+        '{"type":"thread.started","thread_id":"thread-123"}',
+        '{"type":"item.completed","item":{"type":"reasoning","text":"Think"}}',
+        '{"type":"item.completed","item":{"type":"reasoning","text":"ing"}}',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"Final answer"}}',
+        '{"type":"turn.completed","usage":{}}',
+      ].join("\n"),
+    });
+
+    const events = await collect(createCodexCliBackend(config, runner).generateStream(request));
+
+    // Coarse turn: reasoning items surface first, then the one text event, then done.
+    expect(events.slice(0, 3)).toEqual([
+      { type: "reasoning", text: "Think" },
+      { type: "reasoning", text: "ing" },
+      { type: "text", text: "Final answer" },
+    ]);
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event");
+    expect(done.response.text).toBe("Final answer");
+  });
+
+  it("emits no reasoning events when the JSONL exposes none", async () => {
+    const { runner } = fakeRunner({ stdout: successStream });
+
+    const events = await collect(createCodexCliBackend(config, runner).generateStream(request));
+
+    // codex reports no reasoning on this turn (matrix ⚠️) — no placeholder events.
+    expect(events.some((event) => event.type === "reasoning")).toBe(false);
   });
 
   it("emits only the done event when the agent message is empty", async () => {
@@ -366,5 +712,207 @@ describe("codex cli streaming", () => {
     await expect(
       collect(createCodexCliBackend(config, runner).generateStream(request, controller.signal)),
     ).rejects.toBe(reason);
+  });
+});
+
+// ── Tools via the MCP bridge (T15) ─────────────────────────────────────────
+// These drive the REAL loopback bridge: the fake runner reads the bridge URL
+// out of the argv it is handed and plays codex, calling the bridge over HTTP.
+//
+// FLAG: the `-c mcp_servers.llmdriver.url=` key syntax is characterized by the
+// env-gated integration test against the real binary (SPEC-v2 open question 4).
+
+const toolsRequest: Request = {
+  maxTokens: 32,
+  messages: [user("add 1 and 2")],
+  tools: [
+    {
+      name: "add",
+      description: "adds two numbers",
+      inputSchema: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } } },
+      execute: (input) => `sum:${JSON.stringify(input)}`,
+    },
+    {
+      name: "mul",
+      description: "multiplies two numbers",
+      inputSchema: { type: "object" },
+      execute: () => "0",
+    },
+  ],
+};
+
+const toolsStdout = [
+  '{"type":"thread.started","thread_id":"thread-1"}',
+  '{"type":"item.completed","item":{"type":"agent_message","text":"the sum is 3"}}',
+  '{"type":"turn.completed","usage":{}}',
+  "",
+].join("\n");
+
+/** Reads the bridge URL the adapter wrote into the `-c mcp_servers.*` override. */
+function bridgeUrl(command: Command): string {
+  const index = command.args.indexOf("-c");
+  const override = command.args[index + 1] as string;
+  // `mcp_servers.llmdriver.url="http://..."` — key is fixed, value is JSON-quoted.
+  const value = override.slice(override.indexOf("=") + 1);
+  return JSON.parse(value) as string;
+}
+
+/** One JSON-RPC call to the live bridge; rejects if the bridge is closed. */
+async function rpc(url: string, method: string, params?: unknown): Promise<Response> {
+  return fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+}
+
+describe("codex cli tools argv", () => {
+  it("adds the -c mcp_servers.llmdriver.url override (parsed) and keeps stdin last", async () => {
+    const { runner, calls } = fakeRunner({ stdout: toolsStdout });
+
+    await createCodexCliBackend(config, runner).generate(toolsRequest);
+
+    const args = calls[0]?.command.args ?? [];
+    // The stdin marker stays last even with the tool override present.
+    expect(args.at(-1)).toBe("-");
+
+    const cIndex = args.indexOf("-c");
+    expect(cIndex).toBeGreaterThanOrEqual(0);
+    const override = args[cIndex + 1] as string;
+    const [key, ...rest] = override.split("=");
+    expect(key).toBe("mcp_servers.llmdriver.url");
+    // Value is a JSON-quoted loopback bridge URL, not a brittle string match.
+    expect(JSON.parse(rest.join("="))).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/[0-9a-f-]{36}$/);
+  });
+
+  it("keeps the v1 argv untouched when the request carries no tools", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+
+    await createCodexCliBackend(config, runner).generate(request);
+
+    const args = calls[0]?.command.args ?? [];
+    expect(args).not.toContain("-c");
+    expect(args.some((arg) => arg.startsWith("mcp_servers."))).toBe(false);
+  });
+});
+
+describe("codex cli tools bridge lifecycle", () => {
+  it("keeps the bridge reachable during the run, then closes it on resolve", async () => {
+    let url = "";
+    let statusDuringRun = 0;
+    const runner: CommandRunner = async (command) => {
+      url = bridgeUrl(command);
+      statusDuringRun = (await rpc(url, "tools/list")).status;
+      return { stdout: toolsStdout, stderr: "", exitCode: 0 };
+    };
+
+    await createCodexCliBackend(config, runner).generate(toolsRequest);
+
+    expect(statusDuringRun).toBe(200);
+    await expect(rpc(url, "tools/list")).rejects.toThrow(); // connection refused after close
+  });
+
+  it("closes the bridge when the run fails", async () => {
+    let url = "";
+    const runner: CommandRunner = async (command) => {
+      url = bridgeUrl(command);
+      return { stdout: "", stderr: "boom\n", exitCode: 1 };
+    };
+
+    await expect(
+      createCodexCliBackend(config, runner).generate(toolsRequest),
+    ).rejects.toBeInstanceOf(LLMDriverError);
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+
+  it("closes the bridge when the run aborts", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    let url = "";
+    const runner: CommandRunner = async (command, signal) => {
+      url = bridgeUrl(command);
+      controller.abort(reason);
+      throw signal?.reason;
+    };
+
+    await expect(
+      createCodexCliBackend(config, runner).generate(toolsRequest, controller.signal),
+    ).rejects.toBe(reason);
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+
+  it("closes the bridge when the stream consumer breaks early", async () => {
+    let url = "";
+    const runner: CommandRunner = async (command) => {
+      url = bridgeUrl(command);
+      return { stdout: toolsStdout, stderr: "", exitCode: 0 };
+    };
+    const backend = createCodexCliBackend(config, runner);
+
+    for await (const _event of backend.generateStream(toolsRequest)) break;
+
+    await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+});
+
+describe("codex cli tools round-trip", () => {
+  it("populates response.toolCalls from a mid-turn tool call (generate)", async () => {
+    const runner: CommandRunner = async (command) => {
+      await rpc(bridgeUrl(command), "tools/call", { name: "add", arguments: { a: 1, b: 2 } });
+      return { stdout: toolsStdout, stderr: "", exitCode: 0 };
+    };
+
+    const response = await createCodexCliBackend(config, runner).generate(toolsRequest);
+
+    expect(response.toolCalls).toEqual([
+      {
+        id: expect.any(String),
+        name: "add",
+        input: { a: 1, b: 2 },
+        output: { text: 'sum:{"a":1,"b":2}', isError: false },
+        isError: false,
+      },
+    ]);
+  });
+
+  it("emits tool_call before tool_result and lands them in the done response (stream)", async () => {
+    const runner: CommandRunner = async (command) => {
+      await rpc(bridgeUrl(command), "tools/call", { name: "add", arguments: { a: 1, b: 2 } });
+      return { stdout: toolsStdout, stderr: "", exitCode: 0 };
+    };
+
+    const events = await collect(
+      createCodexCliBackend(config, runner).generateStream(toolsRequest),
+    );
+
+    const callAt = events.findIndex((event) => event.type === "tool_call");
+    const resultAt = events.findIndex((event) => event.type === "tool_result");
+    expect(callAt).toBeGreaterThanOrEqual(0);
+    expect(callAt).toBeLessThan(resultAt);
+    const call = events[callAt];
+    const toolResult = events[resultAt];
+    if (call?.type !== "tool_call" || toolResult?.type !== "tool_result") {
+      throw new Error("unreachable");
+    }
+    expect(call).toMatchObject({ name: "add", input: { a: 1, b: 2 } });
+    expect(toolResult).toMatchObject({
+      id: call.id,
+      name: "add",
+      output: { text: 'sum:{"a":1,"b":2}', isError: false },
+      isError: false,
+    });
+
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event last");
+    expect(events.filter((event) => event.type === "done")).toHaveLength(1);
+    expect(done.response.toolCalls).toEqual([
+      {
+        id: call.id,
+        name: "add",
+        input: { a: 1, b: 2 },
+        output: { text: 'sum:{"a":1,"b":2}', isError: false },
+        isError: false,
+      },
+    ]);
   });
 });
