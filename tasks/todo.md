@@ -37,7 +37,7 @@ five gates green (`build`, `test`, `lint`, `typecheck`, `test:coverage`).
 - [ ] Checkpoint 6: full matrix green; teardown leak check; human integration runs
 
 ## Phase 7 — Polish + ship
-- [ ] T16 `timeoutMs` (all) + `maxRetries` (api) (M)
+- [x] T16 `timeoutMs` (all) + `maxRetries` (api) (M)
 - [x] T17 Docs: SPEC merge, README matrix, example flags, CLAUDE.md (M)
 - [ ] Final checkpoint: every matrix cell tested, review + simplify, bump 0.2.0
 
