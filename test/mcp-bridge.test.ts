@@ -18,15 +18,31 @@ async function startBridge(
   return bridge;
 }
 
+/** The MCP JSON-RPC response fields these tests assert on. */
+type JsonRpcBody = {
+  result?: {
+    protocolVersion?: string;
+    capabilities?: { tools?: unknown };
+    tools?: unknown;
+    content?: Array<{ type: string; text: string }>;
+    isError?: boolean;
+  };
+  error?: { code: number; message?: string };
+};
+
 let nextId = 1;
 /** Sends one JSON-RPC request to `url` and returns the parsed response body. */
-async function rpc(url: string, method: string, params?: unknown): Promise<any> {
+async function rpc(
+  url: string,
+  method: string,
+  params?: unknown,
+): Promise<{ status: number; body: JsonRpcBody }> {
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: nextId++, method, params }),
   });
-  return { status: res.status, body: await res.json() };
+  return { status: res.status, body: (await res.json()) as JsonRpcBody };
 }
 
 function echoTool(execute?: Tool["execute"]): Tool {
@@ -49,11 +65,11 @@ describe("mcp bridge", () => {
 
     const init = await rpc(bridge.url, "initialize", { protocolVersion: "2025-06-18" });
     expect(init.status).toBe(200);
-    expect(init.body.result.protocolVersion).toBe("2025-06-18");
-    expect(init.body.result.capabilities.tools).toBeDefined();
+    expect(init.body.result?.protocolVersion).toBe("2025-06-18");
+    expect(init.body.result?.capabilities?.tools).toBeDefined();
 
     const list = await rpc(bridge.url, "tools/list");
-    expect(list.body.result.tools).toEqual([
+    expect(list.body.result?.tools).toEqual([
       {
         name: "echo",
         description: "echoes its input",
@@ -62,8 +78,8 @@ describe("mcp bridge", () => {
     ]);
 
     const call = await rpc(bridge.url, "tools/call", { name: "echo", arguments: { value: "hi" } });
-    expect(call.body.result.content).toEqual([{ type: "text", text: 'echoed: {"value":"hi"}' }]);
-    expect(call.body.result.isError).toBe(false);
+    expect(call.body.result?.content).toEqual([{ type: "text", text: 'echoed: {"value":"hi"}' }]);
+    expect(call.body.result?.isError).toBe(false);
 
     expect(bridge.records).toHaveLength(1);
     expect(bridge.records[0]).toMatchObject({
@@ -93,8 +109,8 @@ describe("mcp bridge", () => {
       }),
     ]);
     const call = await rpc(bridge.url, "tools/call", { name: "echo", arguments: {} });
-    expect(call.body.result.isError).toBe(true);
-    expect(call.body.result.content[0].text).toBe("handler exploded");
+    expect(call.body.result?.isError).toBe(true);
+    expect(call.body.result?.content?.[0]?.text).toBe("handler exploded");
   });
 
   it("handles the JSON-RPC protocol edges: parse error, notification, unknown method", async () => {
@@ -105,7 +121,7 @@ describe("mcp bridge", () => {
       headers: { "content-type": "application/json" },
       body: "{ not json",
     });
-    expect(((await bad.json()) as any).error.code).toBe(-32700);
+    expect(((await bad.json()) as JsonRpcBody).error?.code).toBe(-32700);
 
     const note = await fetch(bridge.url, {
       method: "POST",
@@ -115,7 +131,7 @@ describe("mcp bridge", () => {
     expect(note.status).toBe(202);
 
     const unknown = await rpc(bridge.url, "resources/list");
-    expect(unknown.body.error.code).toBe(-32601);
+    expect(unknown.body.error?.code).toBe(-32601);
   });
 
   it("404s a wrong-token path without invoking any handler", async () => {
