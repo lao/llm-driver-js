@@ -3,17 +3,30 @@
  *
  *   npm run example -- --provider openai --flavor cli --model gpt-5.6-sol --prompt "hi"
  */
+import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 // In your own project this import is `from "llm-driver"`.
 import {
   createClient,
   type Response as GenerateResponse,
   LLMDriverError,
+  type ReasoningEffort,
+  type Request,
+  type Tool,
   user,
 } from "../src/index.js";
 
 const USAGE = `Usage: npm run example -- --provider <claude|openai> --flavor <api|cli> \\
-  --model <model> --prompt <text> [--system <text>] [--max-tokens <n>] [--stream]`;
+  --model <model> --prompt <text> [--system <text>] [--max-tokens <n>] [--stream] \\
+  [--effort <minimal|low|medium|high>] [--schema <path-to-json-schema>] [--tool]`;
+
+/** Demo tool the model can call when --tool is passed. */
+const demoTool: Tool = {
+  name: "get_time",
+  description: "Returns the current time as an ISO-8601 string.",
+  inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  execute: () => new Date().toISOString(),
+};
 
 async function main(): Promise<void> {
   const { values } = parseArgs({
@@ -25,6 +38,9 @@ async function main(): Promise<void> {
       system: { type: "string" },
       "max-tokens": { type: "string", default: "1024" },
       stream: { type: "boolean", default: false },
+      effort: { type: "string" },
+      schema: { type: "string" },
+      tool: { type: "boolean", default: false },
     },
   });
 
@@ -37,12 +53,36 @@ async function main(): Promise<void> {
     throw new Error(`--max-tokens must be a positive integer, got "${values["max-tokens"]}"`);
   }
 
+  const request: Request = { system: values.system, messages: [user(prompt)], maxTokens };
+  if (values.effort !== undefined) {
+    const effort = oneOf("effort", values.effort, [
+      "minimal",
+      "low",
+      "medium",
+      "high",
+    ] as const satisfies readonly ReasoningEffort[]);
+    request.reasoning = { effort };
+  }
+  if (values.schema !== undefined) {
+    request.outputSchema = JSON.parse(readFileSync(values.schema, "utf8"));
+  }
+  if (values.tool) {
+    request.tools = [demoTool];
+  }
+
   const client = createClient({ provider, flavor, model });
-  const request = { system: values.system, messages: [user(prompt)], maxTokens };
 
   if (!values.stream) {
     const response = await client.generate(request);
     console.log(response.text);
+    if (response.structured !== undefined) {
+      console.log("structured:", JSON.stringify(response.structured));
+    }
+    for (const call of response.toolCalls) {
+      console.log(
+        `[tool ${call.name}] ${JSON.stringify(call.input)} -> ${JSON.stringify(call.output)}`,
+      );
+    }
     console.log(summary(response));
     return;
   }

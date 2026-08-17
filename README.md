@@ -60,6 +60,8 @@ interface Response {
   completionReason: "stop" | "max_tokens" | "refusal" | "";
   provider: "claude" | "openai";
   flavor: "api" | "cli";
+  structured?: unknown; // parsed JSON when outputSchema was set
+  toolCalls: ToolCallRecord[]; // audit trail; [] when no tools ran
 }
 ```
 
@@ -86,8 +88,10 @@ The request and the `generate` call stay identical across all four.
 ## Streaming
 
 `generateStream` takes the same request and returns an async iterable of events:
-zero or more `text` deltas, then exactly one final `done` event carrying the
-same `Response` `generate` would have returned. Nothing follows `done`.
+zero or more `text` deltas (interleaved with `reasoning` deltas, and
+`tool_call`/`tool_result` events when `tools` is set), then exactly one final
+`done` event carrying the same `Response` `generate` would have returned. Nothing
+follows `done`.
 
 ```ts
 for await (const event of client.generateStream({
@@ -105,10 +109,18 @@ for await (const event of client.generateStream({
 ```ts
 type StreamEvent =
   | { type: "text"; text: string } // incremental delta, possibly coarse
+  | { type: "reasoning"; text: string } // thinking / reasoning-summary delta
+  | { type: "tool_call"; id: string; name: string; input: unknown }
+  | { type: "tool_result"; id: string; name: string; output: ToolOutput; isError: boolean }
   | { type: "done"; response: Response }; // always last, exactly once
 ```
 
-The concatenated `text` deltas equal `done.response.text`. **Granularity
+The concatenated `text` deltas equal `done.response.text` when no tools run.
+`reasoning` deltas carry the target's thinking and never contribute to
+`response.text`; a target that reports none emits none. When `tools` are set,
+text produced before a tool call still streams but only the final message's text
+lands in `response.text`, so the deltas become a superset (see
+[Tools](#tools)). **Granularity
 is not part of the contract** — it is whatever the target reports, and a target
 may report nothing until the end:
 
@@ -155,6 +167,133 @@ for await (const event of client.generateStream(request, {
 }
 ```
 
+## Generation features
+
+Beyond plain text, the same `generate`/`generateStream` call takes reasoning
+controls, structured output, images, and client tools. Each works on every target
+that can honor it — and **throws where it cannot, never silently drops it** (see
+[Feature support](#feature-support)).
+
+### Sampling and reasoning
+
+```ts
+await client.generate({
+  messages: [user("Prove there are infinitely many primes.")],
+  maxTokens: 2048,
+  temperature: 0.2, // api flavors only
+  reasoning: { effort: "high" }, // all four targets
+});
+```
+
+`reasoning.effort` is one of `"minimal" | "low" | "medium" | "high"`, mapped per
+target (`output_config.effort`, `reasoning.effort`, `--effort`,
+`-c model_reasoning_effort=`). Levels a given provider rejects surface the
+provider's own error rather than being rejected by the library. In streaming mode,
+thinking arrives as `reasoning` events. `temperature`/`topP` are api-only; `topK`
+and `stopSequences` are `claude`/`api` only.
+
+### Structured output
+
+Pass a JSON Schema and read the parsed value from `response.structured`:
+
+```ts
+const response = await client.generate({
+  messages: [user("Give me a point as JSON.")],
+  maxTokens: 512,
+  outputSchema: {
+    type: "object",
+    properties: { x: { type: "number" }, y: { type: "number" } },
+    required: ["x", "y"],
+  },
+});
+console.log(response.structured); // { x: 3, y: 4 } — already parsed
+```
+
+Supported on all four targets (api via the provider's `json_schema` format, CLI
+via `--json-schema` / `--output-schema`). Output that is not valid JSON throws
+`parse_failed`.
+
+### Images
+
+Build a message from content blocks instead of a string:
+
+```ts
+await client.generate({
+  messages: [
+    user([
+      { type: "text", text: "What is in this image?" },
+      { type: "image", source: { base64: pngBase64, mediaType: "image/png" } },
+    ]),
+  ],
+  maxTokens: 1024,
+});
+```
+
+Honored on all four targets. API flavors also accept `{ url }` image sources and
+`document` (PDF) blocks; on CLI flavors URL images and documents throw
+`unsupported_feature`, and Codex accepts images only in the final user turn.
+
+### Tools
+
+Pass handler-based tools; the library runs the agentic loop and calls `execute`
+in-process on every target, then returns an audit trail in `response.toolCalls`:
+
+```ts
+const response = await client.generate({
+  messages: [user("What is the weather in Paris?")],
+  maxTokens: 1024,
+  tools: [
+    {
+      name: "get_weather",
+      description: "Current weather for a city",
+      inputSchema: {
+        type: "object",
+        properties: { city: { type: "string" } },
+        required: ["city"],
+      },
+      async execute(input) {
+        const { city } = input as { city: string };
+        return `18°C and clear in ${city}`;
+      },
+    },
+  ],
+});
+console.log(response.text, response.toolCalls);
+```
+
+- API flavors run the loop client-side (hard cap 16 rounds → `tool_loop_exceeded`)
+  and honor `toolChoice` (`"auto" | "none" | "required" | { name }`).
+- CLI flavors inject the tools into the CLI's own loop over a loopback HTTP MCP
+  bridge; `toolChoice` throws `unsupported_feature` there (the CLI owns its loop).
+- An `execute` that **throws** stops the loop with `tool_failed` (the thrown error
+  is `error.cause`); returning `{ text, isError: true }` reports a failed result to
+  the model and lets it continue. Handlers receive `ctx.signal` mirroring the
+  request abort.
+
+## Feature support
+
+Each request feature is honored on the targets below and throws
+`unsupported_feature` everywhere else — features are never silently dropped. The
+authoritative copy of this matrix lives in `src/capabilities.ts`.
+
+| Feature | claude/api | openai/api | claude/cli | openai/cli |
+| --- | :-: | :-: | :-: | :-: |
+| `temperature`, `topP` | ✅ | ✅ | ❌ | ❌ |
+| `topK`, `stopSequences` | ✅ | ❌ | ❌ | ❌ |
+| `metadata.userId` | ✅ | ✅ | ❌ | ❌ |
+| `reasoning.effort` | ✅ | ✅ | ✅ | ✅ |
+| `outputSchema` | ✅ | ✅ | ✅ | ✅ |
+| `tools` | ✅ | ✅ | ✅ | ✅ |
+| `toolChoice` | ✅ | ✅ | ❌ | ❌ |
+| Image input | ✅ | ✅ | ✅ | ✅ |
+| Document/PDF input | ✅ | ✅ | ❌ | ❌ |
+| `timeoutMs` | ✅ | ✅ | ✅ | ✅ |
+| `maxRetries` | ✅ | ✅ | ❌ | ❌ |
+
+`unsupported_feature` is thrown at `generate()` time, before any transport work
+(from the first `next()` for streams), with a message naming the feature and
+target.
+
 ## Authentication and configuration
 
 API flavors use the official provider SDKs. Set `ANTHROPIC_API_KEY` or
@@ -192,9 +331,21 @@ Prompts are written to the subprocess's stdin and argv is built directly — no
 shell is ever invoked. Treat `cliPath` and `cliArgs` as trusted application
 configuration, because they control local process execution.
 
-Options are flavor-scoped: passing `apiKey`, `baseUrl`, or `fetch` to a `cli`
-client — or `cliPath`/`cliArgs` to an `api` client — is rejected with an
-`invalid_config` error rather than silently ignored.
+Options are flavor-scoped: passing `apiKey`, `baseUrl`, `fetch`, or `maxRetries`
+to a `cli` client — or `cliPath`/`cliArgs` to an `api` client — is rejected with
+an `invalid_config` error rather than silently ignored.
+
+`timeoutMs` and `maxRetries` bound each call:
+
+```ts
+createClient({
+  provider: "claude",
+  flavor: "api",
+  model: "claude-sonnet-4-5",
+  timeoutMs: 30_000, // all flavors: api → SDK request timeout; cli → kill the process group
+  maxRetries: 2, // api flavors only; re-running an agent CLI is not idempotent, so it is rejected there
+});
+```
 
 ## Error handling
 
@@ -227,6 +378,9 @@ try {
 | `parse_failed` | Target output could not be parsed |
 | `api_error` | The provider or CLI reported a failure (`status`, `providerCode` when available) |
 | `transport_failed` | Network or transport-level failure |
+| `unsupported_feature` | A request feature the selected target cannot honor (see [Feature support](#feature-support)) |
+| `tool_failed` | A tool `execute` handler threw; the thrown error is `error.cause` |
+| `tool_loop_exceeded` | The api-flavor tool loop hit its 16-round cap |
 
 Other fields: `provider`, `flavor`, `operation` (e.g. `"generate"`), `status`
 (HTTP status or process exit code), `providerCode`, and `cause`.
@@ -242,13 +396,15 @@ const response = await client.generate(
 );
 ```
 
-There is no default timeout: without a signal, `generate` waits as long as the
-target takes. Pass `AbortSignal.timeout(ms)` if you need a deadline.
+There is no default timeout: without a signal or `timeoutMs`, `generate` waits as
+long as the target takes. Pass `AbortSignal.timeout(ms)` per call, or set
+`timeoutMs` on the client, if you need a deadline.
 
 ## Scope and CLI differences
 
-The shared contract is text-only generation, streaming or not: system text,
-multi-turn user/assistant messages, normalized text, and usage when reported.
+The shared contract is single-call generation, streaming or not: system text,
+multi-turn user/assistant messages, the generation features above (per the
+[feature matrix](#feature-support)), normalized text, and usage when reported.
 
 The CLI flavors intentionally wrap agent CLIs. They are not byte-for-byte
 equivalents of the hosted APIs:
@@ -288,8 +444,11 @@ equivalents of the hosted APIs:
   the host shuts down normally. A host killed outright (`SIGKILL`, or a signal
   it does not handle) leaves the CLI running until it finishes on its own.
 
-Tool/function calling, images, structured output, retries, automatic fallback,
-and persisted conversations are outside this library's current scope.
+Client tools, images, structured output, reasoning controls, and API-flavor
+retries are supported per the [feature matrix](#feature-support). Automatic
+fallback/routing, model catalogs, persisted conversations, document input on CLI
+flavors, and platform APIs (batches, embeddings, moderation, image/audio
+generation, server-side tools) are outside this library's scope.
 
 ## Example
 
@@ -303,10 +462,12 @@ npm run example -- \
   --prompt "Explain dependency inversion in one paragraph"
 ```
 
-Optional flags: `--system <text>`, `--max-tokens <n>` (default `1024`), and
-`--stream` to print deltas as they arrive followed by the usage line.
-Swap in `--provider claude --flavor api --model claude-sonnet-4-5` and the
-example's generation code is unchanged.
+Optional flags: `--system <text>`, `--max-tokens <n>` (default `1024`),
+`--stream` to print deltas as they arrive followed by the usage line,
+`--effort <minimal|low|medium|high>` to set reasoning effort, `--schema <path>`
+to load a JSON Schema and print `response.structured`, and `--tool` to register a
+demo `get_time` tool the model can call. Swap in `--provider claude --flavor api
+--model claude-sonnet-4-5` and the example's generation code is unchanged.
 
 ## Development
 

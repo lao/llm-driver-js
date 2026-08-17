@@ -6,7 +6,7 @@ export type Target = `${Provider}/${Flavor}`;
 
 /**
  * One gated request feature and the targets that can honor it. This table is the
- * SINGLE source of truth for portability (SPEC-v2 feature matrix): adapters map
+ * SINGLE source of truth for portability (SPEC.md feature matrix): adapters map
  * a feature onto the wire but never decide whether it is supported. Adding a
  * feature is one row here plus its adapter mapping — the gate below stays generic.
  */
@@ -19,7 +19,7 @@ interface Capability {
   supported: readonly Target[];
 }
 
-/** Feature × target support matrix (SPEC-v2, normative). One row per gated field. */
+/** Feature × target support matrix (SPEC.md, normative). One row per gated field. */
 export const CAPABILITIES: readonly Capability[] = [
   {
     feature: "temperature",
