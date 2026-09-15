@@ -47,8 +47,8 @@ provider/model with space
 });
 
 describe("listOpencodeModels option validation", () => {
-  for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-    it(`rejects a non-positive or non-finite timeoutMs (${timeoutMs})`, async () => {
+  for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 0.5]) {
+    it(`rejects a non-positive, non-finite, or fractional timeoutMs (${timeoutMs})`, async () => {
       const caught = await listOpencodeModels({
         cliPath: "/nonexistent/llmwrapper-opencode",
         timeoutMs,

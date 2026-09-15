@@ -32,7 +32,7 @@ export async function listOpencodeModels(
   // This API bypasses `validateConfig`, so normalize the timeout here: a bad
   // value would otherwise reach `AbortSignal.timeout` as an immediate timeout or
   // a platform `RangeError` instead of a documented `LLMDriverError`.
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
     throw new LLMDriverError("invalid_config", "timeoutMs must be a positive number", {
       provider: "opencode",
       operation: "listOpencodeModels",
