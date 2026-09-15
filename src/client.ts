@@ -3,6 +3,7 @@ import type { Backend } from "./backends/backend.js";
 import { createClaudeCliBackend } from "./backends/claude-cli.js";
 import { createCodexCliBackend } from "./backends/codex-cli.js";
 import { createOpenAiApiBackend } from "./backends/openai-api.js";
+import { createOpencodeCliBackend } from "./backends/opencode-cli.js";
 import { assertSupported } from "./capabilities.js";
 import { validateConfig } from "./config.js";
 import { LLMDriverError } from "./errors.js";
@@ -74,6 +75,16 @@ function selectBackend(config: Config): Backend {
       return createOpenAiApiBackend(config);
     case "openai/cli":
       return createCodexCliBackend(config);
+    case "opencode/cli":
+      return createOpencodeCliBackend(config);
+    default:
+      // opencode/api and any future unsupported pair are rejected by
+      // validateConfig before this runs; this keeps the switch exhaustive.
+      throw new LLMDriverError(
+        "invalid_config",
+        `${config.provider}/${config.flavor} is not a supported target`,
+        { provider: config.provider, flavor: config.flavor, operation: "createClient" },
+      );
   }
 }
 

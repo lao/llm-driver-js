@@ -3,7 +3,7 @@
 ## Objective
 
 TypeScript/npm port of the Go `llmwrapper` library (`/Users/lucas/Projects/claudewrap`).
-One small, provider-neutral text-generation API with four switchable targets:
+One small, provider-neutral text-generation API with five switchable targets:
 
 | Provider | Flavor | Transport                                   | Authentication          |
 | -------- | ------ | ------------------------------------------- | ----------------------- |
@@ -11,6 +11,11 @@ One small, provider-neutral text-generation API with four switchable targets:
 | `claude` | `cli`  | Local `claude -p` process                    | Existing Claude CLI login |
 | `openai` | `api`  | OpenAI Responses API (`openai`)              | `OPENAI_API_KEY`        |
 | `openai` | `cli`  | Local `codex exec` process                   | Existing Codex CLI login |
+| `opencode` | `cli` | Local `opencode run --format json` process  | Existing opencode login/config |
+
+`opencode` is a multi-provider harness with no hosted API: it is `cli`-only, and
+its model is any `provider/model` id the local install can reach, enumerated by
+`listOpencodeModels()` (`opencode models`).
 
 Primary user: a Node/TypeScript developer who wants to prototype against a locally
 authenticated CLI and later switch to the hosted API — or switch providers — by
@@ -49,7 +54,7 @@ console.log(response.text);
 Public surface (deliberately small):
 
 ```ts
-type Provider = "claude" | "openai";
+type Provider = "claude" | "openai" | "opencode";
 type Flavor = "api" | "cli";
 type Role = "user" | "assistant";
 type ReasoningEffort = "minimal" | "low" | "medium" | "high";
@@ -63,7 +68,7 @@ interface Config {
   baseUrl?: string;         // optional proxy/test-server override (api flavor)
   fetch?: typeof fetch;     // optional transport override (api flavor)
 
-  cliPath?: string;         // optional; defaults to "claude" / "codex"
+  cliPath?: string;         // optional; defaults to "claude" / "codex" / "opencode"
   cliArgs?: string[];       // optional argv escape hatch; never shell-expanded
 
   timeoutMs?: number;       // all flavors; SDK default (api) / none (cli)
@@ -71,6 +76,14 @@ interface Config {
 }
 
 function createClient(config: Config): Client;
+
+// Enumerates the `provider/model` ids the local opencode can reach (`opencode models`).
+// Throws the normalized LLMDriverError (executable_not_found/process_failed) on failure.
+function listOpencodeModels(options?: {
+  cliPath?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;   // default 10 s
+}): Promise<string[]>;
 
 interface Client {
   generate(request: Request, options?: { signal?: AbortSignal }): Promise<Response>;
@@ -89,9 +102,9 @@ interface Request {
   stopSequences?: string[]; // claude/api only
   metadata?: { userId?: string };  // api flavors only
 
-  reasoning?: { effort: ReasoningEffort };  // all four targets
+  reasoning?: { effort: ReasoningEffort };  // all five targets
   outputSchema?: JsonSchema;                // structured output; all four targets
-  tools?: Tool[];                           // client tools; all four targets
+  tools?: Tool[];                           // client tools; all five targets
   toolChoice?: ToolChoice;                  // api flavors only; requires tools
 }
 
@@ -212,32 +225,34 @@ flavors even though they cannot enforce it (v1 contract, unchanged).
 
 ### Feature matrix (normative)
 
-| Feature | claude/api | openai/api | claude/cli | openai/cli (codex) |
-|---|---|---|---|---|
-| `temperature` | ✅ `temperature` | ✅ `temperature` | ❌ | ❌ |
-| `topP` | ✅ `top_p` | ✅ `top_p` | ❌ | ❌ |
-| `topK` | ✅ `top_k` | ❌ (no equivalent) | ❌ | ❌ |
-| `stopSequences` | ✅ `stop_sequences` | ❌ (Responses API has none) | ❌ | ❌ |
-| `metadata.userId` | ✅ `metadata.user_id` | ✅ `safety_identifier` | ❌ | ❌ |
-| `reasoning.effort` | ✅ `output_config.effort` | ✅ `reasoning.effort` | ✅ `--effort` | ✅ `-c model_reasoning_effort=` |
-| `outputSchema` (structured output) | ✅ `output_config.format` | ✅ `text.format` json_schema | ✅ `--json-schema` | ✅ `--output-schema <tmpfile>` |
-| `tools` (client tools, handler-based) | ✅ tool loop | ✅ tool loop | ✅ MCP bridge | ✅ MCP bridge |
-| `toolChoice` | ✅ | ✅ | ❌ (CLI owns its loop) | ❌ |
-| Image input | ✅ `image` block | ✅ `input_image` | ✅ stream-json content block | ✅ `-i <tmpfile>` |
-| Document/PDF input | ✅ `document` block | ✅ `input_file` | ❌ | ❌ |
-| `timeoutMs` | ✅ SDK timeout | ✅ SDK timeout | ✅ kill process group | ✅ kill process group |
-| `maxRetries` | ✅ SDK retries | ✅ SDK retries | ❌ (re-running an agent is not idempotent) | ❌ |
-| Reasoning stream events | ✅ thinking deltas | ✅ reasoning-summary deltas | ✅ stream-json thinking | ⚠️ best-effort (`agent_reasoning`; may be absent) |
-| Tool-call stream events | ✅ | ✅ | ✅ (bridge observes calls) | ✅ (bridge observes calls) |
+| Feature | claude/api | openai/api | claude/cli | openai/cli (codex) | opencode/cli |
+|---|---|---|---|---|---|
+| `temperature` | ✅ `temperature` | ✅ `temperature` | ❌ | ❌ | ❌ |
+| `topP` | ✅ `top_p` | ✅ `top_p` | ❌ | ❌ | ❌ |
+| `topK` | ✅ `top_k` | ❌ (no equivalent) | ❌ | ❌ | ❌ |
+| `stopSequences` | ✅ `stop_sequences` | ❌ (Responses API has none) | ❌ | ❌ | ❌ |
+| `metadata.userId` | ✅ `metadata.user_id` | ✅ `safety_identifier` | ❌ | ❌ | ❌ |
+| `reasoning.effort` | ✅ `output_config.effort` | ✅ `reasoning.effort` | ✅ `--effort` | ✅ `-c model_reasoning_effort=` | ✅ `--variant` |
+| `outputSchema` (structured output) | ✅ `output_config.format` | ✅ `text.format` json_schema | ✅ `--json-schema` | ✅ `--output-schema <tmpfile>` | ❌ (no flag) |
+| `tools` (client tools, handler-based) | ✅ tool loop | ✅ tool loop | ✅ MCP bridge | ✅ MCP bridge | ✅ MCP bridge (`OPENCODE_CONFIG_CONTENT`) |
+| `toolChoice` | ✅ | ✅ | ❌ (CLI owns its loop) | ❌ | ❌ |
+| Image input | ✅ `image` block | ✅ `input_image` | ✅ stream-json content block | ✅ `-i <tmpfile>` | ✅ `-f <tmpfile>` |
+| Document/PDF input | ✅ `document` block | ✅ `input_file` | ❌ | ❌ | ❌ |
+| `timeoutMs` | ✅ SDK timeout | ✅ SDK timeout | ✅ kill process group | ✅ kill process group | ✅ kill process group |
+| `maxRetries` | ✅ SDK retries | ✅ SDK retries | ❌ (re-running an agent is not idempotent) | ❌ | ❌ |
+| Reasoning stream events | ✅ thinking deltas | ✅ reasoning-summary deltas | ✅ stream-json thinking | ⚠️ best-effort (`agent_reasoning`; may be absent) | ✅ `--thinking` reasoning parts |
+| Tool-call stream events | ✅ | ✅ | ✅ (bridge observes calls) | ✅ (bridge observes calls) | ✅ (bridge observes calls) |
 
 ❌ = throws `unsupported_feature`. ⚠️ = emitted when the target reports it;
 absence is not an error (same stance as v1 delta granularity).
 
 CLI flag mappings are verified against `claude` (2026-08: `--json-schema`,
 `--effort`, `--mcp-config`, `--strict-mcp-config`, `--allowedTools`,
-`--input-format stream-json`) and `codex-cli 0.147.0` (`--output-schema`,
-`-i/--image`, `-c` overrides, `--json`). The opt-in integration test is the
-authority for behavior fixtures cannot prove (see Testing).
+`--input-format stream-json`), `codex-cli 0.147.0` (`--output-schema`,
+`-i/--image`, `-c` overrides, `--json`), and `opencode 1.18` (`run --format json
+--thinking --variant`, `-f`, `mcp` remote servers via `OPENCODE_CONFIG_CONTENT`).
+The opt-in integration test is the authority for behavior fixtures cannot prove
+(see Testing).
 
 ### CLI transport contract (ported from Go)
 
@@ -247,6 +262,11 @@ authority for behavior fixtures cannot prove (see Testing).
 - Codex: `codex exec --json --sandbox read-only --skip-git-repo-check --model <model>
   [--config developer_instructions=<JSON-encoded system>] [feature flags] [cliArgs...] -`,
   transcript on stdin, JSONL events parsed from stdout (agent message + token usage events).
+- opencode: `opencode run --format json --thinking --model <model> [--variant <effort>]
+  [feature flags] [cliArgs...]`, transcript on stdin (a system instruction is
+  prepended to the transcript — opencode has no system-prompt flag), JSON events
+  parsed from stdout. Tools are injected as a remote MCP server through the
+  `OPENCODE_CONFIG_CONTENT` env var (layered over the inherited environment).
 - Argv built directly, prompts passed via stdin, **no shell ever invoked**.
 - Subprocess inherits cwd/env so local authentication works.
 - Missing executable → `executable_not_found`; non-zero exit → `process_failed`
@@ -255,12 +275,12 @@ authority for behavior fixtures cannot prove (see Testing).
 - `AbortSignal` kills the subprocess group (SIGTERM, then SIGKILL after grace, so
   CLI-spawned helper processes die too) and aborts API requests.
 - On abort, `generate` rejects with the abort reason itself — never a wrapped
-  `LLMDriverError` — identically across all four targets.
+  `LLMDriverError` — identically across all five targets.
 - Mirror exact flags from Go reference: `backend_claude_cli.go`, `backend_codex_cli.go`.
 
 ### Streaming contract (`generateStream`)
 
-Provider-neutral, deliberately weak enough to hold on all four targets:
+Provider-neutral, deliberately weak enough to hold on all five targets:
 
 - Yields **zero or more** `text` events, any number of `reasoning` events, and —
   when `tools` is set — `tool_call`/`tool_result` pairs, then **exactly one**
@@ -304,7 +324,7 @@ Provider-neutral, deliberately weak enough to hold on all four targets:
 
 ### Backend semantics — tools
 
-Client tools are **handler-based and uniform across all four targets**: the caller
+Client tools are **handler-based and uniform across all five targets**: the caller
 passes `Tool[]` with an in-process `execute`, and the library ensures every tool
 call routes back to that handler. `Response.toolCalls` is the audit trail; in
 streaming mode calls surface as `tool_call`/`tool_result` events.
@@ -364,10 +384,11 @@ client-side loop, so the 16-round cap and `toolChoice` do not apply
 - claude/cli: `--json-schema '<schema JSON>'`; result parsed from the json result payload.
 - codex/cli: schema written to a scratch temp file, `--output-schema <path>`, file
   deleted in `finally`.
-- All targets: the adapter parses the final text as JSON into `response.structured`;
-  invalid JSON → `parse_failed`. `outputSchema` + `tools` together is allowed
-  wherever both are supported (all four targets); the schema constrains the final
-  message.
+- opencode/cli: no schema flag → `unsupported_feature`.
+- All supporting targets: the adapter parses the final text as JSON into
+  `response.structured`; invalid JSON → `parse_failed`. `outputSchema` + `tools`
+  together is allowed wherever both are supported (the four targets above); the
+  schema constrains the final message.
 
 ### Backend semantics — images
 
@@ -377,6 +398,9 @@ client-side loop, so the 16-round cap and `toolChoice` do not apply
   requests keep the v1 plain-stdin path byte-for-byte (no regression risk).
 - codex/cli: base64 images written to scratch temp files, passed via `-i`, deleted
   in `finally`. URL-source images are `unsupported_feature` (no flag for URLs).
+- opencode/cli: base64 images written to scratch temp files, passed via `-f`,
+  deleted in `finally`; like codex, URL-source and non-final-turn images are
+  `unsupported_feature`.
   `-i` attaches to the *initial prompt*, so images in earlier turns of a multi-turn
   transcript are `unsupported_feature` — images may appear only in the final user turn.
 - Document/PDF blocks are api-only (`document` block on claude, `input_file` on
@@ -524,7 +548,7 @@ README.md / SPEC.md / tasks/plan.md / CLAUDE.md
   `Message.text` becoming optional in favor of `text` XOR `content` — plain
   `{ role, text }` object literals never see it; resolves open question 1).
 - `npm run build && npm test && npm run lint && npm run typecheck` green, offline.
-- README documents the four-target matrix, the strict policy, auth setup, CLI/API
+- README documents the five-target matrix, the strict policy, auth setup, CLI/API
   limitations, and error handling — easy to follow.
 - CLAUDE.md documents project structure and commands.
 

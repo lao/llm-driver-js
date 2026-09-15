@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": false,
-    "includes": ["**", "!**/.claude"]
+    "includes": ["src/**", "test/**", "examples/**", "*.ts", "package.json", "tsconfig.json"]
   },
   "formatter": {
     "enabled": true,

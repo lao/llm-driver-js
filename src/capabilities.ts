@@ -49,7 +49,7 @@ export const CAPABILITIES: readonly Capability[] = [
   {
     feature: "reasoning.effort",
     used: (request) => request.reasoning !== undefined,
-    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
+    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli", "opencode/cli"],
   },
   {
     // Structured output on all four targets: API flavors via the provider's
@@ -59,13 +59,14 @@ export const CAPABILITIES: readonly Capability[] = [
     supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
   },
   {
-    // Images honored on all four targets: API flavors natively, claude/cli via
-    // stream-json stdin (T8), codex/cli via temp files + `-i` (T9). codex/cli's
-    // URL-source and non-final-turn constraints are enforced in the codex-cli
-    // adapter, which throws `unsupported_feature` naming the constraint.
+    // Images honored on all five targets: API flavors natively, claude/cli via
+    // stream-json stdin (T8), codex/cli via temp files + `-i` (T9), opencode/cli
+    // via temp files + `-f`. The codex/cli and opencode/cli URL-source and
+    // non-final-turn constraints are enforced in their adapters, which throw
+    // `unsupported_feature` naming the constraint.
     feature: "image input",
     used: (request) => hasBlock(request, "image"),
-    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
+    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli", "opencode/cli"],
   },
   {
     feature: "document input",
@@ -73,10 +74,12 @@ export const CAPABILITIES: readonly Capability[] = [
     supported: ["claude/api", "openai/api"],
   },
   {
-    // Both cli flavors inject caller tools into the CLI's own loop via the MCP bridge.
+    // Every cli flavor injects caller tools into the CLI's own loop via the MCP
+    // bridge: claude/codex through argv config, opencode through
+    // `OPENCODE_CONFIG_CONTENT` remote MCP servers.
     feature: "tools",
     used: (request) => Array.isArray(request.tools) && request.tools.length > 0,
-    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],
+    supported: ["claude/api", "openai/api", "claude/cli", "openai/cli", "opencode/cli"],
   },
   {
     feature: "toolChoice",

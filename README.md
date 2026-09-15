@@ -1,6 +1,6 @@
 # llm-driver
 
-`llm-driver` is a small TypeScript library with one text-generation API and four
+`llm-driver` is a small TypeScript library with one text-generation API and five
 switchable targets. Point it at a hosted provider API or at an agent CLI you are
 already logged into, and switch between them by changing configuration only —
 the `generate` call site never changes. Models are always explicit; the library
@@ -12,6 +12,11 @@ never selects or updates one for you.
 | `claude` | `cli` | Local `claude -p` | Existing Claude CLI login |
 | `openai` | `api` | OpenAI Responses API | `OPENAI_API_KEY` |
 | `openai` | `cli` | Local `codex exec` | Existing Codex CLI login |
+| `opencode` | `cli` | Local `opencode run` | Existing opencode login/config |
+
+`opencode` is a multi-provider harness: its `--model` takes any `provider/model`
+id the local install can reach (Anthropic, OpenAI, Google, OpenRouter, local
+models, …). Enumerate them with [`listOpencodeModels`](#listing-opencode-models).
 
 ## Install
 
@@ -58,7 +63,7 @@ interface Response {
   usage: Usage; // inputTokens, outputTokens, cachedInputTokens,
   //           cacheCreationInputTokens, reasoningTokens
   completionReason: "stop" | "max_tokens" | "refusal" | "";
-  provider: "claude" | "openai";
+  provider: "claude" | "openai" | "opencode";
   flavor: "api" | "cli";
   structured?: unknown; // parsed JSON when outputSchema was set
   toolCalls: ToolCallRecord[]; // audit trail; [] when no tools ran
@@ -81,9 +86,12 @@ createClient({ provider: "openai", flavor: "api", model: "gpt-5.6-sol" });
 
 // Local Codex CLI
 createClient({ provider: "openai", flavor: "cli", model: "gpt-5.6-sol" });
+
+// Local opencode (cli only), any provider/model it can reach
+createClient({ provider: "opencode", flavor: "cli", model: "anthropic/claude-sonnet-4-5" });
 ```
 
-The request and the `generate` call stay identical across all four.
+The request and the `generate` call stay identical across all five.
 
 ## Streaming
 
@@ -130,16 +138,16 @@ may report nothing until the end:
 | `openai`/`api` | Token-level deltas (Responses API SSE) |
 | `claude`/`cli` | Partial-message chunks (`--output-format stream-json --include-partial-messages`) |
 | `openai`/`cli` | One coarse delta: `codex exec --json` reports completed messages only |
+| `opencode`/`cli` | Per-step text/reasoning deltas (`opencode run --format json --thinking`) |
 
-> **`claude`/`cli` caveat.** `claude -p` is an agent, not a completion endpoint.
-> It streams deltas for every assistant message in the turn, but its final
-> `result` event — the one that becomes `done.response` — reports only the last
-> message. The concatenation therefore equals `done.response.text` for a
-> single-message turn; if the CLI runs tools, the deltas additionally contain the
-> intermediate assistant text spoken before each tool call. `done.response` is
-> always exactly what `generate` would have returned. Treat `done.response.text`
-> as the answer and the deltas as progress output. The other three targets hold
-> the equality unconditionally.
+> **`claude`/`cli` and `opencode`/`cli` caveat.** Both are agents, not completion
+> endpoints. They stream deltas for every assistant message in the turn, but
+> `done.response` comes from the final message alone. The concatenation therefore
+> equals `done.response.text` for a single-message turn; if the CLI runs tools,
+> the deltas additionally contain the intermediate assistant text spoken before
+> each tool call. `done.response` is always exactly what `generate` would have
+> returned. Treat `done.response.text` as the answer and the deltas as progress
+> output. The other targets hold the equality unconditionally.
 
 Errors and aborts work exactly as with `generate`, except that they surface from
 the iteration rather than from the call:
@@ -148,7 +156,7 @@ the iteration rather than from the call:
   called — standard async-generator semantics. `const it = client.generateStream(bad)`
   does not throw; the `for await` that drives it does.
 - A failure throws an `LLMDriverError` from the loop; an abort throws the
-  signal's own reason untouched, identically across all four targets.
+  signal's own reason untouched, identically across all five targets.
 - Stopping early cleans up the transport. `break`, `return`, or `throw` inside
   the loop aborts the HTTP stream, or signals the CLI process group (SIGTERM,
   then SIGKILL after a short grace period) — the iteration does not wait around
@@ -181,13 +189,13 @@ await client.generate({
   messages: [user("Prove there are infinitely many primes.")],
   maxTokens: 2048,
   temperature: 0.2, // api flavors only
-  reasoning: { effort: "high" }, // all four targets
+  reasoning: { effort: "high" }, // all five targets
 });
 ```
 
 `reasoning.effort` is one of `"minimal" | "low" | "medium" | "high"`, mapped per
 target (`output_config.effort`, `reasoning.effort`, `--effort`,
-`-c model_reasoning_effort=`). Levels a given provider rejects surface the
+`-c model_reasoning_effort=`, `--variant`). Levels a given provider rejects surface the
 provider's own error rather than being rejected by the library. In streaming mode,
 thinking arrives as `reasoning` events. `temperature`/`topP` are api-only; `topK`
 and `stopSequences` are `claude`/`api` only.
@@ -209,9 +217,10 @@ const response = await client.generate({
 console.log(response.structured); // { x: 3, y: 4 } — already parsed
 ```
 
-Supported on all four targets (api via the provider's `json_schema` format, CLI
-via `--json-schema` / `--output-schema`). Output that is not valid JSON throws
-`parse_failed`.
+Supported on the four targets that expose a schema flag (api via the provider's
+`json_schema` format, CLI via `--json-schema` / `--output-schema`);
+`opencode`/`cli` has none and throws `unsupported_feature`. Output that is not
+valid JSON throws `parse_failed`.
 
 ### Images
 
@@ -229,9 +238,10 @@ await client.generate({
 });
 ```
 
-Honored on all four targets. API flavors also accept `{ url }` image sources and
+Honored on all five targets. API flavors also accept `{ url }` image sources and
 `document` (PDF) blocks; on CLI flavors URL images and documents throw
-`unsupported_feature`, and Codex accepts images only in the final user turn.
+`unsupported_feature`, and Codex and opencode accept images only in the final
+user turn (opencode attaches them with `-f`, Codex with `-i`).
 
 ### Tools
 
@@ -276,19 +286,19 @@ Each request feature is honored on the targets below and throws
 `unsupported_feature` everywhere else — features are never silently dropped. The
 authoritative copy of this matrix lives in `src/capabilities.ts`.
 
-| Feature | claude/api | openai/api | claude/cli | openai/cli |
-| --- | :-: | :-: | :-: | :-: |
-| `temperature`, `topP` | ✅ | ✅ | ❌ | ❌ |
-| `topK`, `stopSequences` | ✅ | ❌ | ❌ | ❌ |
-| `metadata.userId` | ✅ | ✅ | ❌ | ❌ |
-| `reasoning.effort` | ✅ | ✅ | ✅ | ✅ |
-| `outputSchema` | ✅ | ✅ | ✅ | ✅ |
-| `tools` | ✅ | ✅ | ✅ | ✅ |
-| `toolChoice` | ✅ | ✅ | ❌ | ❌ |
-| Image input | ✅ | ✅ | ✅ | ✅ |
-| Document/PDF input | ✅ | ✅ | ❌ | ❌ |
-| `timeoutMs` | ✅ | ✅ | ✅ | ✅ |
-| `maxRetries` | ✅ | ✅ | ❌ | ❌ |
+| Feature | claude/api | openai/api | claude/cli | openai/cli | opencode/cli |
+| --- | :-: | :-: | :-: | :-: | :-: |
+| `temperature`, `topP` | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `topK`, `stopSequences` | ✅ | ❌ | ❌ | ❌ | ❌ |
+| `metadata.userId` | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `reasoning.effort` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `outputSchema` | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `tools` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `toolChoice` | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Image input | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Document/PDF input | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `timeoutMs` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `maxRetries` | ✅ | ✅ | ❌ | ❌ | ❌ |
 
 `unsupported_feature` is thrown at `generate()` time, before any transport work
 (from the first `next()` for streams), with a message naming the feature and
@@ -334,6 +344,27 @@ configuration, because they control local process execution.
 Options are flavor-scoped: passing `apiKey`, `baseUrl`, `fetch`, or `maxRetries`
 to a `cli` client — or `cliPath`/`cliArgs` to an `api` client — is rejected with
 an `invalid_config` error rather than silently ignored.
+
+### Listing opencode models
+
+Because `opencode` fronts many upstream providers, `listOpencodeModels()` shells
+out to `opencode models` for the exact `provider/model` ids the local install can
+reach (it merges `auth.json` credentials, provider env vars, and `opencode.json`).
+Pass an id straight to `Config.model`:
+
+```ts
+import { listOpencodeModels } from "llm-driver";
+
+const models = await listOpencodeModels();
+// ["opencode/big-pickle", "anthropic/claude-sonnet-4-5", "openrouter/…", …]
+
+const client = createClient({ provider: "opencode", flavor: "cli", model: models[0] });
+```
+
+It throws the usual normalized `LLMDriverError` (`executable_not_found`,
+`process_failed`) when opencode is missing or fails — unlike an interactive UI, a
+library caller decides how to degrade. `cliPath`, `timeoutMs`, and `signal` are
+available for control.
 
 `timeoutMs` and `maxRetries` bound each call:
 
@@ -387,7 +418,7 @@ Other fields: `provider`, `flavor`, `operation` (e.g. `"generate"`), `status`
 
 Abort is deliberately different. Pass an `AbortSignal` and, when it fires,
 `generate` rejects with the signal's abort reason itself — never a wrapped
-`LLMDriverError` — identically across all four targets:
+`LLMDriverError` — identically across all five targets:
 
 ```ts
 const response = await client.generate(

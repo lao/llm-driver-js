@@ -1,7 +1,7 @@
 import { LLMDriverError } from "./errors.js";
 import type { Config, Flavor, Provider } from "./types.js";
 
-const PROVIDERS: Provider[] = ["claude", "openai"];
+const PROVIDERS: Provider[] = ["claude", "openai", "opencode"];
 const FLAVORS: Flavor[] = ["api", "cli"];
 
 /** Options that only make sense for one flavor, rejected for the other. */
@@ -27,6 +27,10 @@ export function validateConfig(config: Config): void {
   }
   if (typeof config.model !== "string" || config.model.trim() === "") {
     throw invalid(config, "model is required");
+  }
+  // opencode is a locally authenticated harness (a CLI), not a hosted API.
+  if (config.provider === "opencode" && config.flavor !== "cli") {
+    throw invalid(config, "opencode only supports the cli flavor");
   }
 
   const forbidden = config.flavor === "api" ? CLI_ONLY : API_ONLY;

@@ -8,6 +8,7 @@ import type {
   Config,
   ErrorCode,
   Flavor,
+  ListOpencodeModelsOptions,
   LLMDriverErrorOptions,
   Message,
   Provider,
@@ -20,7 +21,13 @@ import type {
 import * as barrel from "../src/index.js";
 
 /** The public surface SPEC.md promises; anything else is an internal leak. */
-const RUNTIME_EXPORTS = ["LLMDriverError", "assistant", "createClient", "user"];
+const RUNTIME_EXPORTS = [
+  "LLMDriverError",
+  "assistant",
+  "createClient",
+  "listOpencodeModels",
+  "user",
+];
 
 // Compile-time proof that every documented type is exported from the barrel;
 // `tsc --noEmit` fails if one goes missing.
@@ -30,6 +37,7 @@ type _Types = [
   Config,
   ErrorCode,
   Flavor,
+  ListOpencodeModelsOptions,
   LLMDriverErrorOptions,
   Message,
   Provider,

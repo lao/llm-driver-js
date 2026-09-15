@@ -18,17 +18,29 @@ function expectInvalidConfig(config: Config): LLMDriverError {
 }
 
 describe("validateConfig", () => {
-  const providers: Provider[] = ["claude", "openai"];
+  const providers: Provider[] = ["claude", "openai", "opencode"];
   const flavors: Flavor[] = ["api", "cli"];
 
-  for (const provider of providers) {
-    for (const flavor of flavors) {
-      it(`accepts ${provider}/${flavor}`, () => {
-        expect(() => validateConfig({ provider, flavor, model: "test-model" })).not.toThrow();
-        expect(() => createClient({ provider, flavor, model: "test-model" })).not.toThrow();
-      });
-    }
+  // opencode is a locally authenticated harness: cli only.
+  const combos: Array<[Provider, Flavor]> = [
+    ["claude", "api"],
+    ["claude", "cli"],
+    ["openai", "api"],
+    ["openai", "cli"],
+    ["opencode", "cli"],
+  ];
+
+  for (const [provider, flavor] of combos) {
+    it(`accepts ${provider}/${flavor}`, () => {
+      expect(() => validateConfig({ provider, flavor, model: "test-model" })).not.toThrow();
+      expect(() => createClient({ provider, flavor, model: "test-model" })).not.toThrow();
+    });
   }
+
+  it("rejects opencode/api — opencode only supports the cli flavor", () => {
+    const error = expectInvalidConfig({ provider: "opencode", flavor: "api", model: "m" });
+    expect(error.message).toBe("opencode only supports the cli flavor");
+  });
 
   it("accepts flavor-appropriate options", () => {
     expect(() =>

@@ -1,7 +1,8 @@
 /**
- * One call site, four targets — only the flags change.
+ * One call site, five targets — only the flags change.
  *
  *   npm run example -- --provider openai --flavor cli --model gpt-5.6-sol --prompt "hi"
+ *   npm run example -- --provider opencode --flavor cli --model anthropic/claude-sonnet-4-5 --prompt "hi"
  */
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
@@ -16,7 +17,7 @@ import {
   user,
 } from "../src/index.js";
 
-const USAGE = `Usage: npm run example -- --provider <claude|openai> --flavor <api|cli> \\
+const USAGE = `Usage: npm run example -- --provider <claude|openai|opencode> --flavor <api|cli> \\
   --model <model> --prompt <text> [--system <text>] [--max-tokens <n>] [--stream] \\
   [--effort <minimal|low|medium|high>] [--schema <path-to-json-schema>] [--tool]`;
 
@@ -44,7 +45,7 @@ async function main(): Promise<void> {
     },
   });
 
-  const provider = oneOf("provider", values.provider, ["claude", "openai"] as const);
+  const provider = oneOf("provider", values.provider, ["claude", "openai", "opencode"] as const);
   const flavor = oneOf("flavor", values.flavor, ["api", "cli"] as const);
   const model = required("model", values.model);
   const prompt = required("prompt", values.prompt);
