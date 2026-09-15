@@ -87,18 +87,22 @@ describe("opencode cli command", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.command).toEqual({
       executable: "opencode",
-      args: [...baseArgs, "--model", "anthropic/claude-test", "--", "Hello"],
-      stdin: "",
+      args: [...baseArgs, "--model", "anthropic/claude-test"],
+      stdin: "Hello",
     });
+    // The conversation must stay off argv, where process inspection can read it.
+    expect(calls[0]?.command.args).not.toContain("Hello");
     expect(calls[0]?.signal).toBe(signal);
   });
 
   it("carries a system instruction as inline-config instructions, not prompt text", async () => {
     let args: string[] = [];
+    let stdin = "";
     let instructionPath = "";
     let instructionContents = "";
     const runner: CommandRunner = async (command) => {
       args = command.args;
+      stdin = command.stdin;
       const config = JSON.parse(command.env?.OPENCODE_CONFIG_CONTENT as string) as {
         instructions?: string[];
       };
@@ -115,7 +119,8 @@ describe("opencode cli command", () => {
 
     expect(instructionContents).toBe("Be concise.");
     // The transcript is user/assistant turns only; the system text is privileged.
-    expect(args.at(-1)).toBe("User: First\n\nAssistant: Second\n\nUser: Third");
+    expect(stdin).toBe("User: First\n\nAssistant: Second\n\nUser: Third");
+    expect(args).not.toContain("User: First\n\nAssistant: Second\n\nUser: Third");
     expect(instructionPath).not.toBe("");
     expect(existsSync(instructionPath)).toBe(false);
   });
@@ -135,9 +140,8 @@ describe("opencode cli command", () => {
       "low",
       "--agent",
       "build",
-      "--",
-      "Hello",
     ]);
+    expect(calls[0]?.command.stdin).toBe("Hello");
   });
 
   it("omits the variant and thinking when the request has no reasoning", async () => {
@@ -145,13 +149,7 @@ describe("opencode cli command", () => {
 
     await createOpencodeCliBackend(config, runner).generate(request);
 
-    expect(calls[0]?.command.args).toEqual([
-      ...baseArgs,
-      "--model",
-      "anthropic/claude-test",
-      "--",
-      "Hello",
-    ]);
+    expect(calls[0]?.command.args).toEqual([...baseArgs, "--model", "anthropic/claude-test"]);
   });
 
   it("uses cliPath when provided", async () => {
@@ -420,12 +418,14 @@ function imageBlock(base64: string, mediaType: string): ContentBlock {
 function stagingRunner(result: Partial<CommandResult> = {}) {
   const seen = {
     command: undefined as Command | undefined,
+    stdin: "",
     paths: [] as string[],
     existedDuringRun: [] as boolean[],
     contents: [] as string[],
   };
   const runner: CommandRunner = async (command) => {
     seen.command = command;
+    seen.stdin = command.stdin;
     seen.paths = imagePaths(command);
     seen.existedDuringRun = seen.paths.map((path) => existsSync(path));
     seen.contents = seen.paths.map((path) => (existsSync(path) ? readFileSync(path, "utf8") : ""));
@@ -464,9 +464,8 @@ describe("opencode cli image input", () => {
       seen.paths[0],
       "-f",
       seen.paths[1],
-      "--",
-      "describe",
     ]);
+    expect(seen.stdin).toBe("describe");
     expect(seen.existedDuringRun).toEqual([true, true]);
     expect(seen.contents).toEqual(["fake-png-bytes", "fake-jpg-bytes"]);
     for (const path of seen.paths) expect(existsSync(path)).toBe(false);
@@ -588,8 +587,8 @@ describe("opencode cli streaming", () => {
 
     expect(calls[0]?.command).toEqual({
       executable: "opencode",
-      args: [...baseArgs, "--model", "anthropic/claude-test", "--", "Hello"],
-      stdin: "",
+      args: [...baseArgs, "--model", "anthropic/claude-test"],
+      stdin: "Hello",
     });
     expect(calls[0]?.signal).toBe(signal);
   });
@@ -737,6 +736,32 @@ describe("opencode cli streaming", () => {
       cacheCreationInputTokens: 1,
       reasoningTokens: 1,
     });
+  });
+
+  it("propagates a caller abort that lands during usage recovery", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller aborted");
+    const streamRunner: StreamingCommandRunner = async function* (command, signal) {
+      if (command.args[0] === "export") {
+        controller.abort(reason);
+        throw signal?.reason;
+      }
+      // Text but no terminal step_finish → generateStream runs the export recovery.
+      yield {
+        type: "line",
+        line: '{"type":"text","sessionID":"s","part":{"type":"text","text":"orphan"}}',
+      };
+      yield { type: "exit", exitCode: 0, stderr: "" };
+    };
+
+    await expect(
+      collect(
+        createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(
+          request,
+          controller.signal,
+        ),
+      ),
+    ).rejects.toBe(reason);
   });
 
   it("fails when the stream emits no usable event", async () => {

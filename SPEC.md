@@ -262,15 +262,16 @@ The opt-in integration test is the authority for behavior fixtures cannot prove
   [--config developer_instructions=<JSON-encoded system>] [feature flags] [cliArgs...] -`,
   transcript on stdin, JSONL events parsed from stdout (agent message + token usage events).
 - opencode: `opencode run --format json --model <model> [--thinking --variant <effort>]
-  [feature flags] [cliArgs...] -- "<transcript>"`, the transcript as the final
-  positional argument (`run [message..]`; `--` keeps a leading-dash turn from
-  parsing as an option), JSON events parsed from stdout. Tools are injected as a
-  remote MCP server and a system instruction as an `instructions` file through
-  the `OPENCODE_CONFIG_CONTENT` env var (layered over the inherited environment)
-  — opencode has no system-prompt flag, so the instruction must be a config
-  entry, not prompt text. When the upstream event-loop race drops the terminal
-  `step_finish`, usage is recovered from `opencode export <sessionID>`.
-- Argv built directly, prompts passed via stdin (opencode: final positional), **no shell ever invoked**.
+  [feature flags] [cliArgs...]`, transcript rendered to stdin (opencode reads
+  piped non-TTY stdin; keeping it out of argv avoids leaking the conversation to
+  process inspection and command logging), JSON events parsed from stdout. Tools
+  are injected as a remote MCP server and a system instruction as an
+  `instructions` file through the `OPENCODE_CONFIG_CONTENT` env var (layered over
+  the inherited environment) — opencode has no system-prompt flag, so the
+  instruction must be a config entry, not prompt text. When the upstream
+  event-loop race drops the terminal `step_finish`, usage is recovered from
+  `opencode export <sessionID>`.
+- Argv built directly, prompts passed via stdin, **no shell ever invoked**.
 - Subprocess inherits cwd/env so local authentication works.
 - Missing executable → `executable_not_found`; non-zero exit → `process_failed`
   (status = exit code); malformed output → `parse_failed`; provider-reported

@@ -63,12 +63,13 @@ export function createOpencodeCliBackend(
       // an unknown level surfaces opencode's error.
       args.push("--thinking", "--variant", request.reasoning.effort);
     }
-    // The transcript is the final positional `message`; `--` stops yargs from
-    // reading a leading-dash user turn as an option. stdin stays empty.
-    args.push(...imageArgs, ...extraArgs, "--", renderTranscript(request.messages));
+    args.push(...imageArgs, ...extraArgs);
     // opencode has no system-prompt flag, so `system` rides as an instruction
     // file through the inline config — a true system-level input, not prompt text.
-    const command: Command = { executable, args, stdin: "" };
+    // The transcript goes on stdin (opencode reads piped non-TTY stdin), keeping
+    // the conversation out of argv where process inspection or command logging
+    // could capture it.
+    const command: Command = { executable, args, stdin: renderTranscript(request.messages) };
     const env = opencodeConfig(bridge, instructionPath);
     if (env) command.env = { OPENCODE_CONFIG_CONTENT: env };
     return command;
@@ -432,6 +433,10 @@ async function exportSessionStream(
       stdout += `${line}\n`;
     }
   } catch {
+    // Export is best-effort — a broken export must not fail the run — but a
+    // caller abort is not an export failure: rethrow it so the documented abort
+    // contract holds and generateStream() cannot emit a successful `done`.
+    if (signal?.aborted) throw signal.reason;
     return undefined;
   }
   return stdout;
