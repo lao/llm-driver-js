@@ -150,8 +150,18 @@ const IMAGE_MEDIA_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"]
  */
 function isBase64(value: unknown): boolean {
   if (typeof value !== "string") return false;
-  const body = value.replace(/=+$/, "");
-  if (body === "" || !/^[A-Za-z0-9+/]+$/.test(body)) return false;
+  // Padding is optional, but when present it must be at most two `=` and must
+  // complete the final four-character group; a lone trailing character never
+  // encodes a byte. Without this, `TQ=`, `TQ===`, and any number of trailing
+  // `=` all normalize to the same body and slip past the round-trip check.
+  const match = /^([A-Za-z0-9+/]+)(=*)$/.exec(value);
+  if (!match) return false;
+  const body = match[1] ?? "";
+  const padding = match[2] ?? "";
+  const remainder = body.length % 4;
+  if (remainder === 1) return false;
+  if (padding.length > 2) return false;
+  if (padding.length > 0 && remainder + padding.length !== 4) return false;
   return Buffer.from(value, "base64").toString("base64").replace(/=+$/, "") === body;
 }
 

@@ -204,9 +204,10 @@ function opencodeConfig(
   const existing = parseEnvConfig(process.env.OPENCODE_CONFIG_CONTENT);
   const merged: Record<string, unknown> = { ...existing };
   if (bridge) {
+    const existingMcp = asRecord(existing.mcp);
     merged.mcp = {
-      ...asRecord(existing.mcp),
-      llmdriver: { type: "remote", url: bridge.url, oauth: false },
+      ...existingMcp,
+      [bridgeServerName(existingMcp)]: { type: "remote", url: bridge.url, oauth: false },
     };
   }
   if (instructionPath) {
@@ -216,6 +217,17 @@ function opencodeConfig(
     merged.instructions = [...existingInstructions, instructionPath];
   }
   return JSON.stringify(merged);
+}
+
+/**
+ * A server name the caller's inherited `mcp` map does not already define, so
+ * injecting the bridge can never overwrite a caller-configured server (it is
+ * plain `llmdriver` unless that name is taken, then `llmdriver-2`, …).
+ */
+function bridgeServerName(mcp: Record<string, unknown>): string {
+  let name = "llmdriver";
+  for (let suffix = 2; name in mcp; suffix += 1) name = `llmdriver-${suffix}`;
+  return name;
 }
 
 /** Parses an inherited `OPENCODE_CONFIG_CONTENT`; anything unusable is ignored. */

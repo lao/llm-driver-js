@@ -777,8 +777,10 @@ const toolsStdout = [
 function bridgeUrl(command: Command): string {
   const content = command.env?.OPENCODE_CONFIG_CONTENT;
   if (!content) throw new Error("missing OPENCODE_CONFIG_CONTENT");
-  const config = JSON.parse(content) as { mcp: { llmdriver: { url: string } } };
-  return config.mcp.llmdriver.url;
+  const config = JSON.parse(content) as { mcp: Record<string, { url?: string }> };
+  const bridge = Object.values(config.mcp).find((server) => typeof server.url === "string");
+  if (!bridge?.url) throw new Error("missing remote bridge in OPENCODE_CONFIG_CONTENT");
+  return bridge.url;
 }
 
 /** One JSON-RPC call to the live bridge; rejects if the bridge is closed. */
@@ -835,6 +837,35 @@ describe("opencode cli tools config", () => {
       expect(parsed.mcp.other).toEqual({ type: "local", command: ["node", "server.js"] });
       expect(parsed.mcp.llmdriver?.type).toBe("remote");
       expect(parsed.mcp.llmdriver?.oauth).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_CONFIG_CONTENT;
+      else process.env.OPENCODE_CONFIG_CONTENT = previous;
+    }
+  });
+
+  it("does not overwrite a caller-defined mcp server named llmdriver", async () => {
+    const { runner, calls } = fakeRunner({ stdout: toolsStdout });
+    const inherited = {
+      mcp: { llmdriver: { type: "remote", url: "https://caller.example/mcp" } },
+    };
+    const previous = process.env.OPENCODE_CONFIG_CONTENT;
+    process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify(inherited);
+    try {
+      await createOpencodeCliBackend(config, runner).generate(toolsRequest);
+
+      const parsed = JSON.parse(calls[0]?.command.env?.OPENCODE_CONFIG_CONTENT as string) as {
+        mcp: Record<string, { type: string; url: string; oauth?: boolean }>;
+      };
+      // The caller's own `llmdriver` server survives untouched...
+      expect(parsed.mcp.llmdriver).toEqual({
+        type: "remote",
+        url: "https://caller.example/mcp",
+      });
+      // ...and the bridge lands under a fresh key it cannot collide with.
+      expect(parsed.mcp["llmdriver-2"]).toMatchObject({ type: "remote", oauth: false });
+      expect(parsed.mcp["llmdriver-2"]?.url).toMatch(
+        /^http:\/\/127\.0\.0\.1:\d+\/mcp\/[0-9a-f-]{36}$/,
+      );
     } finally {
       if (previous === undefined) delete process.env.OPENCODE_CONFIG_CONTENT;
       else process.env.OPENCODE_CONFIG_CONTENT = previous;

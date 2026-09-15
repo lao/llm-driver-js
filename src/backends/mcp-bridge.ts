@@ -47,8 +47,18 @@ export function start(tools: Tool[], options: StartOptions = {}): Promise<McpBri
   // before the adapter flushes its buffered events and closes the bridge.
   let inFlight = 0;
   const idleWaiters: Array<() => void> = [];
+  // Quiescence protocol: once `idle()` is requested, no new handler starts. A
+  // request that arrives after `idle()` resolves is refused rather than started
+  // and then killed by `close()`'s `closeAllConnections()`, so an executing tool
+  // call can never be terminated mid-flight.
+  let draining = false;
 
   const server = createServer((req, res) => {
+    if (draining) {
+      // Refuse late work: the CLI has already exited and we are draining.
+      sendJson(res, jsonRpcError(null, -32603, "bridge is shutting down"), 503);
+      return;
+    }
     inFlight += 1;
     handle(req, res)
       .catch(() => {
@@ -152,13 +162,18 @@ export function start(tools: Tool[], options: StartOptions = {}): Promise<McpBri
     });
   }
 
-  const idle = (): Promise<void> =>
-    inFlight === 0 ? Promise.resolve() : new Promise<void>((resolve) => idleWaiters.push(resolve));
+  const idle = (): Promise<void> => {
+    draining = true;
+    return inFlight === 0
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => idleWaiters.push(resolve));
+  };
 
   let closed = false;
   const close = (): Promise<void> => {
     if (closed) return Promise.resolve();
     closed = true;
+    draining = true;
     server.closeAllConnections(); // drop keep-alive sockets so close() resolves promptly
     return new Promise((resolve) => server.close(() => resolve()));
   };
@@ -191,8 +206,8 @@ function jsonRpcError(id: JsonRpcId, code: number, message: string): object {
   return { jsonrpc: "2.0", id: id ?? null, error: { code, message } };
 }
 
-function sendJson(res: ServerResponse, body: object): void {
-  res.writeHead(200, { "content-type": "application/json" });
+function sendJson(res: ServerResponse, body: object, status = 200): void {
+  res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
 }
 
