@@ -34,6 +34,32 @@ provider/model with space
   it("drops option-injection attempts", () => {
     expect(parseOpencodeModels("--evil/model\n-/x\n")).toEqual([]);
   });
+
+  it("drops ids with an empty slash-delimited segment", () => {
+    expect(parseOpencodeModels("provider//model\nfoo/\n/bar\n//\na//b/c\n")).toEqual([]);
+  });
+
+  it("keeps a nested id while dropping malformed siblings", () => {
+    expect(
+      parseOpencodeModels("provider//model\nopenrouter/anthropic/claude-sonnet-4.5\nfoo/\n"),
+    ).toEqual(["openrouter/anthropic/claude-sonnet-4.5"]);
+  });
+});
+
+describe("listOpencodeModels option validation", () => {
+  for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    it(`rejects a non-positive or non-finite timeoutMs (${timeoutMs})`, async () => {
+      const caught = await listOpencodeModels({
+        cliPath: "/nonexistent/llmwrapper-opencode",
+        timeoutMs,
+      }).catch((e) => e);
+
+      expect(caught).toBeInstanceOf(LLMDriverError);
+      expect((caught as LLMDriverError).code).toBe("invalid_config");
+      expect((caught as LLMDriverError).provider).toBe("opencode");
+      expect((caught as LLMDriverError).operation).toBe("listOpencodeModels");
+    });
+  }
 });
 
 /**
@@ -59,6 +85,25 @@ describe.skipIf(process.platform === "win32")("listOpencodeModels", () => {
     const models = await listOpencodeModels({ cliPath });
 
     expect(models).toEqual(["opencode/big-pickle", "anthropic/claude-sonnet-4-5"]);
+  });
+
+  it("runs the `models` subcommand with no argv override", async () => {
+    const cliPath = fakeCli(
+      "models-argv",
+      'if (process.argv.slice(2).join(" ") !== "models") {\n  process.stderr.write("wrong argv\\n");\n  process.exit(2);\n}\nprocess.stdout.write("opencode/big-pickle\\n");',
+    );
+
+    const models = await listOpencodeModels({ cliPath });
+
+    expect(models).toEqual(["opencode/big-pickle"]);
+  });
+
+  it("accepts a positive timeoutMs override", async () => {
+    const cliPath = fakeCli("models-timeout", 'process.stdout.write("opencode/big-pickle\\n");');
+
+    const models = await listOpencodeModels({ cliPath, timeoutMs: 5000 });
+
+    expect(models).toEqual(["opencode/big-pickle"]);
   });
 
   it("propagates a missing executable as executable_not_found", async () => {

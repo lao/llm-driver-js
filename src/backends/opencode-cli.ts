@@ -92,6 +92,10 @@ export function createOpencodeCliBackend(
           signal,
           config.timeoutMs,
         );
+        // The CLI can exit while a tool-call response is still in flight; wait for
+        // the bridge's handlers to settle before snapshotting records (and before
+        // the finally closes the server).
+        await bridge?.idle();
         if (failure) throw preferReportedFailure(failure, stdout, config.model);
         return parseOpencodeOutput(stdout, config.model, bridge?.records ?? []);
       } finally {

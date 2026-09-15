@@ -1,4 +1,5 @@
 import { type Command, executeCli, spawnRunner } from "./backends/cli.js";
+import { LLMDriverError } from "./errors.js";
 
 /** `opencode models` runs a Bun process and may hit the network on a cold cache. */
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -27,6 +28,16 @@ export interface ListOpencodeModelsOptions {
 export async function listOpencodeModels(
   options: ListOpencodeModelsOptions = {},
 ): Promise<string[]> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // This API bypasses `validateConfig`, so normalize the timeout here: a bad
+  // value would otherwise reach `AbortSignal.timeout` as an immediate timeout or
+  // a platform `RangeError` instead of a documented `LLMDriverError`.
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new LLMDriverError("invalid_config", "timeoutMs must be a positive number", {
+      provider: "opencode",
+      operation: "listOpencodeModels",
+    });
+  }
   const command: Command = {
     executable: options.cliPath ?? "opencode",
     args: ["models"],
@@ -37,7 +48,7 @@ export async function listOpencodeModels(
     command,
     spawnRunner,
     options.signal,
-    options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    timeoutMs,
   );
   if (failure) throw failure;
   return parseOpencodeModels(stdout);
@@ -59,6 +70,8 @@ export function parseOpencodeModels(stdout: string): string[] {
 /** Whether a line is one `provider/model` id safe to pass to `--model`. */
 function isModelId(line: string): boolean {
   if (line === "" || line.startsWith("-") || /\s/.test(line)) return false;
-  const slash = line.indexOf("/");
-  return slash > 0 && slash < line.length - 1;
+  // Nested `provider/a/b` ids are valid, but every segment must be non-empty so
+  // malformed output like `provider//model` never reaches `--model`.
+  const segments = line.split("/");
+  return segments.length >= 2 && segments.every((segment) => segment !== "");
 }
