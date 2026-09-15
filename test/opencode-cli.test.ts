@@ -45,6 +45,7 @@ function fakeStreamRunner(chunks: CommandChunk[], error?: unknown) {
     calls.push({ command, signal });
     if (error !== undefined) throw error;
     for (const chunk of chunks) yield chunk;
+    yield { type: "exit", exitCode: 0, stderr: "" } as const;
   };
   return { streamRunner, calls };
 }
@@ -556,6 +557,23 @@ describe("opencode cli streaming", () => {
   it("throws parse_failed when the stream never completes a step", async () => {
     const streamRunner = stubStreamRunner([
       '{"type":"text","sessionID":"s","part":{"type":"text","text":"orphan"}}',
+    ]);
+
+    const error = await collect(
+      createOpencodeCliBackend(config, undefined, streamRunner).generateStream(request),
+    ).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect((error as LLMDriverError).code).toBe("parse_failed");
+    expect((error as LLMDriverError).providerCode).toBe("missing_step_finish");
+  });
+
+  it("throws parse_failed when a later step starts but never finishes", async () => {
+    const streamRunner = stubStreamRunner([
+      '{"type":"text","sessionID":"s","part":{"type":"text","text":"first"}}',
+      '{"type":"step_finish","sessionID":"s","part":{"reason":"tool-calls","tokens":{}}}',
+      '{"type":"step_start","sessionID":"s"}',
+      '{"type":"text","sessionID":"s","part":{"type":"text","text":"second"}}',
     ]);
 
     const error = await collect(

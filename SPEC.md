@@ -398,11 +398,11 @@ client-side loop, so the 16-round cap and `toolChoice` do not apply
   requests keep the v1 plain-stdin path byte-for-byte (no regression risk).
 - codex/cli: base64 images written to scratch temp files, passed via `-i`, deleted
   in `finally`. URL-source images are `unsupported_feature` (no flag for URLs).
+  `-i` attaches to the *initial prompt*, so images in earlier turns of a multi-turn
+  transcript are `unsupported_feature` — images may appear only in the final user turn.
 - opencode/cli: base64 images written to scratch temp files, passed via `-f`,
   deleted in `finally`; like codex, URL-source and non-final-turn images are
   `unsupported_feature`.
-  `-i` attaches to the *initial prompt*, so images in earlier turns of a multi-turn
-  transcript are `unsupported_feature` — images may appear only in the final user turn.
 - Document/PDF blocks are api-only (`document` block on claude, `input_file` on
   openai); on CLI flavors they throw `unsupported_feature`. (claude/cli stream-json
   may accept documents; if a future integration run proves it, the matrix cell

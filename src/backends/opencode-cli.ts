@@ -220,6 +220,7 @@ function parseEvent(run: OpencodeRun, event: Record<string, unknown>): StreamEve
   switch (readString(event, "type")) {
     case "step_start":
       run.stepText = "";
+      run.finished = false;
       return undefined;
     case "text": {
       const text = readString(part, "text");
