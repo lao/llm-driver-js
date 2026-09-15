@@ -179,12 +179,29 @@ function renderPrompt(request: Request): string {
 /**
  * Inline config handing opencode the loopback MCP bridge as a remote server
  * (`OPENCODE_CONFIG_CONTENT` overrides for the run only; OAuth is off since the
- * endpoint is loopback).
+ * endpoint is loopback). The launcher layers `command.env` over `process.env`,
+ * so an inherited inline config is merged rather than replaced — the caller's
+ * provider settings and other MCP servers survive a tool-enabled request.
  */
 function bridgeConfig(bridge: McpBridge): string {
+  const existing = parseEnvConfig(process.env.OPENCODE_CONFIG_CONTENT);
   return JSON.stringify({
-    mcp: { llmdriver: { type: "remote", url: bridge.url, oauth: false } },
+    ...existing,
+    mcp: {
+      ...asRecord(existing.mcp),
+      llmdriver: { type: "remote", url: bridge.url, oauth: false },
+    },
   });
+}
+
+/** Parses an inherited `OPENCODE_CONFIG_CONTENT`; anything unusable is ignored. */
+function parseEnvConfig(raw: string | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    return asRecord(JSON.parse(raw));
+  } catch {
+    return {};
+  }
 }
 
 /** Mutable state gathered from one run's JSON event stream. */

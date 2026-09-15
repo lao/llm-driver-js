@@ -654,6 +654,33 @@ describe("opencode cli tools config", () => {
 
     expect(calls[0]?.command.env).toBeUndefined();
   });
+
+  it("merges an inherited OPENCODE_CONFIG_CONTENT instead of replacing it", async () => {
+    const { runner, calls } = fakeRunner({ stdout: toolsStdout });
+    const inherited = {
+      model: "anthropic/claude-sonnet-4-5",
+      mcp: { other: { type: "local", command: ["node", "server.js"] } },
+    };
+    const previous = process.env.OPENCODE_CONFIG_CONTENT;
+    process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify(inherited);
+    try {
+      await createOpencodeCliBackend(config, runner).generate(toolsRequest);
+
+      const parsed = JSON.parse(calls[0]?.command.env?.OPENCODE_CONFIG_CONTENT as string) as Record<
+        string,
+        unknown
+      > & {
+        mcp: Record<string, { type: string; oauth?: boolean; command?: string[] }>;
+      };
+      expect(parsed.model).toBe("anthropic/claude-sonnet-4-5");
+      expect(parsed.mcp.other).toEqual({ type: "local", command: ["node", "server.js"] });
+      expect(parsed.mcp.llmdriver?.type).toBe("remote");
+      expect(parsed.mcp.llmdriver?.oauth).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_CONFIG_CONTENT;
+      else process.env.OPENCODE_CONFIG_CONTENT = previous;
+    }
+  });
 });
 
 describe("opencode cli tools bridge lifecycle", () => {
