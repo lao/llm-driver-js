@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   Command,
   CommandChunk,
@@ -209,6 +209,17 @@ describe("opencode cli parsing", () => {
     expect(response.completionReason).toBe("max_tokens");
   });
 
+  it("maps a content-filter stop reason to refusal", async () => {
+    const { runner } = fakeRunner({
+      stdout:
+        '{"type":"step_finish","sessionID":"s","part":{"reason":"content-filter","tokens":{}}}',
+    });
+
+    const response = await createOpencodeCliBackend(config, runner).generate(request);
+
+    expect(response.completionReason).toBe("refusal");
+  });
+
   it("concatenates multiple text parts within a step", async () => {
     const { runner } = fakeRunner({
       stdout: [
@@ -282,6 +293,27 @@ describe("opencode cli parsing", () => {
       reasoningTokens: 2,
     });
     expect(response.text).toBe("orphan");
+  });
+
+  it("uses only the remaining generation timeout for usage recovery", async () => {
+    const timeout = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockImplementation(() => new AbortController().signal);
+    const now = vi.spyOn(performance, "now").mockReturnValueOnce(1_000).mockReturnValueOnce(1_075);
+    const runner: CommandRunner = async (command) =>
+      command.args[0] === "export"
+        ? { stdout: usageExport, stderr: "", exitCode: 0 }
+        : { stdout: orphanText, stderr: "", exitCode: 0 };
+
+    try {
+      await createOpencodeCliBackend({ ...config, timeoutMs: 100 }, runner).generate(request);
+
+      expect(timeout).toHaveBeenNthCalledWith(1, 100);
+      expect(timeout).toHaveBeenNthCalledWith(2, 25);
+    } finally {
+      timeout.mockRestore();
+      now.mockRestore();
+    }
   });
 
   it("fails when a successful run emits no usable event", async () => {
@@ -361,6 +393,16 @@ describe("opencode cli failures", () => {
       code: "api_error",
       providerCode: "ProviderError",
       message: "model exploded",
+    },
+    {
+      name: "error event with a nested message",
+      result: {
+        stdout:
+          '{"type":"error","error":{"name":"ProviderError","data":{"message":"authentication failed"}}}\n',
+      },
+      code: "api_error",
+      providerCode: "ProviderError",
+      message: "authentication failed",
     },
   ];
 
@@ -736,6 +778,31 @@ describe("opencode cli streaming", () => {
       cacheCreationInputTokens: 1,
       reasoningTokens: 1,
     });
+  });
+
+  it("caps usage recovery when no generation timeout is configured", async () => {
+    const timeout = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockImplementation(() => new AbortController().signal);
+    const streamRunner: StreamingCommandRunner = async function* (command) {
+      const lines =
+        command.args[0] === "export"
+          ? ["{}"]
+          : ['{"type":"text","sessionID":"s","part":{"type":"text","text":"orphan"}}'];
+      for (const line of lines) yield { type: "line", line };
+      yield { type: "exit", exitCode: 0, stderr: "" };
+    };
+
+    try {
+      await collect(
+        createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(request),
+      );
+
+      expect(timeout).toHaveBeenCalledOnce();
+      expect(timeout).toHaveBeenCalledWith(1_000);
+    } finally {
+      timeout.mockRestore();
+    }
   });
 
   it("propagates a caller abort that lands during usage recovery", async () => {

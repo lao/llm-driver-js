@@ -30,6 +30,8 @@ import { type McpBridge, start as startBridge } from "./mcp-bridge.js";
 
 /** Non-interactive `opencode run`, raw JSON events on stdout. */
 const BASE_ARGS = ["run", "--format", "json"];
+// ponytail: usage recovery is best-effort; raise only if real exports regularly exceed 1 s.
+const USAGE_RECOVERY_TIMEOUT_MS = 1_000;
 
 /**
  * Local `opencode run` process backend (`opencode`/`cli`).
@@ -98,6 +100,8 @@ export function createOpencodeCliBackend(
           : undefined;
         cleanupInstruction = instruction?.cleanup;
         const command = buildCommand(request, bridge, staged.imageArgs, instruction?.path);
+        const deadline =
+          config.timeoutMs === undefined ? undefined : performance.now() + config.timeoutMs;
         const { stdout, failure } = await executeCli(
           "opencode",
           command,
@@ -114,9 +118,13 @@ export function createOpencodeCliBackend(
         // the finally closes the server).
         await bridge?.idle();
         const run = foldEvents(stdout);
-        await recoverUsage(run, () =>
-          exportSession(run.id, executable, runner, signal, config.timeoutMs),
-        );
+        await recoverUsage(run, async () => {
+          if (signal?.aborted) throw signal.reason;
+          const timeoutMs = recoveryTimeout(deadline);
+          return timeoutMs === undefined
+            ? undefined
+            : exportSession(run.id, executable, runner, signal, timeoutMs);
+        });
         return toResponse(run, config.model, bridge?.records ?? []);
       } finally {
         await cleanupImages?.();
@@ -153,6 +161,8 @@ export function createOpencodeCliBackend(
         const command = buildCommand(request, bridge, staged.imageArgs, instruction?.path);
         const run = newRun();
         let index = 0;
+        const deadline =
+          config.timeoutMs === undefined ? undefined : performance.now() + config.timeoutMs;
 
         for await (const line of streamCli(
           "opencode",
@@ -174,9 +184,13 @@ export function createOpencodeCliBackend(
         await bridge?.idle();
         while (pending.length > 0) yield pending.shift() as StreamEvent;
         finalizeStep(run);
-        await recoverUsage(run, () =>
-          exportSessionStream(run.id, executable, streamRunner, signal, config.timeoutMs),
-        );
+        await recoverUsage(run, async () => {
+          if (signal?.aborted) throw signal.reason;
+          const timeoutMs = recoveryTimeout(deadline);
+          return timeoutMs === undefined
+            ? undefined
+            : exportSessionStream(run.id, executable, streamRunner, signal, timeoutMs);
+        });
         yield { type: "done", response: toResponse(run, config.model, bridge?.records ?? []) };
       } finally {
         await cleanupImages?.();
@@ -318,6 +332,7 @@ function parseEvent(run: OpencodeRun, event: Record<string, unknown>): StreamEve
 function completionReason(reason: string): CompletionReason {
   if (reason === "stop") return "stop";
   if (reason === "length") return "max_tokens";
+  if (reason === "content-filter") return "refusal";
   return "";
 }
 
@@ -331,7 +346,8 @@ function addUsage(usage: Usage, tokens: Record<string, unknown>): void {
 }
 
 function opencodeFailure(error: Record<string, unknown>): LLMDriverError {
-  const message = readString(error, "message").trim();
+  const message =
+    readString(error, "message").trim() || readString(asRecord(error.data), "message").trim();
   // opencode's transport errors carry a bare `_tag` (e.g. "BadRequest").
   const tag = readString(error, "_tag") || readString(error, "name");
   return cliError("opencode", "api_error", message || "OpenCode run failed", {
@@ -341,6 +357,12 @@ function opencodeFailure(error: Record<string, unknown>): LLMDriverError {
 
 function parseOpencodeOutput(stdout: string, model: string, toolCalls: ToolCallRecord[]): Response {
   return toResponse(foldEvents(stdout), model, toolCalls);
+}
+
+function recoveryTimeout(deadline: number | undefined): number | undefined {
+  if (deadline === undefined) return USAGE_RECOVERY_TIMEOUT_MS;
+  const remaining = Math.floor(deadline - performance.now());
+  return remaining > 0 ? Math.min(remaining, USAGE_RECOVERY_TIMEOUT_MS) : undefined;
 }
 
 /** Folds a whole stdout JSONL stream into one run, committing any open step. */
