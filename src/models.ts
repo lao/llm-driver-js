@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import { type Command, executeCli, spawnRunner } from "./backends/cli.js";
 import { LLMDriverError } from "./errors.js";
 
@@ -77,13 +78,14 @@ function withOperation(error: LLMDriverError, operation: string): LLMDriverError
 export function parseOpencodeModels(stdout: string): string[] {
   return stdout
     .split("\n")
+    .map(stripVTControlCharacters)
     .map((line) => line.trim())
     .filter(isModelId);
 }
 
 /** Whether a line is one `provider/model` id safe to pass to `--model`. */
 function isModelId(line: string): boolean {
-  if (line === "" || line.startsWith("-") || /\s/.test(line)) return false;
+  if (line === "" || line.startsWith("-") || /[\s\p{Cc}]/u.test(line)) return false;
   // Nested `provider/a/b` ids are valid, but every segment must be non-empty so
   // malformed output like `provider//model` never reaches `--model`.
   const segments = line.split("/");

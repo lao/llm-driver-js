@@ -35,6 +35,12 @@ provider/model with space
     expect(parseOpencodeModels("--evil/model\n-/x\n")).toEqual([]);
   });
 
+  it("strips terminal colors and drops remaining control bytes", () => {
+    expect(
+      parseOpencodeModels("\u001b[32mprovider/model\u001b[0m\nprovider/mo\u0000del\n"),
+    ).toEqual(["provider/model"]);
+  });
+
   it("drops ids with an empty slash-delimited segment", () => {
     expect(parseOpencodeModels("provider//model\nfoo/\n/bar\n//\na//b/c\n")).toEqual([]);
   });
