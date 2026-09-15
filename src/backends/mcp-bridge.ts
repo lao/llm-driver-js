@@ -30,6 +30,8 @@ export interface McpBridge {
   url: string;
   /** Tool calls executed so far, in completion order. Shared with the adapter for `response.toolCalls`. */
   records: ToolCallRecord[];
+  /** Resolves once every in-flight HTTP handler has finished; a barrier before `close()`. */
+  idle(): Promise<void>;
   /** Shuts the server down. Idempotent; intended for the adapter's `finally`. */
   close(): Promise<void>;
 }
@@ -41,12 +43,23 @@ export function start(tools: Tool[], options: StartOptions = {}): Promise<McpBri
   const token = randomUUID();
   const path = `/mcp/${token}`;
 
+  // In-flight HTTP handlers, so `idle()` can wait for a late tool call to land
+  // before the adapter flushes its buffered events and closes the bridge.
+  let inFlight = 0;
+  const idleWaiters: Array<() => void> = [];
+
   const server = createServer((req, res) => {
-    handle(req, res).catch(() => {
-      // A handler fault must never crash the process; report a generic 500.
-      if (!res.headersSent) res.writeHead(500).end();
-      else res.end();
-    });
+    inFlight += 1;
+    handle(req, res)
+      .catch(() => {
+        // A handler fault must never crash the process; report a generic 500.
+        if (!res.headersSent) res.writeHead(500).end();
+        else res.end();
+      })
+      .finally(() => {
+        inFlight -= 1;
+        if (inFlight === 0) for (const resolve of idleWaiters.splice(0)) resolve();
+      });
   });
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -139,6 +152,9 @@ export function start(tools: Tool[], options: StartOptions = {}): Promise<McpBri
     });
   }
 
+  const idle = (): Promise<void> =>
+    inFlight === 0 ? Promise.resolve() : new Promise<void>((resolve) => idleWaiters.push(resolve));
+
   let closed = false;
   const close = (): Promise<void> => {
     if (closed) return Promise.resolve();
@@ -154,7 +170,7 @@ export function start(tools: Tool[], options: StartOptions = {}): Promise<McpBri
       server.removeListener("error", reject);
       const address = server.address();
       const port = typeof address === "object" && address ? address.port : 0;
-      resolve({ url: `http://127.0.0.1:${port}${path}`, records, close });
+      resolve({ url: `http://127.0.0.1:${port}${path}`, records, idle, close });
     });
   });
 }

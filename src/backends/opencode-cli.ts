@@ -27,17 +27,18 @@ import {
 } from "./cli.js";
 import { type McpBridge, start as startBridge } from "./mcp-bridge.js";
 
-/** Non-interactive `opencode run`, raw JSON events on stdout, thinking surfaced. */
-const BASE_ARGS = ["run", "--format", "json", "--thinking"];
+/** Non-interactive `opencode run`, raw JSON events on stdout. */
+const BASE_ARGS = ["run", "--format", "json"];
 
 /**
  * Local `opencode run` process backend (`opencode`/`cli`).
  *
  * opencode is a multi-provider harness: `--model` takes any `provider/model` id
  * the local install can reach (enumerate them with {@link listOpencodeModels}).
- * Its raw JSON event stream is the transport contract; `--thinking` surfaces
- * reasoning parts. Caller tools ride in as a remote MCP server through
- * `OPENCODE_CONFIG_CONTENT`, and image blocks through `-f` temp files.
+ * Its raw JSON event stream is the transport contract; a reasoning request adds
+ * `--thinking` (surfaces reasoning parts) and `--variant` (the effort knob).
+ * Caller tools ride in as a remote MCP server through `OPENCODE_CONFIG_CONTENT`,
+ * and image blocks through `-f` temp files.
  * `runner`/`streamRunner` are internal seams, never public API.
  */
 export function createOpencodeCliBackend(
@@ -55,9 +56,10 @@ export function createOpencodeCliBackend(
   ): Command => {
     const args = [...BASE_ARGS, "--model", config.model];
     if (request.reasoning) {
-      // opencode's `--variant` is the provider-specific reasoning-effort knob;
-      // neutral levels pass through and an unknown level surfaces opencode's error.
-      args.push("--variant", request.reasoning.effort);
+      // `--thinking` surfaces reasoning parts and `--variant` is opencode's
+      // provider-specific reasoning-effort knob. Neutral levels pass through and
+      // an unknown level surfaces opencode's error.
+      args.push("--thinking", "--variant", request.reasoning.effort);
     }
     args.push(...imageArgs, ...extraArgs);
     const command: Command = { executable, args, stdin: renderPrompt(request) };
@@ -137,6 +139,9 @@ export function createOpencodeCliBackend(
           if (emitted !== undefined) yield emitted;
         }
 
+        // The CLI can exit while a tool-call response is still in flight; wait for
+        // the bridge's handlers to settle so their events are queued before the flush.
+        await bridge?.idle();
         while (pending.length > 0) yield pending.shift() as StreamEvent;
         if (!run.finished) {
           throw cliError(
@@ -275,6 +280,7 @@ function parseOpencodeOutput(stdout: string, model: string, toolCalls: ToolCallR
   const run = newRun();
   for (const [index, line] of stdout.split("\n").entries()) {
     if (line.trim() === "") continue;
+    // parseEvent folds the event into `run`; its returned delta is stream-only.
     parseEvent(run, parseJsonObject("opencode", `decode OpenCode CLI event ${index + 1}`, line));
   }
   if (!run.finished) {

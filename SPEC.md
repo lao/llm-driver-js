@@ -240,7 +240,7 @@ flavors even though they cannot enforce it (v1 contract, unchanged).
 | Document/PDF input | ✅ `document` block | ✅ `input_file` | ❌ | ❌ | ❌ |
 | `timeoutMs` | ✅ SDK timeout | ✅ SDK timeout | ✅ kill process group | ✅ kill process group | ✅ kill process group |
 | `maxRetries` | ✅ SDK retries | ✅ SDK retries | ❌ (re-running an agent is not idempotent) | ❌ | ❌ |
-| Reasoning stream events | ✅ thinking deltas | ✅ reasoning-summary deltas | ✅ stream-json thinking | ⚠️ best-effort (`agent_reasoning`; may be absent) | ✅ `--thinking` reasoning parts |
+| Reasoning stream events | ✅ thinking deltas | ✅ reasoning-summary deltas | ✅ stream-json thinking | ⚠️ best-effort (`agent_reasoning`; may be absent) | ✅ `--thinking` reasoning parts (when reasoning requested) |
 | Tool-call stream events | ✅ | ✅ | ✅ (bridge observes calls) | ✅ (bridge observes calls) | ✅ (bridge observes calls) |
 
 ❌ = throws `unsupported_feature`. ⚠️ = emitted when the target reports it;
@@ -249,8 +249,7 @@ absence is not an error (same stance as v1 delta granularity).
 CLI flag mappings are verified against `claude` (2026-08: `--json-schema`,
 `--effort`, `--mcp-config`, `--strict-mcp-config`, `--allowedTools`,
 `--input-format stream-json`), `codex-cli 0.147.0` (`--output-schema`,
-`-i/--image`, `-c` overrides, `--json`), and `opencode 1.18` (`run --format json
---thinking --variant`, `-f`, `mcp` remote servers via `OPENCODE_CONFIG_CONTENT`).
+`-i/--image`, `-c` overrides, `--json`), and `opencode 1.18` (`run --format json [--thinking --variant]`, `-f`, `mcp` remote servers via `OPENCODE_CONFIG_CONTENT`).
 The opt-in integration test is the authority for behavior fixtures cannot prove
 (see Testing).
 
@@ -262,7 +261,7 @@ The opt-in integration test is the authority for behavior fixtures cannot prove
 - Codex: `codex exec --json --sandbox read-only --skip-git-repo-check --model <model>
   [--config developer_instructions=<JSON-encoded system>] [feature flags] [cliArgs...] -`,
   transcript on stdin, JSONL events parsed from stdout (agent message + token usage events).
-- opencode: `opencode run --format json --thinking --model <model> [--variant <effort>]
+- opencode: `opencode run --format json --model <model> [--thinking --variant <effort>]
   [feature flags] [cliArgs...]`, transcript on stdin (a system instruction is
   prepended to the transcript — opencode has no system-prompt flag), JSON events
   parsed from stdout. Tools are injected as a remote MCP server through the

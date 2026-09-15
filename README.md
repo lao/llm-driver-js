@@ -138,7 +138,7 @@ may report nothing until the end:
 | `openai`/`api` | Token-level deltas (Responses API SSE) |
 | `claude`/`cli` | Partial-message chunks (`--output-format stream-json --include-partial-messages`) |
 | `openai`/`cli` | One coarse delta: `codex exec --json` reports completed messages only |
-| `opencode`/`cli` | Per-step text/reasoning deltas (`opencode run --format json --thinking`) |
+| `opencode`/`cli` | Per-step text/reasoning deltas (`opencode run --format json`, `--thinking` when reasoning is requested) |
 
 > **`claude`/`cli` and `opencode`/`cli` caveat.** Both are agents, not completion
 > endpoints. They stream deltas for every assistant message in the turn, but

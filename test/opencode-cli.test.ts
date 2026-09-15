@@ -20,7 +20,7 @@ import {
 
 const config: Config = { provider: "opencode", flavor: "cli", model: "anthropic/claude-test" };
 const request: Request = { maxTokens: 32, messages: [user("Hello")] };
-const baseArgs = ["run", "--format", "json", "--thinking"];
+const baseArgs = ["run", "--format", "json"];
 
 const successStdout = [
   '{"type":"step_start","sessionID":"ses_1"}',
@@ -38,6 +38,11 @@ function fakeRunner(result: Partial<CommandResult>, error?: unknown) {
   };
   return { runner, calls };
 }
+
+/** A buffered runner that fails the test if a streaming test accidentally drives generate(). */
+const neverSpawn: CommandRunner = () => {
+  throw new Error("buffered runner must not be used in streaming tests");
+};
 
 function fakeStreamRunner(chunks: CommandChunk[], error?: unknown) {
   const calls: Array<{ command: Command; signal?: AbortSignal }> = [];
@@ -112,6 +117,7 @@ describe("opencode cli command", () => {
       ...baseArgs,
       "--model",
       "anthropic/claude-test",
+      "--thinking",
       "--variant",
       "low",
       "--agent",
@@ -119,7 +125,7 @@ describe("opencode cli command", () => {
     ]);
   });
 
-  it("omits the variant when the request has no reasoning", async () => {
+  it("omits the variant and thinking when the request has no reasoning", async () => {
     const { runner, calls } = fakeRunner({ stdout: successStdout });
 
     await createOpencodeCliBackend(config, runner).generate(request);
@@ -447,7 +453,7 @@ describe("opencode cli streaming", () => {
       '{"type":"text","sessionID":"ses_s","part":{"type":"text","text":"world"}}',
       '{"type":"step_finish","sessionID":"ses_s","part":{"reason":"stop","tokens":{"input":10,"output":5,"cache":{"read":3,"write":2}}}}',
     ]);
-    const backend = createOpencodeCliBackend(config, undefined, streamRunner);
+    const backend = createOpencodeCliBackend(config, neverSpawn, streamRunner);
 
     const events = await collect(backend.generateStream(request));
 
@@ -486,7 +492,7 @@ describe("opencode cli streaming", () => {
     const signal = new AbortController().signal;
 
     await collect(
-      createOpencodeCliBackend(config, undefined, streamRunner).generateStream(request, signal),
+      createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(request, signal),
     );
 
     expect(calls[0]?.command).toEqual({
@@ -505,7 +511,7 @@ describe("opencode cli streaming", () => {
     ]);
 
     const events = await collect(
-      createOpencodeCliBackend(config, undefined, streamRunner).generateStream(request),
+      createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(request),
     );
 
     expect(events).toHaveLength(2);
@@ -515,7 +521,7 @@ describe("opencode cli streaming", () => {
 
   it("emits no reasoning events when the stream has none", async () => {
     const events = await collect(
-      createOpencodeCliBackend(config, undefined, stubStreamRunner(successStream)).generateStream(
+      createOpencodeCliBackend(config, neverSpawn, stubStreamRunner(successStream)).generateStream(
         request,
       ),
     );
@@ -534,7 +540,7 @@ describe("opencode cli streaming", () => {
 
     await expect(
       collect(
-        createOpencodeCliBackend(config, undefined, streamRunner).generateStream(
+        createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(
           request,
           controller.signal,
         ),
@@ -546,7 +552,7 @@ describe("opencode cli streaming", () => {
     const streamRunner = stubStreamRunner(['{"type":"error","error":{"_tag":"BadRequest"}}']);
 
     const error = await collect(
-      createOpencodeCliBackend(config, undefined, streamRunner).generateStream(request),
+      createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(request),
     ).catch((caught) => caught);
 
     expect(error).toBeInstanceOf(LLMDriverError);
@@ -560,7 +566,7 @@ describe("opencode cli streaming", () => {
     ]);
 
     const error = await collect(
-      createOpencodeCliBackend(config, undefined, streamRunner).generateStream(request),
+      createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(request),
     ).catch((caught) => caught);
 
     expect(error).toBeInstanceOf(LLMDriverError);
@@ -577,7 +583,7 @@ describe("opencode cli streaming", () => {
     ]);
 
     const error = await collect(
-      createOpencodeCliBackend(config, undefined, streamRunner).generateStream(request),
+      createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(request),
     ).catch((caught) => caught);
 
     expect(error).toBeInstanceOf(LLMDriverError);
@@ -681,15 +687,18 @@ describe("opencode cli tools bridge lifecycle", () => {
 
   it("closes the bridge when the stream consumer breaks early", async () => {
     let url = "";
-    const runner: CommandRunner = async (command) => {
+    const streamRunner: StreamingCommandRunner = async function* (command) {
       url = bridgeUrl(command);
-      return { stdout: toolsStdout, stderr: "", exitCode: 0 };
+      for (const line of toolsStdout.split("\n").filter((line) => line !== "")) {
+        yield { type: "line", line } as const;
+      }
+      yield { type: "exit", exitCode: 0, stderr: "" } as const;
     };
-    const streamRunner = stubStreamRunner(toolsStdout.split("\n").filter((line) => line !== ""));
-    const backend = createOpencodeCliBackend(config, runner, streamRunner);
+    const backend = createOpencodeCliBackend(config, neverSpawn, streamRunner);
 
     for await (const _event of backend.generateStream(toolsRequest)) break;
 
+    expect(url).not.toBe("");
     await expect(rpc(url, "tools/list")).rejects.toThrow();
   });
 });
@@ -726,7 +735,7 @@ describe("opencode cli tools round-trip", () => {
     };
 
     const events = await collect(
-      createOpencodeCliBackend(config, undefined, streamRunner).generateStream(toolsRequest),
+      createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(toolsRequest),
     );
 
     const callAt = events.findIndex((event) => event.type === "tool_call");

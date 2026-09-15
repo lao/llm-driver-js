@@ -52,8 +52,10 @@ export const CAPABILITIES: readonly Capability[] = [
     supported: ["claude/api", "openai/api", "claude/cli", "openai/cli", "opencode/cli"],
   },
   {
-    // Structured output on all four targets: API flavors via the provider's
-    // json_schema format, CLI flavors via --json-schema / --output-schema.
+    // Structured output on the four schema-capable targets: API flavors via the
+    // provider's json_schema format, CLI flavors via --json-schema /
+    // --output-schema. opencode/cli has no schema flag, so it is absent here and
+    // throws unsupported_feature (SPEC "Backend semantics — structured output").
     feature: "outputSchema",
     used: (request) => request.outputSchema !== undefined,
     supported: ["claude/api", "openai/api", "claude/cli", "openai/cli"],

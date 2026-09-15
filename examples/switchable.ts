@@ -47,6 +47,9 @@ async function main(): Promise<void> {
 
   const provider = oneOf("provider", values.provider, ["claude", "openai", "opencode"] as const);
   const flavor = oneOf("flavor", values.flavor, ["api", "cli"] as const);
+  if (provider === "opencode" && flavor !== "cli") {
+    throw new Error("--provider opencode only supports --flavor cli");
+  }
   const model = required("model", values.model);
   const prompt = required("prompt", values.prompt);
   const maxTokens = Number(values["max-tokens"]);
