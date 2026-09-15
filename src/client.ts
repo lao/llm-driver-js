@@ -142,6 +142,19 @@ export function validateRequest(request: Request, config: Config): void {
 
 const IMAGE_MEDIA_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
+/**
+ * Whether `value` is well-formed standard base64 (padding optional). `Buffer`'s
+ * decoder is permissive — it silently drops unknown characters — so a malformed
+ * payload would otherwise stage as a corrupt file and surface later as an opaque
+ * CLI/API failure. A round-trip check rejects that at validation time.
+ */
+function isBase64(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const body = value.replace(/=+$/, "");
+  if (body === "" || !/^[A-Za-z0-9+/]+$/.test(body)) return false;
+  return Buffer.from(value, "base64").toString("base64").replace(/=+$/, "") === body;
+}
+
 /** Enforces the `text` XOR `content` invariant and every block's well-formedness. */
 function validateContent(message: Message, index: number, config: Config): void {
   const hasText = message.text !== undefined;
@@ -182,14 +195,18 @@ function validateBlock(block: unknown, index: number, blockIndex: number, config
     if (typeof source !== "object" || source === null) bad("image source must be an object");
     const s = source as Record<string, unknown>;
     if (typeof s.url === "string") return;
-    if (typeof s.base64 !== "string" || s.base64 === "") bad("image source needs base64 or url");
+    const base64 = s.base64;
+    if (typeof base64 !== "string" || base64 === "") bad("image source needs base64 or url");
+    if (!isBase64(base64)) bad("image source base64 is malformed");
     if (!IMAGE_MEDIA_TYPES.includes(s.mediaType as string)) bad("image mediaType is invalid");
     return;
   }
   if (type === "document") {
     if (typeof source !== "object" || source === null) bad("document source must be an object");
     const s = source as Record<string, unknown>;
-    if (typeof s.base64 !== "string" || s.base64 === "") bad("document source needs base64");
+    const base64 = s.base64;
+    if (typeof base64 !== "string" || base64 === "") bad("document source needs base64");
+    if (!isBase64(base64)) bad("document source base64 is malformed");
     if (s.mediaType !== "application/pdf") bad("document mediaType must be application/pdf");
     return;
   }

@@ -127,5 +127,7 @@ describe.skipIf(process.platform === "win32")("listOpencodeModels", () => {
     expect(caught).toBeInstanceOf(LLMDriverError);
     expect((caught as LLMDriverError).code).toBe("process_failed");
     expect((caught as LLMDriverError).status).toBe(3);
+    // Not a generation: the shared CLI normalization is re-stamped.
+    expect((caught as LLMDriverError).operation).toBe("listOpencodeModels");
   });
 });

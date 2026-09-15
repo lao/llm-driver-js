@@ -50,8 +50,22 @@ export async function listOpencodeModels(
     options.signal,
     timeoutMs,
   );
-  if (failure) throw failure;
+  // `executeCli` stamps CLI failures with operation `generate`; this public API
+  // is not a generation, so rewrap while preserving every other field.
+  if (failure) throw withOperation(failure, "listOpencodeModels");
   return parseOpencodeModels(stdout);
+}
+
+/** Copies a CLI error, overriding only its operation context. */
+function withOperation(error: LLMDriverError, operation: string): LLMDriverError {
+  return new LLMDriverError(error.code, error.message, {
+    provider: error.provider,
+    flavor: error.flavor,
+    operation,
+    status: error.status,
+    providerCode: error.providerCode,
+    cause: error.cause,
+  });
 }
 
 /**

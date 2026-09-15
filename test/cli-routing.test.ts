@@ -118,9 +118,17 @@ const flavours: Flavour[] = [
     provider: "opencode",
     model: "anthropic/claude-sonnet-4-5",
     cli: opencodeCli,
-    args: ["run", "--format", "json", "--model", "anthropic/claude-sonnet-4-5"],
-    // opencode has no system-prompt flag, so the system rides at the head of stdin.
-    stdin: "System: Be concise.\n\nUser: hello\n\nAssistant: hi\n\nUser: continue",
+    args: [
+      "run",
+      "--format",
+      "json",
+      "--model",
+      "anthropic/claude-sonnet-4-5",
+      "--",
+      "User: hello\n\nAssistant: hi\n\nUser: continue",
+    ],
+    // The transcript is a positional; the system text travels in inline config.
+    stdin: "",
     text: "routed to opencode",
     id: "session-routing",
   },

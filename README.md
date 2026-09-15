@@ -448,10 +448,11 @@ equivalents of the hosted APIs:
   are allowed by default still run (see the security note below). Codex runs with
   a read-only sandbox. Agent CLI behavior can still differ from a hosted model
   endpoint.
-- System text is passed through Claude's `--append-system-prompt` flag and
-  Codex's per-invocation `developer_instructions` config. Conversation text
-  stays on stdin. System text may therefore be visible to local process
-  inspection.
+- System text is passed through Claude's `--append-system-prompt` flag, Codex's
+  per-invocation `developer_instructions` config, and opencode's inline-config
+  `instructions` file (opencode has no system-prompt flag). Conversation text
+  stays on stdin — opencode takes it as the final positional argument. System
+  text may therefore be visible to local process inspection.
 - CLI subprocesses inherit the application's working directory and environment
   so local authentication works. **Do not send untrusted prompts to a CLI
   flavor without isolating the host process.** Codex's read-only sandbox
@@ -463,7 +464,9 @@ equivalents of the hosted APIs:
   it, and use `cliArgs` to tighten the CLI's own limits, e.g.
   `cliArgs: ["--disallowed-tools", "Read,Glob,Grep"]`.
 - Usage fields are populated only when a target reports them; everything else
-  is `0`.
+  is `0`. When opencode's upstream event-loop race drops the terminal
+  `step_finish`, `opencode`/`cli` recovers the terminal step's tokens from the
+  session export rather than reporting zeros.
 - Process-group cleanup on abort is POSIX-only: the subprocess is spawned
   detached and aborting signals the whole group (SIGTERM, then SIGKILL after a
   grace period) so CLI-spawned helpers die too. On Windows only the direct child

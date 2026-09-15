@@ -151,15 +151,23 @@ describe("validateConfig", () => {
     }
   });
 
-  it("rejects a non-positive, non-finite, or fractional timeoutMs", () => {
-    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 0.5]) {
+  it("accepts any positive finite timeoutMs, including fractional values", () => {
+    for (const timeoutMs of [5000, 0.5, 1.5]) {
+      expect(() =>
+        validateConfig({ provider: "claude", flavor: "api", model: "m", timeoutMs }),
+      ).not.toThrow();
+    }
+  });
+
+  it("rejects a non-positive or non-finite timeoutMs", () => {
+    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
       const error = expectInvalidConfig({
         provider: "claude",
         flavor: "api",
         model: "m",
         timeoutMs,
       });
-      expect(error.message).toBe("timeoutMs must be a positive integer");
+      expect(error.message).toBe("timeoutMs must be a positive number");
     }
   });
 

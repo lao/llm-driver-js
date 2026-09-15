@@ -24,6 +24,7 @@ import {
   spawnStreamRunner,
   stageImages,
   streamCli,
+  withTempFile,
 } from "./cli.js";
 import { type McpBridge, start as startBridge } from "./mcp-bridge.js";
 
@@ -53,6 +54,7 @@ export function createOpencodeCliBackend(
     request: Request,
     bridge?: McpBridge,
     imageArgs: string[] = [],
+    instructionPath?: string,
   ): Command => {
     const args = [...BASE_ARGS, "--model", config.model];
     if (request.reasoning) {
@@ -61,9 +63,14 @@ export function createOpencodeCliBackend(
       // an unknown level surfaces opencode's error.
       args.push("--thinking", "--variant", request.reasoning.effort);
     }
-    args.push(...imageArgs, ...extraArgs);
-    const command: Command = { executable, args, stdin: renderPrompt(request) };
-    if (bridge) command.env = { OPENCODE_CONFIG_CONTENT: bridgeConfig(bridge) };
+    // The transcript is the final positional `message`; `--` stops yargs from
+    // reading a leading-dash user turn as an option. stdin stays empty.
+    args.push(...imageArgs, ...extraArgs, "--", renderTranscript(request.messages));
+    // opencode has no system-prompt flag, so `system` rides as an instruction
+    // file through the inline config — a true system-level input, not prompt text.
+    const command: Command = { executable, args, stdin: "" };
+    const env = opencodeConfig(bridge, instructionPath);
+    if (env) command.env = { OPENCODE_CONFIG_CONTENT: env };
     return command;
   };
 
@@ -81,10 +88,15 @@ export function createOpencodeCliBackend(
     async generate(request, signal) {
       const bridge = await openBridge(request, signal);
       let cleanupImages: (() => Promise<void>) | undefined;
+      let cleanupInstruction: (() => Promise<void>) | undefined;
       try {
         const staged = await stageImages(request, "opencode", "-f");
         cleanupImages = staged.cleanup;
-        const command = buildCommand(request, bridge, staged.imageArgs);
+        const instruction = request.system
+          ? await withTempFile("system.md", request.system)
+          : undefined;
+        cleanupInstruction = instruction?.cleanup;
+        const command = buildCommand(request, bridge, staged.imageArgs, instruction?.path);
         const { stdout, failure } = await executeCli(
           "opencode",
           command,
@@ -92,14 +104,22 @@ export function createOpencodeCliBackend(
           signal,
           config.timeoutMs,
         );
+        // Surface a failed or aborted run before draining the bridge: an MCP
+        // handler that ignores cancellation would otherwise hold `idle()` open
+        // past the configured deadline (which killed only the CLI process).
+        if (failure) throw preferReportedFailure(failure, stdout, config.model);
         // The CLI can exit while a tool-call response is still in flight; wait for
         // the bridge's handlers to settle before snapshotting records (and before
         // the finally closes the server).
         await bridge?.idle();
-        if (failure) throw preferReportedFailure(failure, stdout, config.model);
-        return parseOpencodeOutput(stdout, config.model, bridge?.records ?? []);
+        const run = foldEvents(stdout);
+        await recoverUsage(run, () =>
+          exportSession(run.id, executable, runner, signal, config.timeoutMs),
+        );
+        return toResponse(run, config.model, bridge?.records ?? []);
       } finally {
         await cleanupImages?.();
+        await cleanupInstruction?.();
         await bridge?.close();
       }
     },
@@ -120,11 +140,16 @@ export function createOpencodeCliBackend(
         });
       });
       let cleanupImages: (() => Promise<void>) | undefined;
+      let cleanupInstruction: (() => Promise<void>) | undefined;
 
       try {
         const staged = await stageImages(request, "opencode", "-f");
         cleanupImages = staged.cleanup;
-        const command = buildCommand(request, bridge, staged.imageArgs);
+        const instruction = request.system
+          ? await withTempFile("system.md", request.system)
+          : undefined;
+        cleanupInstruction = instruction?.cleanup;
+        const command = buildCommand(request, bridge, staged.imageArgs, instruction?.path);
         const run = newRun();
         let index = 0;
 
@@ -148,9 +173,13 @@ export function createOpencodeCliBackend(
         await bridge?.idle();
         while (pending.length > 0) yield pending.shift() as StreamEvent;
         finalizeStep(run);
+        await recoverUsage(run, () =>
+          exportSessionStream(run.id, executable, streamRunner, signal, config.timeoutMs),
+        );
         yield { type: "done", response: toResponse(run, config.model, bridge?.records ?? []) };
       } finally {
         await cleanupImages?.();
+        await cleanupInstruction?.();
         await bridge?.close();
       }
     },
@@ -158,31 +187,35 @@ export function createOpencodeCliBackend(
 }
 
 /**
- * opencode has no system-prompt flag, so a system instruction rides at the head
- * of the stdin transcript. A lone user message keeps its v1 verbatim form when
- * no system is set.
+ * Inline config carrying the loopback MCP bridge (when tools are present) and/or
+ * the request's system instruction (`OPENCODE_CONFIG_CONTENT` overrides for the
+ * run only; OAuth is off since the endpoint is loopback). `instructions` are
+ * added to opencode's system prompt — a privileged channel — unlike prefixing
+ * the text to the user transcript. The launcher layers `command.env` over
+ * `process.env`, so an inherited inline config is merged rather than replaced —
+ * the caller's provider settings, other MCP servers, and instructions survive.
+ * Returns `undefined` when there is nothing to inject, leaving env untouched.
  */
-function renderPrompt(request: Request): string {
-  const transcript = renderTranscript(request.messages);
-  return request.system ? `System: ${request.system}\n\n${transcript}` : transcript;
-}
-
-/**
- * Inline config handing opencode the loopback MCP bridge as a remote server
- * (`OPENCODE_CONFIG_CONTENT` overrides for the run only; OAuth is off since the
- * endpoint is loopback). The launcher layers `command.env` over `process.env`,
- * so an inherited inline config is merged rather than replaced — the caller's
- * provider settings and other MCP servers survive a tool-enabled request.
- */
-function bridgeConfig(bridge: McpBridge): string {
+function opencodeConfig(
+  bridge: McpBridge | undefined,
+  instructionPath: string | undefined,
+): string | undefined {
+  if (!bridge && !instructionPath) return undefined;
   const existing = parseEnvConfig(process.env.OPENCODE_CONFIG_CONTENT);
-  return JSON.stringify({
-    ...existing,
-    mcp: {
+  const merged: Record<string, unknown> = { ...existing };
+  if (bridge) {
+    merged.mcp = {
       ...asRecord(existing.mcp),
       llmdriver: { type: "remote", url: bridge.url, oauth: false },
-    },
-  });
+    };
+  }
+  if (instructionPath) {
+    const existingInstructions = Array.isArray(existing.instructions)
+      ? existing.instructions.filter((entry): entry is string => typeof entry === "string")
+      : [];
+    merged.instructions = [...existingInstructions, instructionPath];
+  }
+  return JSON.stringify(merged);
 }
 
 /** Parses an inherited `OPENCODE_CONFIG_CONTENT`; anything unusable is ignored. */
@@ -204,6 +237,8 @@ interface OpencodeRun {
   text: string;
   completionReason: CompletionReason;
   finished: boolean;
+  /** True once any text or `step_finish` event is seen; guards empty output. */
+  sawOutput: boolean;
   usage: Usage;
 }
 
@@ -214,6 +249,7 @@ function newRun(): OpencodeRun {
     text: "",
     completionReason: "",
     finished: false,
+    sawOutput: false,
     usage: {
       inputTokens: 0,
       outputTokens: 0,
@@ -242,6 +278,7 @@ function parseEvent(run: OpencodeRun, event: Record<string, unknown>): StreamEve
     case "text": {
       const text = readString(part, "text");
       if (text === "") return undefined;
+      run.sawOutput = true;
       run.stepText += text;
       return { type: "text", text };
     }
@@ -255,6 +292,7 @@ function parseEvent(run: OpencodeRun, event: Record<string, unknown>): StreamEve
       run.text = run.stepText;
       run.completionReason = completionReason(readString(part, "reason"));
       run.finished = true;
+      run.sawOutput = true;
       addUsage(run.usage, asRecord(part.tokens));
       return undefined;
     case "error":
@@ -289,6 +327,11 @@ function opencodeFailure(error: Record<string, unknown>): LLMDriverError {
 }
 
 function parseOpencodeOutput(stdout: string, model: string, toolCalls: ToolCallRecord[]): Response {
+  return toResponse(foldEvents(stdout), model, toolCalls);
+}
+
+/** Folds a whole stdout JSONL stream into one run, committing any open step. */
+function foldEvents(stdout: string): OpencodeRun {
   const run = newRun();
   for (const [index, line] of stdout.split("\n").entries()) {
     if (line.trim() === "") continue;
@@ -296,7 +339,90 @@ function parseOpencodeOutput(stdout: string, model: string, toolCalls: ToolCallR
     parseEvent(run, parseJsonObject("opencode", `decode OpenCode CLI event ${index + 1}`, line));
   }
   finalizeStep(run);
-  return toResponse(run, model, toolCalls);
+  return run;
+}
+
+/**
+ * The upstream event-loop race can exit `opencode run --format json` after
+ * streaming text but before the terminal `step_finish` — the only in-stream
+ * source of token counts. Recover the completed session's terminal step from
+ * `opencode export <id>` so a successful run is not reported with zeroed usage.
+ * Best-effort: if the export or its parse fails, usage keeps the stream's value.
+ */
+async function recoverUsage(
+  run: OpencodeRun,
+  readExport: () => Promise<string | undefined>,
+): Promise<void> {
+  if (run.finished || run.id === "") return;
+  const stdout = await readExport();
+  if (stdout === undefined) return;
+  const terminal = terminalUsage(stdout);
+  if (terminal === undefined) return;
+  run.usage.inputTokens += terminal.inputTokens;
+  run.usage.outputTokens += terminal.outputTokens;
+  run.usage.cachedInputTokens += terminal.cachedInputTokens;
+  run.usage.cacheCreationInputTokens += terminal.cacheCreationInputTokens;
+  run.usage.reasoningTokens += terminal.reasoningTokens;
+}
+
+/** Token counts of the last assistant message in an `opencode export` payload. */
+function terminalUsage(stdout: string): Usage | undefined {
+  let exported: Record<string, unknown>;
+  try {
+    exported = parseJsonObject("opencode", "decode OpenCode session export", stdout);
+  } catch {
+    return undefined;
+  }
+  const messages = Array.isArray(exported.messages) ? exported.messages : [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const info = asRecord(asRecord(messages[index]).info);
+    if (readString(info, "role") !== "assistant") continue;
+    const tokens = asRecord(info.tokens);
+    if (Object.keys(tokens).length === 0) return undefined;
+    const usage: Usage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      reasoningTokens: 0,
+    };
+    addUsage(usage, tokens);
+    return usage;
+  }
+  return undefined;
+}
+
+/** Reads a session's export JSON through the buffered runner; `undefined` on failure. */
+async function exportSession(
+  sessionId: string,
+  executable: string,
+  runner: CommandRunner,
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): Promise<string | undefined> {
+  const command: Command = { executable, args: ["export", sessionId], stdin: "" };
+  const { stdout, failure } = await executeCli("opencode", command, runner, signal, timeoutMs);
+  return failure ? undefined : stdout;
+}
+
+/** Streaming counterpart of {@link exportSession}. */
+async function exportSessionStream(
+  sessionId: string,
+  executable: string,
+  streamRunner: StreamingCommandRunner,
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): Promise<string | undefined> {
+  const command: Command = { executable, args: ["export", sessionId], stdin: "" };
+  let stdout = "";
+  try {
+    for await (const line of streamCli("opencode", command, streamRunner, signal, timeoutMs)) {
+      stdout += `${line}\n`;
+    }
+  } catch {
+    return undefined;
+  }
+  return stdout;
 }
 
 /**
@@ -312,6 +438,14 @@ function finalizeStep(run: OpencodeRun): void {
 }
 
 function toResponse(run: OpencodeRun, model: string, toolCalls: ToolCallRecord[]): Response {
+  // An exit-0 process that emitted neither text nor a completed step produced no
+  // usable output: treat it as malformed rather than a successful empty answer.
+  // The upstream race that drops only the terminal step_finish still saw text.
+  if (!run.sawOutput) {
+    throw cliError("opencode", "parse_failed", "OpenCode run produced no usable output", {
+      providerCode: "missing_result",
+    });
+  }
   return {
     id: run.id,
     model,

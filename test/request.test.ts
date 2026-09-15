@@ -166,8 +166,13 @@ describe("validateRequest", () => {
     ],
     [
       "image with bad media type",
-      { type: "image", source: { base64: "x", mediaType: "image/tiff" as never } },
+      { type: "image", source: { base64: "aGVsbG8=", mediaType: "image/tiff" as never } },
       "content block 0 image mediaType is invalid",
+    ],
+    [
+      "image with malformed base64",
+      { type: "image", source: { base64: "@@", mediaType: "image/png" } },
+      "content block 0 image source base64 is malformed",
     ],
     [
       "document without base64",
@@ -176,8 +181,13 @@ describe("validateRequest", () => {
     ],
     [
       "document with wrong media type",
-      { type: "document", source: { base64: "x", mediaType: "text/plain" as never } },
+      { type: "document", source: { base64: "aGVsbG8=", mediaType: "text/plain" as never } },
       "content block 0 document mediaType must be application/pdf",
+    ],
+    [
+      "document with malformed base64",
+      { type: "document", source: { base64: "@@", mediaType: "application/pdf" } },
+      "content block 0 document source base64 is malformed",
     ],
   ])("rejects an %s", (_name, block, expected) => {
     const message: Message = { role: "user", content: [block] };

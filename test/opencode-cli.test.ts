@@ -87,14 +87,25 @@ describe("opencode cli command", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.command).toEqual({
       executable: "opencode",
-      args: [...baseArgs, "--model", "anthropic/claude-test"],
-      stdin: "Hello",
+      args: [...baseArgs, "--model", "anthropic/claude-test", "--", "Hello"],
+      stdin: "",
     });
     expect(calls[0]?.signal).toBe(signal);
   });
 
-  it("prepends a system instruction to the stdin transcript", async () => {
-    const { runner, calls } = fakeRunner({ stdout: successStdout });
+  it("carries a system instruction as inline-config instructions, not prompt text", async () => {
+    let args: string[] = [];
+    let instructionPath = "";
+    let instructionContents = "";
+    const runner: CommandRunner = async (command) => {
+      args = command.args;
+      const config = JSON.parse(command.env?.OPENCODE_CONFIG_CONTENT as string) as {
+        instructions?: string[];
+      };
+      instructionPath = config.instructions?.[0] as string;
+      instructionContents = readFileSync(instructionPath, "utf8");
+      return { stdout: successStdout, stderr: "", exitCode: 0 };
+    };
 
     await createOpencodeCliBackend(config, runner).generate({
       system: "Be concise.",
@@ -102,9 +113,11 @@ describe("opencode cli command", () => {
       messages: [user("First"), assistant("Second"), user("Third")],
     });
 
-    expect(calls[0]?.command.stdin).toBe(
-      "System: Be concise.\n\nUser: First\n\nAssistant: Second\n\nUser: Third",
-    );
+    expect(instructionContents).toBe("Be concise.");
+    // The transcript is user/assistant turns only; the system text is privileged.
+    expect(args.at(-1)).toBe("User: First\n\nAssistant: Second\n\nUser: Third");
+    expect(instructionPath).not.toBe("");
+    expect(existsSync(instructionPath)).toBe(false);
   });
 
   it("passes reasoning.effort as --variant", async () => {
@@ -122,6 +135,8 @@ describe("opencode cli command", () => {
       "low",
       "--agent",
       "build",
+      "--",
+      "Hello",
     ]);
   });
 
@@ -130,7 +145,13 @@ describe("opencode cli command", () => {
 
     await createOpencodeCliBackend(config, runner).generate(request);
 
-    expect(calls[0]?.command.args).toEqual([...baseArgs, "--model", "anthropic/claude-test"]);
+    expect(calls[0]?.command.args).toEqual([
+      ...baseArgs,
+      "--model",
+      "anthropic/claude-test",
+      "--",
+      "Hello",
+    ]);
   });
 
   it("uses cliPath when provided", async () => {
@@ -230,6 +251,55 @@ describe("opencode cli parsing", () => {
       flavor: "cli",
       toolCalls: [],
     });
+  });
+
+  const orphanText = '{"type":"text","sessionID":"s","part":{"type":"text","text":"orphan"}}\n';
+  const usageExport = JSON.stringify({
+    info: { id: "s" },
+    messages: [
+      { info: { role: "user" }, parts: [] },
+      {
+        info: {
+          role: "assistant",
+          tokens: { input: 20, output: 7, reasoning: 2, cache: { read: 5, write: 3 } },
+        },
+        parts: [],
+      },
+    ],
+  });
+
+  it("recovers usage from the session export when the terminal step_finish is lost", async () => {
+    const runner: CommandRunner = async (command) =>
+      command.args[0] === "export"
+        ? { stdout: usageExport, stderr: "", exitCode: 0 }
+        : { stdout: orphanText, stderr: "", exitCode: 0 };
+
+    const response = await createOpencodeCliBackend(config, runner).generate(request);
+
+    expect(response.usage).toEqual({
+      inputTokens: 20,
+      outputTokens: 7,
+      cachedInputTokens: 5,
+      cacheCreationInputTokens: 3,
+      reasoningTokens: 2,
+    });
+    expect(response.text).toBe("orphan");
+  });
+
+  it("fails when a successful run emits no usable event", async () => {
+    const runner: CommandRunner = async (command) => ({
+      stdout: command.args[0] === "export" ? "" : '{"type":"session","sessionID":"s"}\n',
+      stderr: "",
+      exitCode: 0,
+    });
+
+    const error = await createOpencodeCliBackend(config, runner)
+      .generate(request)
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect((error as LLMDriverError).code).toBe("parse_failed");
+    expect((error as LLMDriverError).providerCode).toBe("missing_result");
   });
 });
 
@@ -394,6 +464,8 @@ describe("opencode cli image input", () => {
       seen.paths[0],
       "-f",
       seen.paths[1],
+      "--",
+      "describe",
     ]);
     expect(seen.existedDuringRun).toEqual([true, true]);
     expect(seen.contents).toEqual(["fake-png-bytes", "fake-jpg-bytes"]);
@@ -516,8 +588,8 @@ describe("opencode cli streaming", () => {
 
     expect(calls[0]?.command).toEqual({
       executable: "opencode",
-      args: [...baseArgs, "--model", "anthropic/claude-test"],
-      stdin: "Hello",
+      args: [...baseArgs, "--model", "anthropic/claude-test", "--", "Hello"],
+      stdin: "",
     });
     expect(calls[0]?.signal).toBe(signal);
   });
@@ -628,6 +700,54 @@ describe("opencode cli streaming", () => {
       type: "done",
       response: { text: "second", id: "s", completionReason: "" },
     });
+  });
+
+  it("recovers usage from the session export when the stream loses the final step_finish", async () => {
+    const exportJson = JSON.stringify({
+      info: { id: "s" },
+      messages: [
+        {
+          info: {
+            role: "assistant",
+            tokens: { input: 11, output: 4, reasoning: 1, cache: { read: 2, write: 1 } },
+          },
+          parts: [],
+        },
+      ],
+    });
+    const streamRunner: StreamingCommandRunner = async function* (command) {
+      const lines =
+        command.args[0] === "export"
+          ? [exportJson]
+          : ['{"type":"text","sessionID":"s","part":{"type":"text","text":"orphan"}}'];
+      for (const line of lines) yield { type: "line", line };
+      yield { type: "exit", exitCode: 0, stderr: "" };
+    };
+
+    const events = await collect(
+      createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(request),
+    );
+
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("expected a done event");
+    expect(done.response.usage).toEqual({
+      inputTokens: 11,
+      outputTokens: 4,
+      cachedInputTokens: 2,
+      cacheCreationInputTokens: 1,
+      reasoningTokens: 1,
+    });
+  });
+
+  it("fails when the stream emits no usable event", async () => {
+    const streamRunner = stubStreamRunner(['{"type":"session","sessionID":"s"}']);
+
+    const error = await collect(
+      createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(request),
+    ).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(LLMDriverError);
+    expect((error as LLMDriverError).code).toBe("parse_failed");
   });
 });
 
@@ -766,6 +886,39 @@ describe("opencode cli tools bridge lifecycle", () => {
 
     expect(url).not.toBe("");
     await expect(rpc(url, "tools/list")).rejects.toThrow();
+  });
+
+  it("surfaces a failed run instead of draining a stuck tool handler", async () => {
+    // The timeout killed the CLI, but an MCP handler ignores cancellation and
+    // never resolves; generate() must not wait on the bridge forever.
+    let started: () => void = () => {};
+    const startedPromise = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const stuckRequest: Request = {
+      ...toolsRequest,
+      tools: [
+        {
+          name: "add",
+          description: "adds two numbers",
+          inputSchema: { type: "object" },
+          execute: () => {
+            started();
+            return new Promise<string>(() => {});
+          },
+        },
+      ],
+    };
+    const runner: CommandRunner = async (command) => {
+      // Fire the call but never await it: the handler hangs.
+      void rpc(bridgeUrl(command), "tools/call", { name: "add", arguments: {} }).catch(() => {});
+      await startedPromise;
+      return { stdout: "", stderr: "timed out\n", exitCode: 124 };
+    };
+
+    await expect(
+      createOpencodeCliBackend(config, runner).generate(stuckRequest),
+    ).rejects.toBeInstanceOf(LLMDriverError);
   });
 });
 
