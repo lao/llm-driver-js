@@ -147,16 +147,7 @@ export function createOpencodeCliBackend(
         // the bridge's handlers to settle so their events are queued before the flush.
         await bridge?.idle();
         while (pending.length > 0) yield pending.shift() as StreamEvent;
-        if (!run.finished) {
-          throw cliError(
-            "opencode",
-            "parse_failed",
-            "OpenCode CLI output did not complete a step",
-            {
-              providerCode: "missing_step_finish",
-            },
-          );
-        }
+        finalizeStep(run);
         yield { type: "done", response: toResponse(run, config.model, bridge?.records ?? []) };
       } finally {
         await cleanupImages?.();
@@ -209,7 +200,7 @@ interface OpencodeRun {
   id: string;
   /** Text of the step in progress; reset at each `step_start`. */
   stepText: string;
-  /** Text of the last completed step — the final assistant message. */
+  /** Text of the last completed (or, if the stream cut out early, open) step. */
   text: string;
   completionReason: CompletionReason;
   finished: boolean;
@@ -304,12 +295,20 @@ function parseOpencodeOutput(stdout: string, model: string, toolCalls: ToolCallR
     // parseEvent folds the event into `run`; its returned delta is stream-only.
     parseEvent(run, parseJsonObject("opencode", `decode OpenCode CLI event ${index + 1}`, line));
   }
-  if (!run.finished) {
-    throw cliError("opencode", "parse_failed", "OpenCode CLI output did not complete a step", {
-      providerCode: "missing_step_finish",
-    });
-  }
+  finalizeStep(run);
   return toResponse(run, model, toolCalls);
+}
+
+/**
+ * Commits a step the stream left open. `opencode run --format json` can exit 0
+ * after streaming text but before the terminal `step_finish` (a known upstream
+ * event-loop race), so the open step's text becomes the answer while its
+ * completion reason stays unreported rather than failing the whole run.
+ */
+function finalizeStep(run: OpencodeRun): void {
+  if (run.finished) return;
+  run.text = run.stepText;
+  run.completionReason = "";
 }
 
 function toResponse(run: OpencodeRun, model: string, toolCalls: ToolCallRecord[]): Response {

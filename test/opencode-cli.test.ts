@@ -204,6 +204,33 @@ describe("opencode cli parsing", () => {
     expect(response.text).toBe("Hello, world");
     expect(response.id).toBe("s");
   });
+
+  it("returns accumulated text when a successful run omits the final step_finish", async () => {
+    // Upstream race: `opencode run --format json` can exit 0 after streaming text
+    // but before the terminal `step_finish`, so the answer must not be discarded.
+    const { runner } = fakeRunner({
+      stdout: '{"type":"text","sessionID":"s","part":{"type":"text","text":"orphan"}}\n',
+    });
+
+    const response = await createOpencodeCliBackend(config, runner).generate(request);
+
+    expect(response).toEqual({
+      id: "s",
+      model: "anthropic/claude-test",
+      text: "orphan",
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        reasoningTokens: 0,
+      },
+      completionReason: "",
+      provider: "opencode",
+      flavor: "cli",
+      toolCalls: [],
+    });
+  });
 });
 
 describe("opencode cli failures", () => {
@@ -266,14 +293,6 @@ describe("opencode cli failures", () => {
       code: "api_error",
       providerCode: "ProviderError",
       message: "model exploded",
-    },
-    {
-      name: "missing step finish",
-      result: {
-        stdout: '{"type":"text","sessionID":"s","part":{"type":"text","text":"orphan"}}\n',
-      },
-      code: "parse_failed",
-      providerCode: "missing_step_finish",
     },
   ];
 
@@ -560,21 +579,40 @@ describe("opencode cli streaming", () => {
     expect((error as LLMDriverError).providerCode).toBe("BadRequest");
   });
 
-  it("throws parse_failed when the stream never completes a step", async () => {
+  it("returns accumulated text when the stream never completes a step", async () => {
     const streamRunner = stubStreamRunner([
       '{"type":"text","sessionID":"s","part":{"type":"text","text":"orphan"}}',
     ]);
 
-    const error = await collect(
+    const events = await collect(
       createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(request),
-    ).catch((caught) => caught);
+    );
 
-    expect(error).toBeInstanceOf(LLMDriverError);
-    expect((error as LLMDriverError).code).toBe("parse_failed");
-    expect((error as LLMDriverError).providerCode).toBe("missing_step_finish");
+    expect(events).toEqual([
+      { type: "text", text: "orphan" },
+      {
+        type: "done",
+        response: {
+          id: "s",
+          model: "anthropic/claude-test",
+          text: "orphan",
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            reasoningTokens: 0,
+          },
+          completionReason: "",
+          provider: "opencode",
+          flavor: "cli",
+          toolCalls: [],
+        },
+      },
+    ]);
   });
 
-  it("throws parse_failed when a later step starts but never finishes", async () => {
+  it("returns the last open step's text when a later step never finishes", async () => {
     const streamRunner = stubStreamRunner([
       '{"type":"text","sessionID":"s","part":{"type":"text","text":"first"}}',
       '{"type":"step_finish","sessionID":"s","part":{"reason":"tool-calls","tokens":{}}}',
@@ -582,13 +620,14 @@ describe("opencode cli streaming", () => {
       '{"type":"text","sessionID":"s","part":{"type":"text","text":"second"}}',
     ]);
 
-    const error = await collect(
+    const events = await collect(
       createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(request),
-    ).catch((caught) => caught);
+    );
 
-    expect(error).toBeInstanceOf(LLMDriverError);
-    expect((error as LLMDriverError).code).toBe("parse_failed");
-    expect((error as LLMDriverError).providerCode).toBe("missing_step_finish");
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      response: { text: "second", id: "s", completionReason: "" },
+    });
   });
 });
 
