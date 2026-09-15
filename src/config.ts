@@ -59,11 +59,9 @@ export function validateConfig(config: Config): void {
   }
   if (
     config.timeoutMs !== undefined &&
-    (typeof config.timeoutMs !== "number" ||
-      !Number.isFinite(config.timeoutMs) ||
-      config.timeoutMs <= 0)
+    (!Number.isInteger(config.timeoutMs) || config.timeoutMs <= 0)
   ) {
-    throw invalid(config, "timeoutMs must be a positive number");
+    throw invalid(config, "timeoutMs must be a positive integer");
   }
   // maxRetries on a cli flavor already failed the API_ONLY check above.
   if (

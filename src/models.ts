@@ -33,7 +33,7 @@ export async function listOpencodeModels(
   // value would otherwise reach `AbortSignal.timeout` as an immediate timeout or
   // a platform `RangeError` instead of a documented `LLMDriverError`.
   if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
-    throw new LLMDriverError("invalid_config", "timeoutMs must be a positive number", {
+    throw new LLMDriverError("invalid_config", "timeoutMs must be a positive integer", {
       provider: "opencode",
       operation: "listOpencodeModels",
     });
