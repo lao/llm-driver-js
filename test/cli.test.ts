@@ -190,6 +190,18 @@ describe("executeCli", () => {
     expect(seen).toEqual([{ command, signal }]);
   });
 
+  it("accepts a positive fractional timeoutMs", async () => {
+    const outcome = await executeCli(
+      "claude",
+      command,
+      resultRunner({ stdout: "payload" }),
+      undefined,
+      0.5,
+    );
+
+    expect(outcome).toEqual({ stdout: "payload" });
+  });
+
   it("maps a missing executable to executable_not_found", async () => {
     const { failure } = await executeCli("claude", command, failingRunner(enoent()));
 

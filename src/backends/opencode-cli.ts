@@ -56,7 +56,7 @@ export function createOpencodeCliBackend(
     const deadline =
       config.timeoutMs === undefined ? undefined : performance.now() + config.timeoutMs;
     const timeoutSignal =
-      config.timeoutMs === undefined ? undefined : AbortSignal.timeout(config.timeoutMs);
+      config.timeoutMs === undefined ? undefined : AbortSignal.timeout(Math.ceil(config.timeoutMs));
     const signal =
       caller && timeoutSignal
         ? AbortSignal.any([caller, timeoutSignal])
@@ -98,8 +98,7 @@ export function createOpencodeCliBackend(
     // the conversation out of argv where process inspection or command logging
     // could capture it.
     const command: Command = { executable, args, stdin: renderTranscript(request.messages) };
-    const env = opencodeConfig(bridge, instructionPath);
-    if (env) command.env = { OPENCODE_CONFIG_CONTENT: env };
+    command.env = { OPENCODE_CONFIG_CONTENT: opencodeConfig(bridge, instructionPath) };
     return command;
   };
 
@@ -269,15 +268,18 @@ async function drainBridge(
  * the text to the user transcript. The launcher layers `command.env` over
  * `process.env`, so an inherited inline config is merged rather than replaced —
  * the caller's provider settings, other MCP servers, and instructions survive.
- * Returns `undefined` when there is nothing to inject, leaving env untouched.
+ * Every run also denies opencode's native shell and edit tools unless the caller
+ * explicitly overrides those permissions in inherited inline config.
  */
 function opencodeConfig(
   bridge: McpBridge | undefined,
   instructionPath: string | undefined,
-): string | undefined {
-  if (!bridge && !instructionPath) return undefined;
+): string {
   const existing = parseEnvConfig(process.env.OPENCODE_CONFIG_CONTENT);
-  const merged: Record<string, unknown> = { ...existing };
+  const merged: Record<string, unknown> = {
+    ...existing,
+    permission: safePermissions(existing.permission),
+  };
   if (bridge) {
     const existingMcp = asRecord(existing.mcp);
     merged.mcp = {
@@ -292,6 +294,29 @@ function opencodeConfig(
     merged.instructions = [...existingInstructions, instructionPath];
   }
   return JSON.stringify(merged);
+}
+
+function safePermissions(permission: unknown): unknown {
+  if (permission === "allow" || permission === "ask" || permission === "deny") return permission;
+  const inherited = asRecord(permission);
+  const merged: Record<string, unknown> = {};
+  // OpenCode uses last-match-wins ordering: missing defaults go first, while
+  // inherited entries keep their relative positions and therefore their intent.
+  if (!("bash" in inherited)) merged.bash = "deny";
+  if (!("edit" in inherited)) merged.edit = "deny";
+  for (const [name, value] of Object.entries(inherited)) {
+    if (name !== "bash" && name !== "edit") {
+      merged[name] = value;
+      continue;
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      merged[name] = value;
+      continue;
+    }
+    const rules = asRecord(value);
+    merged[name] = "*" in rules ? value : { "*": "deny", ...rules };
+  }
+  return merged;
 }
 
 /**

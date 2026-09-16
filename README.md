@@ -446,8 +446,10 @@ equivalents of the hosted APIs:
 - Claude CLI runs in single-shot print mode with the default permission mode, so
   a headless run cannot approve tool actions that need approval — but tools that
   are allowed by default still run (see the security note below). Codex runs with
-  a read-only sandbox. Agent CLI behavior can still differ from a hosted model
-  endpoint.
+  a read-only sandbox. OpenCode runs deny its native `bash` and `edit` tools by
+  default; set an explicit `permission` policy in inherited
+  `OPENCODE_CONFIG_CONTENT` to opt into those CLI tools. Agent CLI behavior can
+  still differ from a hosted model endpoint.
 - System text is passed through Claude's `--append-system-prompt` flag, Codex's
   per-invocation `developer_instructions` config, and opencode's inline-config
   `instructions` file (opencode has no system-prompt flag). Conversation text

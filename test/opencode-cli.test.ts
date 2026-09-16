@@ -89,6 +89,9 @@ describe("opencode cli command", () => {
       executable: "opencode",
       args: [...baseArgs, "--model", "anthropic/claude-test"],
       stdin: "Hello",
+      env: {
+        OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":"deny","edit":"deny"}}',
+      },
     });
     // The conversation must stay off argv, where process inspection can read it.
     expect(calls[0]?.command.args).not.toContain("Hello");
@@ -313,6 +316,21 @@ describe("opencode cli parsing", () => {
     } finally {
       timeout.mockRestore();
       now.mockRestore();
+    }
+  });
+
+  it("rounds a fractional request deadline up for AbortSignal.timeout", async () => {
+    const timeout = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockImplementation(() => new AbortController().signal);
+    const { runner } = fakeRunner({ stdout: successStdout });
+
+    try {
+      await createOpencodeCliBackend({ ...config, timeoutMs: 0.5 }, runner).generate(request);
+
+      expect(timeout).toHaveBeenCalledWith(1);
+    } finally {
+      timeout.mockRestore();
     }
   });
 
@@ -631,6 +649,9 @@ describe("opencode cli streaming", () => {
       executable: "opencode",
       args: [...baseArgs, "--model", "anthropic/claude-test"],
       stdin: "Hello",
+      env: {
+        OPENCODE_CONFIG_CONTENT: '{"permission":{"bash":"deny","edit":"deny"}}',
+      },
     });
     expect(calls[0]?.signal).toBe(signal);
   });
@@ -884,6 +905,23 @@ async function rpc(url: string, method: string, params?: unknown): Promise<Respo
   });
 }
 
+async function generatedInlineConfig(
+  permission: unknown,
+): Promise<{ permission: Record<string, unknown> }> {
+  const { runner, calls } = fakeRunner({ stdout: successStdout });
+  const previous = process.env.OPENCODE_CONFIG_CONTENT;
+  process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ permission });
+  try {
+    await createOpencodeCliBackend(config, runner).generate(request);
+    return JSON.parse(calls[0]?.command.env?.OPENCODE_CONFIG_CONTENT as string) as {
+      permission: Record<string, unknown>;
+    };
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_CONFIG_CONTENT;
+    else process.env.OPENCODE_CONFIG_CONTENT = previous;
+  }
+}
+
 function hangingToolsRequest(
   onStart: (signal: AbortSignal | undefined) => void,
   safetySignal: AbortSignal,
@@ -918,18 +956,22 @@ describe("opencode cli tools config", () => {
     expect(content).toBeDefined();
     const parsed = JSON.parse(content as string) as {
       mcp: { llmdriver: { type: string; url: string; oauth: boolean } };
+      permission: { bash: string; edit: string };
     };
+    expect(parsed.permission).toEqual({ bash: "deny", edit: "deny" });
     expect(parsed.mcp.llmdriver.type).toBe("remote");
     expect(parsed.mcp.llmdriver.oauth).toBe(false);
     expect(parsed.mcp.llmdriver.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/[0-9a-f-]{36}$/);
   });
 
-  it("sets no env when the request carries no tools", async () => {
+  it("denies bash and edit even when the request carries no tools or system prompt", async () => {
     const { runner, calls } = fakeRunner({ stdout: successStdout });
 
     await createOpencodeCliBackend(config, runner).generate(request);
 
-    expect(calls[0]?.command.env).toBeUndefined();
+    expect(JSON.parse(calls[0]?.command.env?.OPENCODE_CONFIG_CONTENT as string)).toEqual({
+      permission: { bash: "deny", edit: "deny" },
+    });
   });
 
   it("merges an inherited OPENCODE_CONFIG_CONTENT instead of replacing it", async () => {
@@ -950,6 +992,7 @@ describe("opencode cli tools config", () => {
         mcp: Record<string, { type: string; oauth?: boolean; command?: string[] }>;
       };
       expect(parsed.model).toBe("anthropic/claude-sonnet-4-5");
+      expect(parsed.permission).toEqual({ bash: "deny", edit: "deny" });
       expect(parsed.mcp.other).toEqual({ type: "local", command: ["node", "server.js"] });
       expect(parsed.mcp.llmdriver?.type).toBe("remote");
       expect(parsed.mcp.llmdriver?.oauth).toBe(false);
@@ -958,6 +1001,79 @@ describe("opencode cli tools config", () => {
       else process.env.OPENCODE_CONFIG_CONTENT = previous;
     }
   });
+
+  it("fills missing permission defaults without replacing explicit object entries", async () => {
+    const { runner, calls } = fakeRunner({ stdout: successStdout });
+    const previous = process.env.OPENCODE_CONFIG_CONTENT;
+    process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+      model: "anthropic/claude-sonnet-4-5",
+      permission: { bash: "allow", read: "ask" },
+    });
+    try {
+      await createOpencodeCliBackend(config, runner).generate(request);
+
+      expect(JSON.parse(calls[0]?.command.env?.OPENCODE_CONFIG_CONTENT as string)).toEqual({
+        model: "anthropic/claude-sonnet-4-5",
+        permission: { bash: "allow", edit: "deny", read: "ask" },
+      });
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_CONFIG_CONTENT;
+      else process.env.OPENCODE_CONFIG_CONTENT = previous;
+    }
+  });
+
+  it("adds deny catch-alls to inherited granular bash and edit policies", async () => {
+    const { permission } = await generatedInlineConfig({
+      bash: { "git status": "allow" },
+      edit: { "README.md": "allow" },
+    });
+
+    expect(permission.bash).toEqual({ "*": "deny", "git status": "allow" });
+    expect(permission.edit).toEqual({ "*": "deny", "README.md": "allow" });
+    expect(Object.keys(permission.bash as object)).toEqual(["*", "git status"]);
+    expect(Object.keys(permission.edit as object)).toEqual(["*", "README.md"]);
+  });
+
+  it("preserves explicit granular catch-alls in their inherited positions", async () => {
+    const { permission } = await generatedInlineConfig({
+      bash: { "git *": "allow", "*": "ask" },
+      edit: { "*": "allow", "secrets/**": "deny" },
+    });
+
+    expect(permission.bash).toEqual({ "git *": "allow", "*": "ask" });
+    expect(permission.edit).toEqual({ "*": "allow", "secrets/**": "deny" });
+    expect(Object.keys(permission.bash as object)).toEqual(["git *", "*"]);
+    expect(Object.keys(permission.edit as object)).toEqual(["*", "secrets/**"]);
+  });
+
+  it.each([
+    [{ "*": "allow", bash: "deny" }, ["edit", "*", "bash"]],
+    [{ bash: "deny", "*": "allow" }, ["edit", "bash", "*"]],
+  ] as const)("preserves inherited top-level wildcard order %#", async (inherited, keys) => {
+    const { permission } = await generatedInlineConfig(inherited);
+
+    expect(permission).toEqual({ edit: "deny", ...inherited });
+    expect(Object.keys(permission)).toEqual(keys);
+  });
+
+  it.each(["allow", "ask", "deny"] as const)(
+    "preserves an inherited scalar permission policy (%s)",
+    async (permission) => {
+      const { runner, calls } = fakeRunner({ stdout: successStdout });
+      const previous = process.env.OPENCODE_CONFIG_CONTENT;
+      process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ permission });
+      try {
+        await createOpencodeCliBackend(config, runner).generate(request);
+
+        expect(
+          JSON.parse(calls[0]?.command.env?.OPENCODE_CONFIG_CONTENT as string).permission,
+        ).toBe(permission);
+      } finally {
+        if (previous === undefined) delete process.env.OPENCODE_CONFIG_CONTENT;
+        else process.env.OPENCODE_CONFIG_CONTENT = previous;
+      }
+    },
+  );
 
   it("does not overwrite a caller-defined mcp server named llmdriver", async () => {
     const { runner, calls } = fakeRunner({ stdout: toolsStdout });

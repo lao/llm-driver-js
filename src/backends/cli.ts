@@ -87,7 +87,7 @@ function withDeadline(
   timeoutMs: number | undefined,
 ): { signal: AbortSignal | undefined; timedOut: () => boolean } {
   if (timeoutMs === undefined) return { signal, timedOut: () => false };
-  const deadline = AbortSignal.timeout(timeoutMs);
+  const deadline = AbortSignal.timeout(Math.ceil(timeoutMs));
   return {
     signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
     timedOut: () => deadline.aborted && !signal?.aborted,
