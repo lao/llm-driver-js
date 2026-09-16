@@ -29,6 +29,13 @@ const CODEX_STDOUT = [
   "",
 ].join("\n");
 
+const OPENCODE_STDOUT = [
+  '{"type":"step_start","sessionID":"session-routing"}',
+  '{"type":"text","sessionID":"session-routing","part":{"type":"text","text":"routed to opencode"}}',
+  '{"type":"step_finish","sessionID":"session-routing","part":{"reason":"stop","tokens":{"input":3,"output":4}}}',
+  "",
+].join("\n");
+
 interface Invocation {
   argv: string[];
   stdin: string;
@@ -55,12 +62,14 @@ function fakeCli(name: string, stdout: string): { path: string; read: () => Invo
 
 const claudeCli = fakeCli("fake-claude", CLAUDE_STDOUT);
 const codexCli = fakeCli("fake-codex", CODEX_STDOUT);
+const opencodeCli = fakeCli("fake-opencode", OPENCODE_STDOUT);
 
 interface Flavour {
   provider: Provider;
   model: string;
   cli: typeof claudeCli;
   args: string[];
+  stdin: string;
   text: string;
   id: string;
 }
@@ -81,6 +90,7 @@ const flavours: Flavour[] = [
       "--append-system-prompt",
       "Be concise.",
     ],
+    stdin: "User: hello\n\nAssistant: hi\n\nUser: continue",
     text: "routed to claude",
     id: "session-routing",
   },
@@ -100,8 +110,19 @@ const flavours: Flavour[] = [
       'developer_instructions="Be concise."',
       "-",
     ],
+    stdin: "User: hello\n\nAssistant: hi\n\nUser: continue",
     text: "routed to codex",
     id: "thread-routing",
+  },
+  {
+    provider: "opencode",
+    model: "anthropic/claude-sonnet-4-5",
+    cli: opencodeCli,
+    args: ["run", "--format", "json", "--model", "anthropic/claude-sonnet-4-5"],
+    // The transcript travels on stdin; the system text in inline config.
+    stdin: "User: hello\n\nAssistant: hi\n\nUser: continue",
+    text: "routed to opencode",
+    id: "session-routing",
   },
 ];
 
@@ -124,7 +145,7 @@ describe.skipIf(process.platform === "win32")("cli routing through createClient"
 
       expect(flavour.cli.read()).toEqual({
         argv: flavour.args,
-        stdin: "User: hello\n\nAssistant: hi\n\nUser: continue",
+        stdin: flavour.stdin,
       });
       expect(response.text).toBe(flavour.text);
       expect(response.id).toBe(flavour.id);

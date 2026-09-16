@@ -1,6 +1,10 @@
 export { createClient } from "./client.js";
 export { type ErrorCode, LLMDriverError, type LLMDriverErrorOptions } from "./errors.js";
 export {
+  type ListOpencodeModelsOptions,
+  listOpencodeModels,
+} from "./models.js";
+export {
   assistant,
   type Client,
   type CompletionReason,

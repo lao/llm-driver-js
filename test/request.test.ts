@@ -124,6 +124,31 @@ describe("validateRequest", () => {
     ).not.toThrow();
   });
 
+  it("accepts unpadded or correctly padded base64 but rejects malformed padding", () => {
+    const accepts = (base64: string): boolean => {
+      try {
+        validateRequest(
+          {
+            messages: [user([{ type: "image", source: { base64, mediaType: "image/png" } }])],
+            maxTokens: 1,
+          },
+          apiConfig,
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    expect(accepts("TQ==")).toBe(true); // "M", fully padded
+    expect(accepts("TQ")).toBe(true); // same value, padding omitted
+    expect(accepts("TWE=")).toBe(true); // "Ma"
+    expect(accepts("TWE")).toBe(true); // "Ma", padding omitted
+    expect(accepts("TQ=")).toBe(false); // one pad where two are required
+    expect(accepts("TQ===")).toBe(false); // more than two pads
+    expect(accepts("TQ=====")).toBe(false); // arbitrarily many pads
+    expect(accepts("T")).toBe(false); // a lone char encodes no byte
+  });
+
   it("rejects a message with both text and content", () => {
     const error = expectInvalidRequest({
       messages: [{ role: "user", text: "hi", content: [{ type: "text", text: "hi" }] }],
@@ -166,8 +191,23 @@ describe("validateRequest", () => {
     ],
     [
       "image with bad media type",
-      { type: "image", source: { base64: "x", mediaType: "image/tiff" as never } },
+      { type: "image", source: { base64: "aGVsbG8=", mediaType: "image/tiff" as never } },
       "content block 0 image mediaType is invalid",
+    ],
+    [
+      "image with malformed base64",
+      { type: "image", source: { base64: "@@", mediaType: "image/png" } },
+      "content block 0 image source base64 is malformed",
+    ],
+    [
+      "image with a stray single padding character",
+      { type: "image", source: { base64: "TQ=", mediaType: "image/png" } },
+      "content block 0 image source base64 is malformed",
+    ],
+    [
+      "image with excess padding",
+      { type: "image", source: { base64: "TQ=====", mediaType: "image/png" } },
+      "content block 0 image source base64 is malformed",
     ],
     [
       "document without base64",
@@ -176,8 +216,13 @@ describe("validateRequest", () => {
     ],
     [
       "document with wrong media type",
-      { type: "document", source: { base64: "x", mediaType: "text/plain" as never } },
+      { type: "document", source: { base64: "aGVsbG8=", mediaType: "text/plain" as never } },
       "content block 0 document mediaType must be application/pdf",
+    ],
+    [
+      "document with malformed base64",
+      { type: "document", source: { base64: "@@", mediaType: "application/pdf" } },
+      "content block 0 document source base64 is malformed",
     ],
   ])("rejects an %s", (_name, block, expected) => {
     const message: Message = { role: "user", content: [block] };

@@ -167,6 +167,75 @@ describe("mcp bridge", () => {
     await expect(rpc(url, "tools/list")).rejects.toThrow();
   });
 
+  it("idle() waits for an in-flight tool call so its onCall lands", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let startedCall: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      startedCall = resolve;
+    });
+    const seen: ToolCallRecord[] = [];
+    const bridge = await startBridge(
+      [
+        echoTool(async () => {
+          startedCall();
+          await gate;
+          return "done";
+        }),
+      ],
+      { onCall: (r) => seen.push(r) },
+    );
+
+    const call = rpc(bridge.url, "tools/call", { name: "echo", arguments: {} });
+    await started;
+    let idle = false;
+    const idlePromise = bridge.idle().then(() => {
+      idle = true;
+    });
+    await Promise.resolve();
+    expect(idle).toBe(false);
+
+    release();
+    await call;
+    await idlePromise;
+    expect(seen).toHaveLength(1);
+  });
+
+  it("refuses a request that arrives after idle() begins, so close() can't kill a live call", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let startedCall: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      startedCall = resolve;
+    });
+    const bridge = await startBridge([
+      echoTool(async () => {
+        startedCall();
+        await gate;
+        return "done";
+      }),
+    ]);
+
+    const inFlight = rpc(bridge.url, "tools/call", { name: "echo", arguments: {} });
+    await started; // counted before idle(), so idle() must wait for it
+
+    const idlePromise = bridge.idle();
+    // A late arrival is refused at the quiescence boundary, never started — so
+    // the adapter's later closeAllConnections() cannot terminate it mid-call.
+    const late = await rpc(bridge.url, "tools/call", { name: "echo", arguments: {} });
+    expect(late.status).toBe(503);
+    expect(bridge.records).toHaveLength(0);
+
+    release();
+    await inFlight;
+    await idlePromise;
+    expect(bridge.records).toHaveLength(1);
+  });
+
   it("propagates the abort signal to an in-flight execute", async () => {
     const controller = new AbortController();
     let observed: AbortSignal | undefined;

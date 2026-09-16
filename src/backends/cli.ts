@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { type ErrorCode, LLMDriverError } from "../errors.js";
-import type { ContentBlock, Message, Provider } from "../types.js";
+import type { ContentBlock, ImageMediaType, Message, Provider, Request } from "../types.js";
 
 /** Hard cap on captured stdout and stderr, matching the Go reference. */
 const MAX_OUTPUT_BYTES = 16 << 20;
@@ -18,6 +18,11 @@ export interface Command {
   executable: string;
   args: string[];
   stdin: string;
+  /**
+   * Extra environment variables layered over the inherited process environment
+   * (which is kept so the CLI's own login still works). Omitted: inherit as-is.
+   */
+  env?: Record<string, string>;
 }
 
 export interface CommandResult {
@@ -82,7 +87,7 @@ function withDeadline(
   timeoutMs: number | undefined,
 ): { signal: AbortSignal | undefined; timedOut: () => boolean } {
   if (timeoutMs === undefined) return { signal, timedOut: () => false };
-  const deadline = AbortSignal.timeout(timeoutMs);
+  const deadline = AbortSignal.timeout(Math.ceil(timeoutMs));
   return {
     signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
     timedOut: () => deadline.aborted && !signal?.aborted,
@@ -289,6 +294,79 @@ export async function withTempFile(
   return { path, cleanup };
 }
 
+/** File extension a CLI's image flag infers the format from, keyed by media type. */
+const IMAGE_EXTENSION: Record<ImageMediaType, string> = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+};
+
+/**
+ * Writes each base64 image in the final user turn to a scratch temp directory and
+ * returns the matching `<flag> <path>` argv plus an idempotent cleanup. CLI image
+ * flags attach files to the initial prompt only and carry no URL form, so a
+ * URL-source image or one outside the final user message is rejected as
+ * `unsupported_feature` before any file is written. Cleanup always runs in the
+ * adapter's `finally` (resolve, reject, and abort alike).
+ */
+export async function stageImages(
+  request: Request,
+  provider: Provider,
+  flag: string,
+): Promise<{ imageArgs: string[]; cleanup: () => Promise<void> }> {
+  const images = collectImages(request, provider);
+  if (images.length === 0) return { imageArgs: [], cleanup: async () => {} };
+
+  const dir = await mkdtemp(join(tmpdir(), `llm-driver-${provider}-`));
+  const paths = images.map((image, index) => join(dir, `image-${index}${image.extension}`));
+  try {
+    await Promise.all(
+      images.map((image, index) =>
+        writeFile(paths[index] as string, Buffer.from(image.base64, "base64")),
+      ),
+    );
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    imageArgs: paths.flatMap((path) => [flag, path]),
+    cleanup: () => rm(dir, { recursive: true, force: true }),
+  };
+}
+
+/** Collects the base64 images destined for a CLI's file flag, enforcing its constraints. */
+function collectImages(
+  request: Request,
+  provider: Provider,
+): Array<{ base64: string; extension: string }> {
+  const lastIndex = request.messages.length - 1;
+  const images: Array<{ base64: string; extension: string }> = [];
+  request.messages.forEach((message, index) => {
+    for (const block of message.content ?? []) {
+      if (block.type !== "image") continue;
+      if ("url" in block.source) throw unsupportedImage("URL-source images", provider);
+      if (index !== lastIndex || message.role !== "user") {
+        throw unsupportedImage("images outside the final user message", provider);
+      }
+      images.push({
+        base64: block.source.base64,
+        extension: IMAGE_EXTENSION[block.source.mediaType],
+      });
+    }
+  });
+  return images;
+}
+
+function unsupportedImage(constraint: string, provider: Provider): LLMDriverError {
+  return new LLMDriverError(
+    "unsupported_feature",
+    `${constraint} are not supported on ${provider}/cli`,
+    { provider, flavor: "cli", operation: "generate" },
+  );
+}
+
 /** Reads a nested object, treating anything else as absent. */
 export function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -364,6 +442,7 @@ function launchChild(command: Command): ChildProcessWithoutNullStreams {
   const child = spawn(command.executable, command.args, {
     stdio: ["pipe", "pipe", "pipe"],
     detached: POSIX,
+    env: command.env ? { ...process.env, ...command.env } : undefined,
   });
   trackChild(child);
   child.stdin.on("error", () => {});

@@ -4,6 +4,7 @@ import { createClaudeCliBackend } from "../src/backends/claude-cli.js";
 import type { Command, CommandRunner } from "../src/backends/cli.js";
 import { createCodexCliBackend } from "../src/backends/codex-cli.js";
 import { createOpenAiApiBackend } from "../src/backends/openai-api.js";
+import { createOpencodeCliBackend } from "../src/backends/opencode-cli.js";
 import { assertSupported, CAPABILITIES, type Target } from "../src/capabilities.js";
 import { createClientWithBackend } from "../src/client.js";
 import { LLMDriverError } from "../src/errors.js";
@@ -17,6 +18,10 @@ const CONFIGS: Record<Target, Config> = {
   "openai/api": { provider: "openai", flavor: "api", model: "m" },
   "claude/cli": { provider: "claude", flavor: "cli", model: "m" },
   "openai/cli": { provider: "openai", flavor: "cli", model: "m" },
+  // `opencode/api` is rejected by validateConfig; the pure gate still treats it
+  // as a target with no supported cells.
+  "opencode/api": { provider: "opencode", flavor: "api", model: "m" },
+  "opencode/cli": { provider: "opencode", flavor: "cli", model: "m" },
 };
 
 const ALL_TARGETS = Object.keys(CONFIGS) as Target[];
@@ -32,12 +37,14 @@ function neverRun(): { runner: CommandRunner; calls: Command[] } {
 }
 
 /** Real CLI backend behind the client, so an escaped gate would actually spawn. */
-function cliClient(target: "claude/cli" | "openai/cli", runner: CommandRunner) {
+function cliClient(target: "claude/cli" | "openai/cli" | "opencode/cli", runner: CommandRunner) {
   const config = CONFIGS[target];
   const backend =
     target === "claude/cli"
       ? createClaudeCliBackend(config, runner)
-      : createCodexCliBackend(config, runner);
+      : target === "openai/cli"
+        ? createCodexCliBackend(config, runner)
+        : createOpencodeCliBackend(config, runner);
   return createClientWithBackend(config, backend);
 }
 
@@ -63,6 +70,7 @@ describe("assertSupported (matrix gate)", () => {
     ["openai/api", false],
     ["claude/cli", true],
     ["openai/cli", true],
+    ["opencode/cli", true],
   ] as const)("temperature on %s throws unsupported=%s", (target, shouldThrow) => {
     const call = () => assertSupported(REQUEST, CONFIGS[target]);
     if (!shouldThrow) {
@@ -176,9 +184,16 @@ describe("image and document gate", () => {
     expect(() => assertSupported(request(IMAGE), CONFIGS["openai/cli"])).not.toThrow();
   });
 
+  it("does not throw for image input on opencode/cli (temp files + -f)", () => {
+    // The gate permits it; the opencode-cli adapter enforces the URL / non-final
+    // constraints and is covered in opencode-cli.test.ts.
+    expect(() => assertSupported(request(IMAGE), CONFIGS["opencode/cli"])).not.toThrow();
+  });
+
   it.each([
     ["document input", DOCUMENT, "claude/cli"],
     ["document input", DOCUMENT, "openai/cli"],
+    ["document input", DOCUMENT, "opencode/cli"],
   ] as const)("throws unsupported_feature for %s on %s", (feature, block, target) => {
     const error = (() => {
       try {
@@ -212,16 +227,16 @@ describe("tools + toolChoice gate", () => {
     expect(() => assertSupported(toolChoiceReq, CONFIGS[target])).not.toThrow();
   });
 
-  it.each(["claude/cli", "openai/cli"] as const)(
+  it.each(["claude/cli", "openai/cli", "opencode/cli"] as const)(
     "does not throw for tools on %s (MCP bridge)",
     (target) => {
       expect(() => assertSupported(toolsReq, CONFIGS[target])).not.toThrow();
     },
   );
 
-  // `tools` is supported on both cli flavors via the bridge; `toolChoice` is not
+  // `tools` is supported on every cli flavor via the bridge; `toolChoice` is not
   // (the CLI decides when to call).
-  it.each([["toolChoice", toolChoiceReq, ["claude/cli", "openai/cli"]]] as const)(
+  it.each([["toolChoice", toolChoiceReq, ["claude/cli", "openai/cli", "opencode/cli"]]] as const)(
     "throws unsupported_feature for %s on its unsupported cli targets",
     (feature, req, unsupported) => {
       for (const target of unsupported) {
@@ -241,7 +256,7 @@ describe("tools + toolChoice gate", () => {
 });
 
 describe("temperature on cli flavors", () => {
-  it.each(["claude/cli", "openai/cli"] as const)(
+  it.each(["claude/cli", "openai/cli", "opencode/cli"] as const)(
     "generate() rejects before any spawn on %s",
     async (target) => {
       const { runner, calls } = neverRun();
@@ -255,7 +270,7 @@ describe("temperature on cli flavors", () => {
     },
   );
 
-  it.each(["claude/cli", "openai/cli"] as const)(
+  it.each(["claude/cli", "openai/cli", "opencode/cli"] as const)(
     "generateStream() throws from the first next() on %s",
     async (target) => {
       const { runner, calls } = neverRun();

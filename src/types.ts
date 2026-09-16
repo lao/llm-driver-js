@@ -1,5 +1,5 @@
-/** Model provider selected by a {@link Config}. */
-export type Provider = "claude" | "openai";
+/** Model provider selected by a {@link Config}. `opencode` is CLI-only. */
+export type Provider = "claude" | "openai" | "opencode";
 
 /** How a provider is invoked: its hosted API or its locally authenticated CLI. */
 export type Flavor = "api" | "cli";
@@ -31,7 +31,7 @@ export interface Config {
   /** API flavor only: transport override, e.g. an injected test fetch. */
   fetch?: typeof fetch;
 
-  /** CLI flavor only: overrides the default `claude` or `codex` executable. */
+  /** CLI flavor only: overrides the default `claude`, `codex`, or `opencode` executable. */
   cliPath?: string;
   /** CLI flavor only: extra argv passed verbatim; never shell-expanded. */
   cliArgs?: string[];

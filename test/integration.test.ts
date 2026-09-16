@@ -6,6 +6,7 @@
  *
  *   LLMWRAPPER_CLAUDE_CLI_MODEL=claude-sonnet-4-6 npm test
  *   LLMWRAPPER_CODEX_CLI_MODEL=gpt-5.6-sol npm test
+ *   LLMWRAPPER_OPENCODE_CLI_MODEL=anthropic/claude-sonnet-4-5 npm test
  */
 import { describe, expect, it } from "vitest";
 import { createClient } from "../src/client.js";
@@ -17,6 +18,7 @@ const TIMEOUT_MS = 180_000;
 const targets: Array<{ provider: Provider; envVar: string }> = [
   { provider: "claude", envVar: "LLMWRAPPER_CLAUDE_CLI_MODEL" },
   { provider: "openai", envVar: "LLMWRAPPER_CODEX_CLI_MODEL" },
+  { provider: "opencode", envVar: "LLMWRAPPER_OPENCODE_CLI_MODEL" },
 ];
 
 for (const { provider, envVar } of targets) {
@@ -84,10 +86,11 @@ for (const { provider, envVar } of targets) {
         expect(done.response.provider).toBe(provider);
         expect(done.response.model).toBe(model);
         // Granularity is target-dependent; only the sum is contractual — and
-        // only for the three targets that hold it unconditionally. `claude`/`cli`
-        // is an agent whose deltas are a superset once the turn runs tools, so
-        // it keeps the invariants above and is characterized separately below.
-        if (provider !== "claude") {
+        // only for the targets that hold it unconditionally. `claude`/`cli` and
+        // `opencode`/`cli` are agents whose deltas are a superset once the turn
+        // runs tools, so they keep the invariants above and are characterized
+        // separately below.
+        if (provider !== "claude" && provider !== "opencode") {
           expect(
             events
               .filter((event) => event.type === "text")
@@ -252,11 +255,55 @@ describe.skipIf(!process.env.LLMWRAPPER_CODEX_CLI_MODEL)("codex cli tools via br
 });
 
 /**
+ * Real `opencode run` running a client tool through the MCP bridge. The sole
+ * confirmation of the `OPENCODE_CONFIG_CONTENT` remote-MCP injection against the
+ * real binary: if opencode ignores the injected server, this test fails.
+ */
+describe.skipIf(!process.env.LLMWRAPPER_OPENCODE_CLI_MODEL)("opencode cli tools via bridge", () => {
+  it(
+    "calls a trivial in-process tool and records the call",
+    async () => {
+      const model = process.env.LLMWRAPPER_OPENCODE_CLI_MODEL as string;
+      const client = createClient({ provider: "opencode", flavor: "cli", model });
+
+      let called = false;
+      const response = await client.generate({
+        messages: [
+          user(
+            "Call the secret_number tool with no arguments and reply with exactly the number it returns.",
+          ),
+        ],
+        maxTokens: 512,
+        tools: [
+          {
+            name: "secret_number",
+            description: "Returns the secret number. Call it to learn the secret.",
+            inputSchema: { type: "object", properties: {} },
+            execute: () => {
+              called = true;
+              return "1729";
+            },
+          },
+        ],
+      });
+
+      expect(called).toBe(true);
+      expect(response.toolCalls.map((call) => call.name)).toContain("secret_number");
+      expect(response.text).toContain("1729");
+    },
+    TIMEOUT_MS,
+  );
+});
+
+/**
  * The truth the fixtures cannot prove: that `--json-schema` (claude) and
  * `--output-schema` (codex) really make the CLI emit JSON we can parse into
- * `structured`. Env-gated, skipped by default; run before checkpoint sign-off.
+ * `structured`. opencode/cli has no schema flag and is gated out (❌), so it is
+ * excluded. Env-gated, skipped by default; run before checkpoint sign-off.
  */
-for (const { provider, envVar } of targets) {
+const structuredTargets = targets.filter((target) => target.provider !== "opencode");
+
+for (const { provider, envVar } of structuredTargets) {
   const model = process.env[envVar];
 
   describe.skipIf(!model)(`${provider} cli structured output`, () => {

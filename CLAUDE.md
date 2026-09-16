@@ -16,9 +16,10 @@ npm run example -- --provider claude --flavor cli --model <model> --prompt "..."
 
 All five gates (build, test, lint, typecheck, coverage) must pass before committing.
 
-Opt-in integration smoke test (spawns real `claude`/`codex` binaries): set
-`LLMWRAPPER_CLAUDE_CLI_MODEL` and/or `LLMWRAPPER_CODEX_CLI_MODEL`, then `npm test`.
-It is `describe.skipIf`-gated and skips by default — keep it that way.
+Opt-in integration smoke test (spawns real `claude`/`codex`/`opencode` binaries):
+set `LLMWRAPPER_CLAUDE_CLI_MODEL`, `LLMWRAPPER_CODEX_CLI_MODEL`, and/or
+`LLMWRAPPER_OPENCODE_CLI_MODEL`, then `npm test`. It is `describe.skipIf`-gated and
+skips by default — keep it that way.
 
 ## Source of truth
 
@@ -30,11 +31,13 @@ semantics without updating SPEC.md first.
 
 ## Architecture
 
-One provider-neutral `generate()` API over four backends selected purely by config
+One provider-neutral `generate()` API over five backends selected purely by config
 (`provider` × `flavor`): Anthropic Messages API, OpenAI Responses API, `claude -p`
-subprocess, `codex exec` subprocess. Beyond text it carries sampling params,
-reasoning effort, structured output, image input, and handler-based client tools —
-each honored per target or rejected, never silently dropped.
+subprocess, `codex exec` subprocess, and `opencode run` subprocess. Beyond text it
+carries sampling params, reasoning effort, structured output, image input, and
+handler-based client tools — each honored per target or rejected, never silently
+dropped. `opencode` is cli-only and multi-provider (any `provider/model` id its
+local install can reach); `src/models.ts` enumerates them via `opencode models`.
 
 - `src/types.ts` / `src/errors.ts` own every public type. Provider SDK types must
   never appear in the public surface; `src/index.ts` exports only what SPEC.md lists.
@@ -51,7 +54,7 @@ each honored per target or rejected, never silently dropped.
 - `src/backends/*.ts` are internal. SDK imports stay confined to their adapter file.
   All adapters normalize failures into `LLMDriverError` with a stable `code`; the one
   exception is abort: on `AbortSignal`, `generate` rejects with the raw abort reason,
-  never a wrapped error, identically across all four targets.
+  never a wrapped error, identically across all five targets.
 - `generateStream` is the streaming half of the same contract: zero or more `text`
   deltas whose concatenation equals `done.response.text`, then exactly one `done`
   event carrying the Response `generate` would have returned. Granularity is
@@ -88,15 +91,17 @@ each honored per target or rejected, never silently dropped.
   `tools/list` / `tools/call`, gated by an unguessable `/mcp/<token>` path.
   `tools/call` runs `execute()` in-process. claude/cli wires it via `--mcp-config`
   + `--strict-mcp-config` + `--allowedTools mcp__llmdriver__<name>`; codex/cli via
-  `-c mcp_servers.llmdriver.url=`. Torn down in `finally` with the process-group
-  kill. `toolChoice` is `unsupported_feature` on cli — the CLI owns its loop.
+  `-c mcp_servers.llmdriver.url=`; opencode/cli via a remote `mcp.llmdriver` entry
+  in `OPENCODE_CONFIG_CONTENT` (the shared `Command.env`, layered over the inherited
+  environment). Torn down in `finally` with the process-group kill. `toolChoice` is
+  `unsupported_feature` on cli — the CLI owns its loop.
 
 ## Testing discipline
 
 The default suite never touches the network or spawns a provider CLI: API adapter
 tests inject `fetch`/`baseUrl`, CLI adapter tests inject a fake runner (the only real
 spawns use `process.execPath -e`). `test/contract.test.ts` pushes one neutral request
-through all four backends and asserts the identical normalized shape — extend it when
+through all five backends and asserts the identical normalized shape — extend it when
 touching any adapter.
 
 ## Constraints

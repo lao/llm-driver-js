@@ -7,6 +7,7 @@ import type {
   StreamingCommandRunner,
 } from "../src/backends/cli.js";
 import { createCodexCliBackend } from "../src/backends/codex-cli.js";
+import { createOpencodeCliBackend } from "../src/backends/opencode-cli.js";
 import { createClient, createClientWithBackend } from "../src/client.js";
 import { LLMDriverError } from "../src/errors.js";
 import {
@@ -105,8 +106,14 @@ function stubStreamRunner(lines: string[]): StreamingCommandRunner {
   };
 }
 
-/** Reads the loopback bridge URL out of either CLI's argv (claude or codex). */
+/** Reads the loopback bridge URL out of any CLI's argv/env (claude, codex, opencode). */
 function bridgeUrl(command: Command): string {
+  if (command.env?.OPENCODE_CONFIG_CONTENT) {
+    const { mcp } = JSON.parse(command.env.OPENCODE_CONFIG_CONTENT) as {
+      mcp: { llmdriver: { url: string } };
+    };
+    return mcp.llmdriver.url;
+  }
   const configIndex = command.args.indexOf("--mcp-config");
   if (configIndex >= 0) {
     const { mcpServers } = JSON.parse(command.args[configIndex + 1] as string) as {
@@ -214,6 +221,21 @@ function interleave<T>(reasoning: (chunk: string) => T, text: (chunk: string) =>
   return REASONING_DELTAS.flatMap((chunk, i) => [reasoning(chunk), text(DELTAS[i] as string)]);
 }
 
+const OPENCODE_CLI_STDOUT = [
+  '{"type":"step_start","sessionID":"opencode-1"}',
+  ...interleave(
+    (text) =>
+      `{"type":"reasoning","sessionID":"opencode-1","part":{"type":"reasoning","text":${JSON.stringify(text)}}}`,
+    (text) =>
+      `{"type":"text","sessionID":"opencode-1","part":{"type":"text","text":${JSON.stringify(text)}}}`,
+  ),
+  '{"type":"step_finish","sessionID":"opencode-1","part":{"reason":"stop",' +
+    '"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":3,"write":2}}}}',
+  "",
+].join("\n");
+
+const OPENCODE_CLI_STREAM = OPENCODE_CLI_STDOUT.split("\n").filter((line) => line !== "");
+
 const CLAUDE_API_STREAM = [
   sse("message_start", {
     type: "message_start",
@@ -287,6 +309,11 @@ const CLAUDE_CLI_STREAM = [
 
 const CLAUDE_CLI_CONFIG: Config = { provider: "claude", flavor: "cli", model: "claude-cli-test" };
 const CODEX_CLI_CONFIG: Config = { provider: "openai", flavor: "cli", model: "codex-cli-test" };
+const OPENCODE_CLI_CONFIG: Config = {
+  provider: "opencode",
+  flavor: "cli",
+  model: "anthropic/claude-opencode-test",
+};
 
 const claudeCliClient = () =>
   createClientWithBackend(
@@ -301,6 +328,15 @@ const codexCliClient = () =>
   createClientWithBackend(
     CODEX_CLI_CONFIG,
     createCodexCliBackend(CODEX_CLI_CONFIG, stubRunner(CODEX_CLI_STDOUT)),
+  );
+const opencodeCliClient = () =>
+  createClientWithBackend(
+    OPENCODE_CLI_CONFIG,
+    createOpencodeCliBackend(
+      OPENCODE_CLI_CONFIG,
+      stubRunner(OPENCODE_CLI_STDOUT),
+      stubStreamRunner(OPENCODE_CLI_STREAM),
+    ),
   );
 
 interface Target {
@@ -393,9 +429,21 @@ const targets: Target[] = [
     completionReason: "",
     reasoningTokens: 1,
   },
+  {
+    provider: "opencode",
+    flavor: "cli",
+    model: "anthropic/claude-opencode-test",
+    generate: (request) => opencodeCliClient().generate(request),
+    // opencode's raw JSON events carry per-step text/reasoning deltas; the last
+    // step's text is the final message.
+    stream: (request) => opencodeCliClient().generateStream(request),
+    id: "opencode-1",
+    completionReason: "stop",
+    reasoningTokens: 0,
+  },
 ];
 
-describe("contract across all four targets", () => {
+describe("contract across all five targets", () => {
   for (const target of targets) {
     it(`${target.provider}/${target.flavor} returns the normalized response`, async () => {
       const response = await target.generate(PROMPT);
@@ -467,7 +515,7 @@ describe("contract across all four targets", () => {
   }
 
   it("accepts a neutral reasoning request on every target with the same shape", async () => {
-    // reasoning.effort is ✅ on all four targets, so one request runs unmodified
+    // reasoning.effort is ✅ on all five targets, so one request runs unmodified
     // everywhere and normalizes to the identical shape (matrix single source).
     const reasoningPrompt: GenerateRequest = { ...PROMPT, reasoning: { effort: "medium" } };
     const responses = await Promise.all(targets.map((target) => target.generate(reasoningPrompt)));
@@ -481,7 +529,7 @@ describe("contract across all four targets", () => {
     }
   });
 
-  // A base64 image in the final user turn is honored on all four targets: API
+  // A base64 image in the final user turn is honored on all five targets: API
   // flavors natively, claude/cli via stream-json stdin (T8), codex/cli via temp
   // files + `-i` (T9). One neutral image fixture proves the whole matrix row.
   const IMAGE_PROMPT: GenerateRequest = {
@@ -494,7 +542,7 @@ describe("contract across all four targets", () => {
     ],
   };
 
-  // All four targets honor image input (API flavors, claude/cli T8, codex/cli T9).
+  // All five targets honor image input (API flavors, claude/cli T8, codex/cli T9).
   const imageSupported = (_t: Target) => true;
 
   for (const target of targets.filter(imageSupported)) {
@@ -514,7 +562,7 @@ describe("contract across all four targets", () => {
     });
   }
 
-  it("runs the tool loop to the same toolCalls and text on all four targets", async () => {
+  it("runs the tool loop to the same toolCalls and text on all five targets", async () => {
     // One neutral tool request, sent to every target. Provider wire shapes differ
     // (Messages tool_use vs Responses function_call vs the CLI MCP bridge) but the
     // normalized toolCalls records and final text must be identical. Shared call id
@@ -629,11 +677,29 @@ describe("contract across all four targets", () => {
       createCodexCliBackend(CODEX_CLI_CONFIG, codexRunner),
     );
 
-    const [claudeResponse, openaiResponse, cliResponse, codexResponse] = await Promise.all([
+    // opencode/cli reaches the identical record through the same bridge, handed
+    // to it as a remote MCP server via OPENCODE_CONFIG_CONTENT.
+    const opencodeToolsStdout = [
+      '{"type":"step_start","sessionID":"opencode-1"}',
+      '{"type":"text","sessionID":"opencode-1","part":{"type":"text","text":"the value is 42"}}',
+      '{"type":"step_finish","sessionID":"opencode-1","part":{"reason":"stop","tokens":{}}}',
+      "",
+    ].join("\n");
+    const opencodeRunner: CommandRunner = async (command) => {
+      await bridgeCall(command, "tc_1", "lookup", { q: "x" });
+      return { stdout: opencodeToolsStdout, stderr: "", exitCode: 0 };
+    };
+    const opencode = createClientWithBackend(
+      OPENCODE_CLI_CONFIG,
+      createOpencodeCliBackend(OPENCODE_CLI_CONFIG, opencodeRunner),
+    );
+
+    const responses = await Promise.all([
       claude.generate(request),
       openai.generate(request),
       cli.generate(request),
       codex.generate(request),
+      opencode.generate(request),
     ]);
 
     const expectedToolCalls = [
@@ -645,7 +711,7 @@ describe("contract across all four targets", () => {
         isError: false,
       },
     ];
-    for (const response of [claudeResponse, openaiResponse, cliResponse, codexResponse]) {
+    for (const response of responses) {
       expect(response.toolCalls).toEqual(expectedToolCalls);
       expect(response.text).toBe("the value is 42");
     }

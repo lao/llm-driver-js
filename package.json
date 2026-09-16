@@ -1,7 +1,7 @@
 {
   "name": "llm-driver",
   "version": "0.2.0",
-  "description": "One text-generation API, four switchable targets: Claude and OpenAI, via hosted API or local CLI.",
+  "description": "One text-generation API, five switchable targets: Claude and OpenAI via hosted API or local CLI, plus opencode's full multi-provider model catalog.",
   "license": "MIT",
   "author": "Lucas Abreu Oliveira",
   "repository": {
@@ -42,6 +42,7 @@
     "claude",
     "openai",
     "codex",
+    "opencode",
     "cli",
     "wrapper",
     "ai"
