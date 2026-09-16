@@ -52,6 +52,32 @@ export function createOpencodeCliBackend(
   const executable = config.cliPath ?? "opencode";
   const extraArgs = config.cliArgs ?? [];
 
+  const requestDeadline = (caller: AbortSignal | undefined) => {
+    const deadline =
+      config.timeoutMs === undefined ? undefined : performance.now() + config.timeoutMs;
+    const timeoutSignal =
+      config.timeoutMs === undefined ? undefined : AbortSignal.timeout(config.timeoutMs);
+    const signal =
+      caller && timeoutSignal
+        ? AbortSignal.any([caller, timeoutSignal])
+        : (caller ?? timeoutSignal);
+    return {
+      signal,
+      deadline,
+      error: () =>
+        caller?.aborted
+          ? caller.reason
+          : timeoutSignal?.aborted
+            ? cliError(
+                "opencode",
+                "process_failed",
+                `CLI command timed out after ${config.timeoutMs} ms`,
+                { providerCode: "timeout" },
+              )
+            : signal?.reason,
+    };
+  };
+
   const buildCommand = (
     request: Request,
     bridge?: McpBridge,
@@ -89,7 +115,8 @@ export function createOpencodeCliBackend(
 
   return {
     async generate(request, signal) {
-      const bridge = await openBridge(request, signal);
+      const requestTimer = requestDeadline(signal);
+      const bridge = await openBridge(request, requestTimer.signal);
       let cleanupImages: (() => Promise<void>) | undefined;
       let cleanupInstruction: (() => Promise<void>) | undefined;
       try {
@@ -100,15 +127,21 @@ export function createOpencodeCliBackend(
           : undefined;
         cleanupInstruction = instruction?.cleanup;
         const command = buildCommand(request, bridge, staged.imageArgs, instruction?.path);
-        const deadline =
-          config.timeoutMs === undefined ? undefined : performance.now() + config.timeoutMs;
-        const { stdout, failure } = await executeCli(
-          "opencode",
-          command,
-          runner,
-          signal,
-          config.timeoutMs,
-        );
+        const deadline = requestTimer.deadline;
+        let stdout: string;
+        let failure: LLMDriverError | undefined;
+        try {
+          ({ stdout, failure } = await executeCli(
+            "opencode",
+            command,
+            runner,
+            requestTimer.signal,
+          ));
+        } catch (error) {
+          if (requestTimer.signal?.aborted) throw requestTimer.error();
+          throw error;
+        }
+        if (requestTimer.signal?.aborted) throw requestTimer.error();
         // Surface a failed or aborted run before draining the bridge: an MCP
         // handler that ignores cancellation would otherwise hold `idle()` open
         // past the configured deadline (which killed only the CLI process).
@@ -116,7 +149,7 @@ export function createOpencodeCliBackend(
         // The CLI can exit while a tool-call response is still in flight; wait for
         // the bridge's handlers to settle before snapshotting records (and before
         // the finally closes the server).
-        await bridge?.idle();
+        await drainBridge(bridge, requestTimer.signal, requestTimer.error);
         const run = foldEvents(stdout);
         await recoverUsage(run, async () => {
           if (signal?.aborted) throw signal.reason;
@@ -138,7 +171,8 @@ export function createOpencodeCliBackend(
       // reads, so buffer its events and flush them into the generator's own yield
       // stream (tool_call before its tool_result, both before `done`).
       const pending: StreamEvent[] = [];
-      const bridge = await openBridge(request, signal, (record) => {
+      const requestTimer = requestDeadline(signal);
+      const bridge = await openBridge(request, requestTimer.signal, (record) => {
         pending.push({ type: "tool_call", id: record.id, name: record.name, input: record.input });
         pending.push({
           type: "tool_result",
@@ -161,27 +195,31 @@ export function createOpencodeCliBackend(
         const command = buildCommand(request, bridge, staged.imageArgs, instruction?.path);
         const run = newRun();
         let index = 0;
-        const deadline =
-          config.timeoutMs === undefined ? undefined : performance.now() + config.timeoutMs;
+        const deadline = requestTimer.deadline;
 
-        for await (const line of streamCli(
-          "opencode",
-          command,
-          streamRunner,
-          signal,
-          config.timeoutMs,
-        )) {
-          while (pending.length > 0) yield pending.shift() as StreamEvent;
-          index += 1;
-          if (line.trim() === "") continue;
-          const event = parseJsonObject("opencode", `decode OpenCode CLI event ${index}`, line);
-          const emitted = parseEvent(run, event);
-          if (emitted !== undefined) yield emitted;
+        try {
+          for await (const line of streamCli(
+            "opencode",
+            command,
+            streamRunner,
+            requestTimer.signal,
+          )) {
+            while (pending.length > 0) yield pending.shift() as StreamEvent;
+            index += 1;
+            if (line.trim() === "") continue;
+            const event = parseJsonObject("opencode", `decode OpenCode CLI event ${index}`, line);
+            const emitted = parseEvent(run, event);
+            if (emitted !== undefined) yield emitted;
+          }
+        } catch (error) {
+          if (requestTimer.signal?.aborted) throw requestTimer.error();
+          throw error;
         }
+        if (requestTimer.signal?.aborted) throw requestTimer.error();
 
         // The CLI can exit while a tool-call response is still in flight; wait for
         // the bridge's handlers to settle so their events are queued before the flush.
-        await bridge?.idle();
+        await drainBridge(bridge, requestTimer.signal, requestTimer.error);
         while (pending.length > 0) yield pending.shift() as StreamEvent;
         finalizeStep(run);
         await recoverUsage(run, async () => {
@@ -199,6 +237,28 @@ export function createOpencodeCliBackend(
       }
     },
   };
+}
+
+async function drainBridge(
+  bridge: McpBridge | undefined,
+  signal: AbortSignal | undefined,
+  abortError: () => unknown,
+): Promise<void> {
+  if (!bridge) return;
+  if (!signal) return bridge.idle();
+  if (signal.aborted) throw abortError();
+  let rejectAbort: (reason: unknown) => void = () => {};
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  const onAbort = () => rejectAbort(abortError());
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    await Promise.race([bridge.idle(), aborted]);
+    if (signal.aborted) throw abortError();
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 /**

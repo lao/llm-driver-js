@@ -884,6 +884,30 @@ async function rpc(url: string, method: string, params?: unknown): Promise<Respo
   });
 }
 
+function hangingToolsRequest(
+  onStart: (signal: AbortSignal | undefined) => void,
+  safetySignal: AbortSignal,
+): Request {
+  return {
+    ...toolsRequest,
+    tools: [
+      {
+        name: "add",
+        description: "adds two numbers",
+        inputSchema: { type: "object" },
+        execute: (_input, ctx) => {
+          onStart(ctx.signal);
+          return new Promise<string>((_resolve, reject) => {
+            safetySignal.addEventListener("abort", () => reject(safetySignal.reason), {
+              once: true,
+            });
+          });
+        },
+      },
+    ],
+  };
+}
+
 describe("opencode cli tools config", () => {
   it("passes the bridge through OPENCODE_CONFIG_CONTENT (remote, no oauth)", async () => {
     const { runner, calls } = fakeRunner({ stdout: toolsStdout });
@@ -1042,6 +1066,129 @@ describe("opencode cli tools bridge lifecycle", () => {
     await expect(
       createOpencodeCliBackend(config, runner).generate(stuckRequest),
     ).rejects.toBeInstanceOf(LLMDriverError);
+  });
+
+  it("times out a successful run while draining its tool handler", async () => {
+    const safety = new AbortController();
+    const fallback = setTimeout(() => safety.abort(new Error("test fallback")), 500);
+    let url = "";
+    let toolSignal: AbortSignal | undefined;
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const stuckRequest = hangingToolsRequest((signal) => {
+      toolSignal = signal;
+      markStarted();
+    }, safety.signal);
+    const runner: CommandRunner = async (command) => {
+      url = bridgeUrl(command);
+      void rpc(url, "tools/call", { name: "add", arguments: {} }).catch(() => {});
+      await started;
+      return { stdout: toolsStdout, stderr: "", exitCode: 0 };
+    };
+
+    try {
+      const error = await createOpencodeCliBackend({ ...config, timeoutMs: 20 }, runner)
+        .generate(stuckRequest)
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(LLMDriverError);
+      expect(error).toMatchObject({ code: "process_failed", providerCode: "timeout" });
+      expect(toolSignal?.aborted).toBe(true);
+      expect(safety.signal.aborted).toBe(false);
+      await expect(rpc(url, "tools/list")).rejects.toThrow();
+    } finally {
+      clearTimeout(fallback);
+      safety.abort();
+    }
+  });
+
+  it("times out a successful stream while draining its tool handler", async () => {
+    const safety = new AbortController();
+    const fallback = setTimeout(() => safety.abort(new Error("test fallback")), 500);
+    let url = "";
+    let toolSignal: AbortSignal | undefined;
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const stuckRequest = hangingToolsRequest((signal) => {
+      toolSignal = signal;
+      markStarted();
+    }, safety.signal);
+    const streamRunner: StreamingCommandRunner = async function* (command) {
+      url = bridgeUrl(command);
+      void rpc(url, "tools/call", { name: "add", arguments: {} }).catch(() => {});
+      await started;
+      for (const line of toolsStdout.split("\n").filter((line) => line !== "")) {
+        yield { type: "line", line };
+      }
+      yield { type: "exit", exitCode: 0, stderr: "" };
+    };
+
+    try {
+      const error = await collect(
+        createOpencodeCliBackend(
+          { ...config, timeoutMs: 20 },
+          neverSpawn,
+          streamRunner,
+        ).generateStream(stuckRequest),
+      ).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(LLMDriverError);
+      expect(error).toMatchObject({ code: "process_failed", providerCode: "timeout" });
+      expect(toolSignal?.aborted).toBe(true);
+      expect(safety.signal.aborted).toBe(false);
+      await expect(rpc(url, "tools/list")).rejects.toThrow();
+    } finally {
+      clearTimeout(fallback);
+      safety.abort();
+    }
+  });
+
+  it("surfaces a caller abort while streaming drains its tool handler", async () => {
+    const controller = new AbortController();
+    const safety = new AbortController();
+    const fallback = setTimeout(() => safety.abort(new Error("test fallback")), 500);
+    const reason = new Error("caller aborted during bridge drain");
+    let url = "";
+    let toolSignal: AbortSignal | undefined;
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const stuckRequest = hangingToolsRequest((signal) => {
+      toolSignal = signal;
+      markStarted();
+    }, safety.signal);
+    const streamRunner: StreamingCommandRunner = async function* (command) {
+      url = bridgeUrl(command);
+      void rpc(url, "tools/call", { name: "add", arguments: {} }).catch(() => {});
+      await started;
+      for (const line of toolsStdout.split("\n").filter((line) => line !== "")) {
+        yield { type: "line", line };
+      }
+      yield { type: "exit", exitCode: 0, stderr: "" };
+      setTimeout(() => controller.abort(reason), 0);
+    };
+
+    try {
+      await expect(
+        collect(
+          createOpencodeCliBackend(config, neverSpawn, streamRunner).generateStream(
+            stuckRequest,
+            controller.signal,
+          ),
+        ),
+      ).rejects.toBe(reason);
+      expect(toolSignal?.aborted).toBe(true);
+      expect(safety.signal.aborted).toBe(false);
+      await expect(rpc(url, "tools/list")).rejects.toThrow();
+    } finally {
+      clearTimeout(fallback);
+      safety.abort();
+    }
   });
 });
 
